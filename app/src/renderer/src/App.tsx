@@ -1,35 +1,23 @@
-import Versions from './components/Versions'
-import electronLogo from './assets/electron.svg'
+import { useMemo } from 'react'
+import { Tldraw } from 'tldraw'
+import { BrowserShapeUtil } from './BrowserShapeUtil'
 
-function App(): React.JSX.Element {
-  const ipcHandle = (): void => window.electron.ipcRenderer.send('ping')
+export default function App() {
+  const shapeUtils = useMemo(() => [BrowserShapeUtil], [])
 
   return (
-    <>
-      <img alt="logo" className="logo" src={electronLogo} />
-      <div className="creator">Powered by electron-vite</div>
-      <div className="text">
-        Build an Electron app with <span className="react">React</span>
-        &nbsp;and <span className="ts">TypeScript</span>
-      </div>
-      <p className="tip">
-        Please try pressing <code>F12</code> to open the devTool
-      </p>
-      <div className="actions">
-        <div className="action">
-          <a href="https://electron-vite.org/" target="_blank" rel="noreferrer">
-            Documentation
-          </a>
-        </div>
-        <div className="action">
-          <a target="_blank" rel="noreferrer" onClick={ipcHandle}>
-            Send IPC
-          </a>
-        </div>
-      </div>
-      <Versions></Versions>
-    </>
+    <div style={{ width: '100vw', height: '100vh' }}>
+      <Tldraw
+        shapeUtils={shapeUtils}
+        onMount={(editor) => {
+          editor.createShape({
+            type: 'browser-shape',
+            x: 100,
+            y: 100,
+            props: { w: 1000, h: 650, url: 'https://example.com', tabId: '' },
+          })
+        }}
+      />
+    </div>
   )
 }
-
-export default App
