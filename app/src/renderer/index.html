@@ -6,15 +6,15 @@
     <title>Electron</title>
 
     <!-- CSP: allow tldraw icons/fonts + Vite dev server -->
-    <meta http-equiv="Content-Security-Policy" content="
-      default-src 'self';
-      script-src 'self' http://localhost:* http://127.0.0.1:* 'unsafe-eval';
-      style-src 'self' 'unsafe-inline';
-      img-src 'self' data: blob:;
-      font-src 'self' data: blob:;
-      connect-src 'self' ws: http://localhost:* http://127.0.0.1:*;
-      worker-src 'self' blob:;
-    ">
+<meta http-equiv="Content-Security-Policy" content="
+  default-src 'self';
+  script-src 'self' 'unsafe-eval';
+  style-src 'self' 'unsafe-inline';
+  img-src 'self' data: blob:;
+  font-src 'self' data:;
+  connect-src 'self';
+  worker-src 'self' blob:;
+">
 
     <!-- Fill window & prevent scroll -->
     <style>

@@ -1,14 +1,29 @@
-import { Tldraw } from 'tldraw'
-import 'tldraw/tldraw.css'
-import { getAssetUrls } from '@tldraw/assets/selfHosted'  // ✅ this path exists
-
-const assetUrls = getAssetUrls()
+import { useMemo } from 'react';
+import { Tldraw } from 'tldraw';
+import { getAssetUrls } from '@tldraw/assets/selfHosted';
+import { BrowserShapeUtil } from './BrowserShapeUtil';
 
 export default function App() {
+  const shapeUtils = useMemo(() => [BrowserShapeUtil], []);
+  // electron-vite renderer serves public/ at '/'
+  const assetUrls = useMemo(
+    () => getAssetUrls({ baseUrl: '/tldraw-assets' }),
+    []
+  );
+
   return (
-    // also fixes the scroll issue by making the editor truly fill the window
-    <div style={{ position: 'fixed', inset: 0 }}>
-      <Tldraw assetUrls={assetUrls} />
+    <div style={{ width: '100vw', height: '100vh' }}>
+      <Tldraw
+        shapeUtils={shapeUtils}
+        assetUrls={assetUrls}  // <- forces icons/fonts from /tldraw-assets/*
+        onMount={(editor) => {
+          editor.createShape({
+            type: 'browser-shape',
+            x: 100, y: 100,
+            props: { w: 1000, h: 650, url: 'https://example.com', tabId: '' },
+          });
+        }}
+      />
     </div>
-  )
+  );
 }

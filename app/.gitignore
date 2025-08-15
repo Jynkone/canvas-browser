@@ -1,6 +1,16 @@
-node_modules
-dist
-out
+# existing
+node_modules/
+dist/
+out/
 .DS_Store
 .eslintcache
 *.log*
+
+# --- TLDraw static assets we copied for Electron ---
+# (icons, fonts, translations, embed-icons)
+**/src/renderer/public/tldraw-assets/
+**/src/renderer/public/tldraw-assets/**
+
+# If you ever place them under a top-level public/:
+public/tldraw-assets/
+public/tldraw-assets/**
