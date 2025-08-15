@@ -2,14 +2,26 @@
 <html>
   <head>
     <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
     <title>Electron</title>
-    <!-- https://developer.mozilla.org/en-US/docs/Web/HTTP/CSP -->
-    <meta
-      http-equiv="Content-Security-Policy"
-      content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:"
-    />
-  </head>
 
+    <!-- CSP: allow tldraw icons/fonts + Vite dev server -->
+    <meta http-equiv="Content-Security-Policy" content="
+      default-src 'self';
+      script-src 'self' http://localhost:* http://127.0.0.1:* 'unsafe-eval';
+      style-src 'self' 'unsafe-inline';
+      img-src 'self' data: blob:;
+      font-src 'self' data: blob:;
+      connect-src 'self' ws: http://localhost:* http://127.0.0.1:*;
+      worker-src 'self' blob:;
+    ">
+
+    <!-- Fill window & prevent scroll -->
+    <style>
+      html, body, #root { height:100%; width:100%; margin:0; padding:0; overflow:hidden; }
+      * { box-sizing: border-box; }
+    </style>
+  </head>
   <body>
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>

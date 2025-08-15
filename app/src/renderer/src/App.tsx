@@ -1,23 +1,14 @@
-import { useMemo } from 'react'
 import { Tldraw } from 'tldraw'
-import { BrowserShapeUtil } from './BrowserShapeUtil'
+import 'tldraw/tldraw.css'
+import { getAssetUrls } from '@tldraw/assets/selfHosted'  // ✅ this path exists
+
+const assetUrls = getAssetUrls()
 
 export default function App() {
-  const shapeUtils = useMemo(() => [BrowserShapeUtil], [])
-
   return (
-    <div style={{ width: '100vw', height: '100vh' }}>
-      <Tldraw
-        shapeUtils={shapeUtils}
-        onMount={(editor) => {
-          editor.createShape({
-            type: 'browser-shape',
-            x: 100,
-            y: 100,
-            props: { w: 1000, h: 650, url: 'https://example.com', tabId: '' },
-          })
-        }}
-      />
+    // also fixes the scroll issue by making the editor truly fill the window
+    <div style={{ position: 'fixed', inset: 0 }}>
+      <Tldraw assetUrls={assetUrls} />
     </div>
   )
 }
