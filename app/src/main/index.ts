@@ -1,38 +1,80 @@
 import { app, BrowserWindow } from 'electron'
-import { join } from 'path'
-import { OsrTabs } from './osrTabs'
+import { join, dirname } from 'path'
+import { fileURLToPath } from 'url'
+import { setupOverlayIPC } from './overlay'
 
-let mainWindow: BrowserWindow
+const __filename = fileURLToPath(import.meta.url)
+// Use dirname() instead of join(__filename, '..')
+const __dirname = dirname(__filename)
 
-async function createWindow() {
+// Single instance lock (optional but nice to have)
+if (!app.requestSingleInstanceLock()) {
+  app.quit()
+}
+
+let mainWindow: BrowserWindow | null = null
+
+function createWindow() {
   mainWindow = new BrowserWindow({
-    width: 1400,
+    width: 1280,
     height: 900,
+    minWidth: 960,
+    minHeight: 600,
+    show: true,
+    backgroundColor: '#111111',
     webPreferences: {
+      // IMPORTANT: points to the built preload (electron-vite outputs to out/preload/index.js)
       preload: join(__dirname, '../preload/index.js'),
-      contextIsolation: true,
-      sandbox: true,
       nodeIntegration: false,
+      contextIsolation: true,
     },
   })
 
-  const uiWc = mainWindow.webContents
-  // Set up OSR tab manager (routes frames to the UI renderer)
-  new OsrTabs(uiWc)
+  // Wire overlay IPC
+  setupOverlayIPC(() => mainWindow)
 
-  if (process.env.ELECTRON_RENDERER_URL) {
-    await mainWindow.loadURL(process.env.ELECTRON_RENDERER_URL)
+  // DEV vs PROD load
+  const devUrl =
+    process.env.ELECTRON_RENDERER_URL ||
+    process.env.VITE_DEV_SERVER_URL ||
+    'http://localhost:5173/'
+
+  if (process.env.ELECTRON_RENDERER_URL || process.env.VITE_DEV_SERVER_URL) {
+    console.log('[main] loading DEV URL:', devUrl)
+    mainWindow.loadURL(devUrl)
   } else {
-    await mainWindow.loadFile(join(__dirname, '../renderer/index.html'))
+    const indexHtml = join(__dirname, '../renderer/index.html')
+    console.log('[main] loading PROD file:', indexHtml)
+    mainWindow.loadFile(indexHtml)
   }
+
+  mainWindow.on('closed', () => {
+    mainWindow = null
+  })
 }
 
-app.whenReady().then(createWindow)
+// Standard app lifecycle
+app.whenReady().then(() => {
+  createWindow()
 
-app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') app.quit()
+  app.on('activate', () => {
+    if (BrowserWindow.getAllWindows().length === 0) {
+      createWindow()
+    }
+  })
 })
 
-app.on('activate', () => {
-  if (BrowserWindow.getAllWindows().length === 0) createWindow()
+app.on('window-all-closed', () => {
+  // On macOS, typical to keep app alive until Cmd+Q
+  if (process.platform !== 'darwin') {
+    app.quit()
+  }
+})
+
+// If another instance is launched, focus the existing window
+app.on('second-instance', () => {
+  if (mainWindow) {
+    if (mainWindow.isMinimized()) mainWindow.restore()
+    mainWindow.focus()
+  }
 })
