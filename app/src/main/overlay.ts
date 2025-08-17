@@ -1,40 +1,25 @@
-// overlay.ts
-import { BrowserWindow, BrowserView, ipcMain } from 'electron'
+// overlay.ts — lean & mean (no animations), Electron 37 supported APIs
+// Uses WebContentsView + Views hierarchy. One global zoom = canvasZoom * 0.8.
+// Consistent across sites: native zoom when >= 0.25, minimal emulation below 0.25.
+
+import { BrowserWindow, WebContentsView, ipcMain } from 'electron'
 import { randomUUID } from 'crypto'
 
 type Rect = { x: number; y: number; width: number; height: number }
 
 type ViewState = {
-  view: BrowserView
-  lastIntRect: { x: number; y: number; w: number; h: number } | null
-  frac: { fx: number; fy: number }
-  baseCssKey: string | null
-  dbgAttached: boolean
-  extraScale: number // <1 when effective zoom < 0.25
-
-  // Smoothing / mode state
+  view: WebContentsView
+  lastBounds: { x: number; y: number; w: number; h: number } | null
   lastAppliedZoom?: number
-  mode?: 'native' | 'emu'
-  lastZoomAt?: number
 }
 
-const MIN_EFFECTIVE_ZOOM = 0.05
 const CHROME_MIN = 0.25
 const CHROME_MAX = 5
+const ZOOM_RATIO = 0.8 // breathing room
 const clamp = (n: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, n))
 
-// IMPORTANT: leave this at 1 for 1:1 mapping between canvas zoom and page zoom.
-// If you want everything 30% smaller, set to 0.70 — but it'll make “matching” feel off.
-const ZOOM_RATIO = 1.0
-
-// Smoothing knobs
-const ZOOM_EPS = 0.01            // ignore ~1% deltas
-const ZOOM_QUANTUM = 1 / 64      // step size (~1.56%)
-const MODE_HYST = 0.02           // hysteresis around 0.25 to stop flapping
-const ZOOM_MIN_INTERVAL_MS = 16  // throttle (≈60 Hz)
-
-// NEW: app-wide zoom that survives navigation & new tabs
-let currentZoom = 1
+// Raw canvas zoom from renderer; effective = canvasZoom * ZOOM_RATIO (no compounding)
+let canvasZoom = 1
 
 export function setupOverlayIPC(getWindow: () => BrowserWindow | null) {
   const views = new Map<string, ViewState>()
@@ -44,250 +29,162 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null) {
       const s = views.get(id)!
       return { view: s.view, state: s }
     }
-    return { view: null as unknown as BrowserView | null, state: null as unknown as ViewState | null }
+    return { view: null as unknown as WebContentsView | null, state: null as unknown as ViewState | null }
   }
 
-  async function ensureBaseCSS(tabId: string, view: BrowserView) {
-    const s = views.get(tabId)
-    if (!s || s.baseCssKey) return
-    const css = `
-      html, body { overflow: hidden !important; }
-      *::-webkit-scrollbar { display: none !important; }
-      html { transform-origin: 0 0 !important; will-change: transform !important; }
-      body { margin: 0 !important; background: transparent !important; }
-    `
-    try { s.baseCssKey = await view.webContents.insertCSS(css) } catch {}
-  }
+  // Views API attach/detach
+  const attach = (win: BrowserWindow, view: WebContentsView) => { try { win.contentView.addChildView(view) } catch {} }
+  const detach = (win: BrowserWindow, view: WebContentsView) => { try { win.contentView.removeChildView(view) } catch {} }
 
-  async function applySubpixel(view: BrowserView, tx: number, ty: number) {
-    const js = `
-      (function () {
-        const el = document.documentElement;
-        const t = 'translate3d(${tx}px, ${ty}px, 0)';
-        if (el.style.transform !== t) el.style.transform = t;
-      })();
-    `
-    try { await view.webContents.executeJavaScript(js) } catch {}
-  }
+  const currentEff = () => clamp((canvasZoom || 1) * ZOOM_RATIO, 0.05, CHROME_MAX)
 
-  async function ensureDebugger(view: BrowserView, state: ViewState) {
-    if (state.dbgAttached) return
-    try { view.webContents.debugger.attach('1.3'); state.dbgAttached = true } catch {}
-  }
-  async function clearEmulation(view: BrowserView, state: ViewState) {
-    if (!state.dbgAttached) return
-    try { await view.webContents.debugger.sendCommand('Emulation.clearDeviceMetricsOverride', {}) } catch {}
-    state.extraScale = 1
-  }
-  async function applyEmulation(view: BrowserView, state: ViewState) {
-    if (!state.dbgAttached || !state.lastIntRect) return
-    const { w, h } = state.lastIntRect
-    const s = state.extraScale
-    const emuWidth  = Math.max(1, Math.floor(w / s))
-    const emuHeight = Math.max(1, Math.floor(h / s))
+  async function clearEmuIfAny(view: WebContentsView) {
     try {
-      await view.webContents.debugger.sendCommand('Emulation.setDeviceMetricsOverride', {
-        width: emuWidth,
-        height: emuHeight,
-        deviceScaleFactor: 0,
-        scale: s,
-        mobile: false,
-        screenWidth: emuWidth,
-        screenHeight: emuHeight,
-        positionX: 0,
-        positionY: 0,
-        dontSetVisibleSize: false,
+      const wc = view.webContents as any
+      if (wc.debugger.isAttached()) {
+        await wc.debugger.sendCommand('Emulation.clearDeviceMetricsOverride', {})
+        wc.debugger.detach()
+      }
+    } catch {}
+  }
+
+  // Apply one effective zoom to a view (native >= 0.25; minimal emu below)
+  async function setEff(view: WebContentsView, eff: number) {
+    if (eff >= CHROME_MIN) {
+      try { await view.webContents.setZoomFactor(eff) } catch {}
+      await clearEmuIfAny(view)
+      return
+    }
+    // eff < 0.25 → keep Chromium at 0.25 and emulate remaining scale
+    try { await view.webContents.setZoomFactor(CHROME_MIN) } catch {}
+    try {
+      const wc = view.webContents as any
+      if (!wc.debugger.isAttached()) wc.debugger.attach('1.3')
+      const scale = Math.max(0.05, Math.min(1, eff / CHROME_MIN))
+      const b = view.getBounds()
+      const emuW = Math.max(1, Math.floor(b.width / scale))
+      const emuH = Math.max(1, Math.floor(b.height / scale))
+      await wc.debugger.sendCommand('Emulation.setDeviceMetricsOverride', {
+        width: emuW, height: emuH, deviceScaleFactor: 0, scale,
+        mobile: false, screenWidth: emuW, screenHeight: emuH,
+        positionX: 0, positionY: 0, dontSetVisibleSize: false,
       })
     } catch {}
   }
 
-  function attach(win: BrowserWindow, view: BrowserView) { try { win.addBrowserView(view) } catch {} }
-  function detach(win: BrowserWindow, view: BrowserView) { try { win.removeBrowserView(view) } catch {} }
+  // Reapply exact current effective zoom (no animations)
+  async function reapplyNoAnim(view: WebContentsView, state: ViewState) {
+    const eff = currentEff()
+    await setEff(view, eff)
+    state.lastAppliedZoom = eff
+  }
 
-  // ---- IPC ----
+  // ----------------------------- IPC -----------------------------
 
   ipcMain.handle('overlay:create-tab', async (_e, payload?: { url?: string }) => {
     const win = getWindow()
     if (!win) return { ok: false }
+
     const tabId = randomUUID()
-    const view = new BrowserView({
+    const view = new WebContentsView({
       webPreferences: {
         devTools: true,
         contextIsolation: true,
         nodeIntegration: false,
-        plugins: false,
         backgroundThrottling: false,
-      },
+      }
     })
 
-    // Lock Chromium's own zoom (pinch) and reset page zoom
+    // Lock user page-zoom (we control it centrally)
     try {
       view.webContents.setZoomFactor(1)
-      // Hard-lock pinch/visual zoom (trackpad gesture)
       view.webContents.setVisualZoomLevelLimits(1, 1)
     } catch {}
 
-    // 🔧 Your DevTools toggle — kept
+    const state: ViewState = { view, lastBounds: null, lastAppliedZoom: undefined }
+    views.set(tabId, state)
+
+    // Keep zoom consistent across navigations (reapply exact current eff, no compounding)
+    const reapply = () => reapplyNoAnim(view, state)
+    view.webContents.on('dom-ready', reapply)
+    view.webContents.on('did-navigate', reapply)
+    view.webContents.on('did-navigate-in-page', reapply)
+
+    // Minimal key handling: DevTools toggle + block page zoom combos
     view.webContents.on('before-input-event', (event, input) => {
       const mod = input.control || input.meta
-      const isToggle = (input.key?.toLowerCase() === 'i' && mod && input.shift) || input.key === 'F12'
-      if (isToggle) {
+      const key = (input.key || '').toLowerCase()
+
+      // DevTools
+      if ((key === 'i' && mod && input.shift) || input.key === 'F12') {
         event.preventDefault()
         if (view.webContents.isDevToolsOpened()) view.webContents.closeDevTools()
         else view.webContents.openDevTools({ mode: 'detach' })
         return
       }
 
-      // Block keyboard zoom (Cmd/Ctrl +, -, 0)
-      if (mod) {
-        const key = (input.key || '').toLowerCase()
-        if (key === '=' || key === '+' || key === '-' || key === '_' || key === '0') {
-          event.preventDefault()
-          // Forward to renderer as “app zoom” (your existing pattern)
-          if (key === '=' || key === '+') {
-            currentZoom = clamp(currentZoom * 1.1, MIN_EFFECTIVE_ZOOM, CHROME_MAX)
-          } else if (key === '-' || key === '_') {
-            currentZoom = clamp(currentZoom / 1.1, MIN_EFFECTIVE_ZOOM, CHROME_MAX)
-          } else if (key === '0') {
-            currentZoom = 1
-          }
-          win.webContents.send('overlay:zoom-from-page', { factor: currentZoom })
-          return
-        }
-      }
-
-      // Block Ctrl/⌘ + trackpad wheel zoom (Chromium synthesizes wheel+ctrl for pinch-to-zoom)
-      if (input.type === 'mouseWheel' && (input.control || input.meta)) {
+      // Block page zoom shortcuts; renderer owns canvasZoom
+      if (mod && (key === '=' || key === '+' || key === '-' || key === '_' || key === '0')) {
         event.preventDefault()
         return
       }
-    })
-
-    // Re-apply CSS/emulation on navigation so styles persist
-    view.webContents.on('dom-ready', () => {
-      const s = views.get(tabId)
-      if (!s) return
-      s.baseCssKey = null
-      ensureBaseCSS(tabId, view)
-      if (s.mode === 'emu') {
-        ensureDebugger(view, s).then(() => applyEmulation(view, s)).catch(() => {})
+      if (input.type === 'mouseWheel' && (input.control || input.meta)) {
+        event.preventDefault()
       }
     })
 
-    views.set(tabId, {
-      view,
-      lastIntRect: null,
-      frac: { fx: 0, fy: 0 },
-      baseCssKey: null,
-      dbgAttached: false,
-      extraScale: 1,
-
-      // smoothing / mode
-      mode: 'native',
-      lastAppliedZoom: undefined,
-      lastZoomAt: 0,
-    })
     attach(win, view)
+
+    // Apply current global zoom immediately (no animation)
+    await reapplyNoAnim(view, state)
 
     try { await view.webContents.loadURL(payload?.url || 'https://google.com/') } catch {}
     return { ok: true, tabId }
   })
 
-  ipcMain.handle('overlay:get-zoom', async () => currentZoom)
+  ipcMain.handle('overlay:get-zoom', async () => canvasZoom)
 
   ipcMain.handle('overlay:show', async (_e, { tabId, rect }: { tabId: string; rect: Rect }) => {
     const win = getWindow()
     const { view, state } = resolve(tabId)
     if (!win || !view || !state) return
-    const bx = Math.floor(rect.x), by = Math.floor(rect.y)
-    const bw = Math.ceil(rect.width), bh = Math.ceil(rect.height)
-    state.lastIntRect = { x: bx, y: by, w: bw, h: bh }
-    state.frac = { fx: rect.x - bx, fy: rect.y - by }
+    const x = Math.floor(rect.x), y = Math.floor(rect.y)
+    const w = Math.ceil(rect.width), h = Math.ceil(rect.height)
+    state.lastBounds = { x, y, w, h }
     attach(win, view)
-    view.setBounds({ x: bx, y: by, width: bw, height: bh })
-    await ensureBaseCSS(tabId, view)
-    await applySubpixel(view, -state.frac.fx, -state.frac.fy)
-    if (state.extraScale < 1) {
-      await ensureDebugger(view, state)
-      await applyEmulation(view, state)
-    }
+    try { view.setBounds({ x, y, width: w, height: h }) } catch {}
+    if (currentEff() < CHROME_MIN) await reapplyNoAnim(view, state) // emu needs bounds
   })
 
   ipcMain.handle('overlay:set-bounds', async (_e, { tabId, rect }: { tabId: string; rect: Rect }) => {
     const { view, state } = resolve(tabId)
     if (!view || !state) return
-    const bx = Math.floor(rect.x), by = Math.floor(rect.y)
-    const bw = Math.ceil(rect.width), bh = Math.ceil(rect.height)
-    const changed = !state.lastIntRect ||
-      bx !== state.lastIntRect.x || by !== state.lastIntRect.y ||
-      bw !== state.lastIntRect.w || bh !== state.lastIntRect.h
-    if (changed) {
-      state.lastIntRect = { x: bx, y: by, w: bw, h: bh }
-      try { view.setBounds({ x: bx, y: by, width: bw, height: bh }) } catch {}
-      if (state.extraScale < 1) {
-        await ensureDebugger(view, state)
-        await applyEmulation(view, state)
-      }
+    const x = Math.floor(rect.x), y = Math.floor(rect.y)
+    const w = Math.ceil(rect.width), h = Math.ceil(rect.height)
+    const b = state.lastBounds
+    if (!b || x !== b.x || y !== b.y || w !== b.w || h !== b.h) {
+      state.lastBounds = { x, y, w, h }
+      try { view.setBounds({ x, y, width: w, height: h }) } catch {}
+      if (currentEff() < CHROME_MIN) await reapplyNoAnim(view, state)
     }
-    state.frac = { fx: rect.x - bx, fy: rect.y - by }
-    await applySubpixel(view, -state.frac.fx, -state.frac.fy)
   })
 
-  ipcMain.handle('overlay:set-zoom', async (_e, { tabId, factor }: { tabId: string; factor: number }) => {
-    const { view, state } = resolve(tabId)
-    if (!view || !state) return
+  // Renderer tells us the raw canvas zoom; compute effective once and push (no animation)
+  ipcMain.handle('overlay:set-zoom', async (_e, { tabId, factor }: { tabId?: string; factor: number }) => {
+    canvasZoom = factor || 1
+    const target = currentEff()
 
-    // throttle
-    const now = Date.now()
-    if (state.lastZoomAt && now - state.lastZoomAt < ZOOM_MIN_INTERVAL_MS) return
-    state.lastZoomAt = now
-
-    // apply ratio, clamp & quantize
-    let target = clamp((factor || 1) * ZOOM_RATIO, MIN_EFFECTIVE_ZOOM, CHROME_MAX)
-    target = Math.round(target / ZOOM_QUANTUM) * ZOOM_QUANTUM
-
-    // deadband vs last applied
-    if (state.lastAppliedZoom && Math.abs(target - state.lastAppliedZoom) < ZOOM_EPS * Math.max(1, state.lastAppliedZoom)) {
-      return
-    }
-
-    // decide mode with hysteresis around CHROME_MIN
-    const wantNative = state.mode === 'emu'
-      ? target >= (CHROME_MIN + MODE_HYST)
-      : target >= CHROME_MIN
-
-    if (wantNative) {
-      // switch from emulation if needed
-      if (state.mode !== 'native') {
-        state.mode = 'native'
-        state.extraScale = 1
-        await clearEmulation(view, state)
-      }
-      try { await view.webContents.setZoomFactor(target) } catch {}
+    if (tabId) {
+      const { view, state } = resolve(tabId)
+      if (!view || !state) return
+      await setEff(view, target)
       state.lastAppliedZoom = target
-      currentZoom = target
     } else {
-      // emulation path below CHROME_MIN
-      const extra = target / CHROME_MIN
-      const extraQ = Math.max(0.01, Math.round(extra / ZOOM_QUANTUM) * ZOOM_QUANTUM)
-
-      if (state.mode !== 'emu') {
-        state.mode = 'emu'
-        try { await view.webContents.setZoomFactor(CHROME_MIN) } catch {}
-        await ensureDebugger(view, state)
+      for (const [, s] of views) {
+        await setEff(s.view, target)
+        s.lastAppliedZoom = target
       }
-
-      if (Math.abs((state.extraScale ?? 1) - extraQ) >= ZOOM_EPS * Math.max(1, state.extraScale ?? 1)) {
-        state.extraScale = extraQ
-        await applyEmulation(view, state)
-      }
-
-      state.lastAppliedZoom = target
-      currentZoom = target
     }
-
-    await ensureBaseCSS(tabId, view)
-    await applySubpixel(view, -state.frac.fx, -state.frac.fy)
   })
 
   ipcMain.handle('overlay:hide', async (_e, { tabId }: { tabId: string }) => {
@@ -297,16 +194,32 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null) {
     detach(win, view)
   })
 
-    ipcMain.handle('overlay:destroy', async (_e, { tabId }: { tabId: string }) => {
+  ipcMain.handle('overlay:destroy', async (_e, { tabId }: { tabId: string }) => {
     const win = getWindow()
-    const { view, state } = resolve(tabId)
+    const { view } = resolve(tabId)
     if (win && view) {
-      try { if (state?.dbgAttached) { try { await view.webContents.debugger.detach() } catch {} } }
-      finally { detach(win, view) }
+      try {
+        await clearEmuIfAny(view)
+        detach(win, view)
+        try { view.webContents.stop() } catch {}
+        try { view.webContents.setAudioMuted(true) } catch {}
+        try { (view.webContents as any).destroy() } catch {}
+      } finally {
+        for (const [k, s] of views) if (s.view === view) { views.delete(k); break }
+      }
     }
-    views.delete(tabId)
   })
 
+  ipcMain.handle('overlay:capture', async (_e, { tabId }: { tabId: string }) => {
+    const { view } = resolve(tabId)
+    if (!view) return { ok: false }
+    try {
+      const image = await view.webContents.capturePage()
+      const png = image.toPNG({ scaleFactor: 1 })
+      const dataUrl = `data:image/png;base64,${Buffer.from(png).toString('base64')}`
+      return { ok: true, dataUrl }
+    } catch { return { ok: false } }
+  })
 
   ipcMain.handle('overlay:focus', async (_e, p?: { tabId?: string }) => {
     const { view } = resolve(p?.tabId ?? null)
