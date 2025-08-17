@@ -1,24 +1,24 @@
 {
-  "name": "app",
+  "name": "canvas-browser",
   "version": "1.0.0",
-  "description": "An Electron application with React and TypeScript",
-  "main": "./out/main/index.js",
-  "author": "example.com",
+  "description": "An infinite browser",
+  "main": "out/main/index.js",            
+  "author": "Ajinkya",
   "homepage": "https://electron-vite.org",
   "scripts": {
-    "format": "prettier --write .",
+    "dev": "electron-vite dev",
+    "build": "npm run typecheck && electron-vite build",   
+    "preview": "electron-vite preview",                    
+    "dist": "npm run build && electron-builder",           
+    "dist:win": "npm run build && electron-builder --win",
+    "dist:mac": "npm run build && electron-builder --mac",
+    "dist:linux": "npm run build && electron-builder --linux",
     "lint": "eslint --cache .",
+    "format": "prettier --write .",
     "typecheck:node": "tsc --noEmit -p tsconfig.node.json --composite false",
     "typecheck:web": "tsc --noEmit -p tsconfig.web.json --composite false",
     "typecheck": "npm run typecheck:node && npm run typecheck:web",
-    "start": "electron-vite preview",
-    "dev": "electron-vite dev",
-    "build": "npm run typecheck && electron-vite build",
-    "postinstall": "electron-builder install-app-deps",
-    "build:unpack": "npm run build && electron-builder --dir",
-    "build:win": "npm run build && electron-builder --win",
-    "build:mac": "electron-vite build && electron-builder --mac",
-    "build:linux": "electron-vite build && electron-builder --linux"
+    "postinstall": "electron-builder install-app-deps"
   },
   "dependencies": {
     "@electron-toolkit/preload": "^3.0.2",
@@ -47,5 +47,47 @@
     "react-dom": "^19.1.0",
     "typescript": "^5.8.3",
     "vite": "^7.0.5"
+  },
+"build": {
+  "appId": "com.example.Paper",
+  "productName": "Paper",
+
+  "directories": {
+    "output": "release",
+    "buildResources": "build"           
+  },
+
+  "files": [
+    "out/**/*",
+    "package.json",
+    "build/icon.png"                     
+  ],
+  "asar": true,
+
+  "mac": {
+    "target": ["dmg", "zip"],
+    "category": "public.app-category.developer-tools",
+    "hardenedRuntime": true,
+    "entitlements": "build/entitlements.mac.plist",
+    "entitlementsInherit": "build/entitlements.mac.plist",
+    "icon": "build/icon.icns"            
+  },
+
+  "win": {
+    "target": [{ "target": "nsis", "arch": ["x64"] }],
+    "icon": "build/icon.ico"             
+  },
+
+  "linux": {
+    "target": ["AppImage", "deb"],
+    "category": "Utility",
+    "icon": "build/icon.png"             
+  },
+
+  "nsis": {
+    "oneClick": false,
+    "allowToChangeInstallationDirectory": true
   }
+}
+
 }

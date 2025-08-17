@@ -18,7 +18,7 @@ function WithHotkeys() {
         type: 'browser-shape',
         x: center.x - 500,
         y: center.y - 330,
-        props: { w: 1000, h: 660, url: 'https://example.com', tabId: '' },
+        props: { w: 1000, h: 660, url: 'https://google.com', tabId: '' },
       })
     }
     window.addEventListener('keydown', onKeyDown)
@@ -29,7 +29,10 @@ function WithHotkeys() {
 
 export default function App() {
   const shapeUtils = useMemo(() => [BrowserShapeUtil], [])
-  const assetUrls = useMemo(() => getAssetUrls({ baseUrl: '/tldraw-assets' }), [])
+  const assetUrls = useMemo(
+  () => getAssetUrls({ baseUrl: import.meta.env.DEV ? '/tldraw-assets' : './tldraw-assets' }),
+  []
+)
   return (
     <div style={{ width: '100vw', height: '100vh' }}>
       <Tldraw

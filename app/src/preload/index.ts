@@ -1,28 +1,28 @@
+// src/preload/index.ts
 import { contextBridge, ipcRenderer } from 'electron'
 
-type Rect = { x: number; y: number; width: number; height: number }
-const call = <T = unknown>(channel: string, ...args: any[]) =>
-  ipcRenderer.invoke(channel, ...args) as Promise<T>
+// 1) Versions bridge
+contextBridge.exposeInMainWorld('electron', {
+  process: { versions: process.versions }
+})
 
+// 2) Your existing overlay bridge (example shape)
 contextBridge.exposeInMainWorld('overlay', {
-  createTab(url: string): Promise<string> { return call('overlay:create-tab', url) },
-  closeTab(tabId: string): Promise<void> { return call('overlay:close-tab', tabId) },
-
-  show(a: any, b?: Rect): Promise<void> {
-    if (typeof a === 'string') return call('overlay:show', { tabId: a, rect: b! })
-    return call('overlay:show', a)
-  },
-
-  hide(payload?: { tabId?: string }): Promise<void> { return call('overlay:hide', payload) },
-
-  setBounds(a: any): Promise<void> {
-    return call('overlay:set-bounds', typeof a?.tabId === 'string' ? a : { tabId: a.tabId, rect: a.rect })
-  },
-
-  setZoom(a: any): Promise<void> {
-    return call('overlay:set-zoom', typeof a === 'number' ? { factor: a } : a)
-  },
-
-  focus(payload?: { tabId?: string }): Promise<void> { return call('overlay:focus', payload) },
-  blur(): Promise<void> { return call('overlay:blur') },
+  createTab: (payload: { url?: string }) =>
+    ipcRenderer.invoke('overlay:create-tab', payload),
+  show: (payload: { tabId: string; rect: { x: number; y: number; width: number; height: number } }) =>
+    ipcRenderer.invoke('overlay:show', payload),
+  hide: (payload: { tabId: string }) =>
+    ipcRenderer.invoke('overlay:hide', payload),
+  destroy: (payload: { tabId: string }) =>
+    ipcRenderer.invoke('overlay:destroy', payload),
+  setBounds: (payload: { tabId: string; rect: { x: number; y: number; width: number; height: number }; dpr?: number }) =>
+    ipcRenderer.invoke('overlay:set-bounds', payload),
+  setZoom: (payload: { tabId: string; factor: number }) =>
+    ipcRenderer.invoke('overlay:set-zoom', payload),
+  capture: (payload: { tabId: string }) =>
+    ipcRenderer.invoke('overlay:capture', payload),
+  focus: (payload?: { tabId?: string }) =>
+    ipcRenderer.invoke('overlay:focus', payload),
+  blur: () => ipcRenderer.invoke('overlay:blur'),
 })
