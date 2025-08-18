@@ -2,17 +2,14 @@
 
 export type Rect = { x: number; y: number; width: number; height: number }
 
-// --- Results
-export interface TabResult {
-  ok: boolean
-  tabId?: string
-  error?: string
-}
+// --- Results (discriminated unions)
+export type TabResult =
+  | { ok: true; tabId: string }
+  | { ok: false; error: string }
 
-export interface SimpleResult {
-  ok: boolean
-  error?: string
-}
+export type SimpleResult =
+  | { ok: true }
+  | { ok: false; error: string }
 
 export interface NavigationState {
   currentUrl: string
@@ -21,11 +18,13 @@ export interface NavigationState {
   title: string
 }
 
-export interface NavigationStateResult extends NavigationState {
-  ok: boolean
-  /** optional signal surfaced from main via webContents.isLoading() */
-  isLoading?: boolean
-}
+export type NavigationStateResult =
+  | ({ ok: true } & NavigationState & { /** surfaced from main via isLoading() */ isLoading: boolean })
+  | { ok: false; error: string }
+
+export type CaptureResult =
+  | { ok: true; dataUrl: string }
+  | { ok: false; error: string }
 
 // --- Payloads
 export interface CreateTabPayload {
@@ -38,7 +37,7 @@ export interface TabIdPayload {
 
 export interface BoundsPayload {
   tabId: string
-  /** screen-space rect for the BrowserView */
+  /** screen-space rect for the WebContentsView */
   rect: Rect
 }
 
@@ -53,6 +52,7 @@ export interface NavigatePayload {
   url: string
 }
 
+// --- API surface
 export interface OverlayAPI {
   // lifecycle / placement
   createTab(payload?: CreateTabPayload): Promise<TabResult>
@@ -65,7 +65,7 @@ export interface OverlayAPI {
   // focus / capture (optional)
   focus(payload?: Partial<TabIdPayload>): Promise<void>
   blur(): Promise<void>
-  capture(payload: TabIdPayload): Promise<{ ok: boolean; dataUrl?: string }>
+  capture(payload: TabIdPayload): Promise<CaptureResult>
 
   // navigation
   navigate(payload: NavigatePayload): Promise<SimpleResult>

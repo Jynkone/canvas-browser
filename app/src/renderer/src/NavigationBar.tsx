@@ -14,7 +14,40 @@ interface NavigationBarProps {
   onReload: () => void
 }
 
-export const NAV_BAR_HEIGHT = 44
+// Type-safe button keys
+const BUTTON_KEYS = {
+  BACK: 'back',
+  FORWARD: 'forward',
+  RELOAD: 'reload'
+} as const
+
+type ButtonKey = typeof BUTTON_KEYS[keyof typeof BUTTON_KEYS]
+
+// Style constants with proper typing
+const STYLES = {
+  NAV_BAR_HEIGHT: 44,
+  COLORS: {
+    PRIMARY: '#007bff',
+    BACKGROUND: '#f0f0f0',
+    DISABLED_BACKGROUND: '#e0e0e0',
+    DISABLED_TEXT: '#999',
+    TEXT: '#333',
+    BORDER: '#dee2e6',
+    BORDER_BOTTOM: '#adb5bd',
+    INPUT_BORDER: '#ced4da',
+    INPUT_FOCUS_SHADOW: 'rgba(0, 123, 255, 0.35)',
+    INPUT_HOVER_SHADOW: 'rgba(0,0,0,0.12)',
+    ACTIVE_BACKGROUND: '#d0e4ff'
+  },
+  TRANSITIONS: {
+    TRANSFORM: 'transform 0.25s cubic-bezier(0.2, 0, 0, 1.2)',
+    BACKGROUND: 'background-color 0.25s ease',
+    ALL: 'all 0.25s ease'
+  },
+  ANIMATION_DURATION: 250
+} as const
+
+export const NAV_BAR_HEIGHT = STYLES.NAV_BAR_HEIGHT
 
 export const NavigationBar: React.FC<NavigationBarProps> = ({
   navState,
@@ -25,7 +58,7 @@ export const NavigationBar: React.FC<NavigationBarProps> = ({
   onReload
 }) => {
   const [urlInput, setUrlInput] = useState(navState.currentUrl)
-  const [clicking, setClicking] = useState<string | null>(null)
+  const [clicking, setClicking] = useState<ButtonKey | null>(null)
 
   useEffect(() => {
     setUrlInput(navState.currentUrl)
@@ -36,45 +69,50 @@ export const NavigationBar: React.FC<NavigationBarProps> = ({
     const trimmed = urlInput.trim()
     if (!trimmed) return
 
-    if (trimmed.startsWith('http://') || trimmed.startsWith('https://')) {
+    // Type-safe URL validation
+    const isHttpUrl = trimmed.startsWith('http://') || trimmed.startsWith('https://')
+    const isDomainLike = trimmed.includes('.')
+
+    if (isHttpUrl) {
       onUrlChange(trimmed)
-    } else if (trimmed.includes('.')) {
+    } else if (isDomainLike) {
       onUrlChange(`https://${trimmed}`)
     } else {
       onUrlChange(`https://www.google.com/search?q=${encodeURIComponent(trimmed)}`)
     }
   }, [urlInput, onUrlChange])
 
-  // --- Styles ---
+  // Type-safe styles - exactly like original but with constants
   const baseButton: React.CSSProperties = {
     width: '32px',
     height: '32px',
     border: 'none',
     borderRadius: '4px',
-    background: '#f0f0f0',
+    background: STYLES.COLORS.BACKGROUND,
     cursor: 'pointer',
     display: 'flex',
     alignItems: 'center',
     justifyContent: 'center',
     fontSize: '14px',
-    color: '#333',
-    transition: 'transform 0.25s cubic-bezier(0.2, 0, 0, 1.2), background-color 0.25s ease',
+    color: STYLES.COLORS.TEXT,
+    transition: `${STYLES.TRANSITIONS.TRANSFORM}, ${STYLES.TRANSITIONS.BACKGROUND}`,
     userSelect: 'none'
   }
+
   const disabledButton: React.CSSProperties = {
     ...baseButton,
-    background: '#e0e0e0',
-    color: '#999',
+    background: STYLES.COLORS.DISABLED_BACKGROUND,
+    color: STYLES.COLORS.DISABLED_TEXT,
     cursor: 'not-allowed'
   }
 
-  // --- Helper for buttons ---
+  // Helper for buttons - exactly like original logic
   const makeButton = (
-    key: string,
+    key: ButtonKey,
     label: string,
     handler: () => void,
-    disabled?: boolean,
-    title?: string
+    disabled: boolean,
+    title: string
   ) => {
     const isActive = clicking === key
     return (
@@ -84,14 +122,15 @@ export const NavigationBar: React.FC<NavigationBarProps> = ({
           if (!disabled) {
             setClicking(key)
             handler()
-            setTimeout(() => setClicking(null), 250)
+            setTimeout(() => setClicking(null), STYLES.ANIMATION_DURATION)
           }
         }}
         disabled={disabled}
         style={{
           ...(disabled ? disabledButton : baseButton),
           transform: isActive ? 'scale(0.8)' : 'scale(1.0)',
-          background: isActive ? '#d0e4ff' : (disabled ? disabledButton.background : baseButton.background)
+          background: isActive ? STYLES.COLORS.ACTIVE_BACKGROUND : 
+                     (disabled ? STYLES.COLORS.DISABLED_BACKGROUND : STYLES.COLORS.BACKGROUND)
         }}
         title={title}
       >
@@ -103,11 +142,11 @@ export const NavigationBar: React.FC<NavigationBarProps> = ({
   return (
     <div
       style={{
-        height: `${NAV_BAR_HEIGHT}px`,
+        height: `${STYLES.NAV_BAR_HEIGHT}px`,
         width: '100%',
         background: 'linear-gradient(135deg, #f8f9fa 0%, #e9ecef 100%)',
-        border: '1px solid #dee2e6',
-        borderBottom: '1px solid #adb5bd',
+        border: `1px solid ${STYLES.COLORS.BORDER}`,
+        borderBottom: `1px solid ${STYLES.COLORS.BORDER_BOTTOM}`,
         borderRadius: '6px 6px 0 0',
         display: 'flex',
         alignItems: 'center',
@@ -127,9 +166,9 @@ export const NavigationBar: React.FC<NavigationBarProps> = ({
       onMouseUp={(e) => e.stopPropagation()}
       onClick={(e) => e.stopPropagation()}
     >
-      {makeButton('back', '←', onBack, !navState.canGoBack, 'Go back')}
-      {makeButton('forward', '→', onForward, !navState.canGoForward, 'Go forward')}
-      {makeButton('reload', '↻', onReload, false, 'Reload')}
+      {makeButton(BUTTON_KEYS.BACK, '←', onBack, !navState.canGoBack, 'Go back')}
+      {makeButton(BUTTON_KEYS.FORWARD, '→', onForward, !navState.canGoForward, 'Go forward')}
+      {makeButton(BUTTON_KEYS.RELOAD, '↻', onReload, false, 'Reload')}
 
       <form onSubmit={handleSubmit} style={{ flex: 1, display: 'flex' }}>
         <input
@@ -141,28 +180,28 @@ export const NavigationBar: React.FC<NavigationBarProps> = ({
             flex: 1,
             height: '32px',
             padding: '0 12px',
-            border: '1px solid #ced4da',
+            border: `1px solid ${STYLES.COLORS.INPUT_BORDER}`,
             borderRadius: '6px',
             outline: 'none',
             fontSize: '13px',
             fontFamily: 'system-ui, sans-serif',
             background: 'white',
             boxSizing: 'border-box',
-            transition: 'all 0.25s ease',
+            transition: STYLES.TRANSITIONS.ALL,
             whiteSpace: 'nowrap',
             overflow: 'hidden',
             textOverflow: 'ellipsis'
           }}
           onFocus={(e) => {
             e.currentTarget.select()
-            e.currentTarget.style.borderColor = '#007bff'
-            e.currentTarget.style.boxShadow = '0 0 6px rgba(0, 123, 255, 0.35)'
+            e.currentTarget.style.borderColor = STYLES.COLORS.PRIMARY
+            e.currentTarget.style.boxShadow = `0 0 6px ${STYLES.COLORS.INPUT_FOCUS_SHADOW}`
             e.currentTarget.style.background = '#ffffff'
             e.currentTarget.style.overflow = 'visible'
             e.currentTarget.style.textOverflow = 'clip'
           }}
           onBlur={(e) => {
-            e.currentTarget.style.borderColor = '#ced4da'
+            e.currentTarget.style.borderColor = STYLES.COLORS.INPUT_BORDER
             e.currentTarget.style.boxShadow = 'none'
             e.currentTarget.style.background = 'white'
             e.currentTarget.style.overflow = 'hidden'
@@ -182,12 +221,12 @@ export const NavigationBar: React.FC<NavigationBarProps> = ({
             if (document.activeElement !== e.currentTarget) {
               e.currentTarget.style.borderColor = '#bbb'
               e.currentTarget.style.background = '#fefefe'
-              e.currentTarget.style.boxShadow = '0 0 6px rgba(0,0,0,0.12)'
+              e.currentTarget.style.boxShadow = `0 0 6px ${STYLES.COLORS.INPUT_HOVER_SHADOW}`
             }
           }}
           onMouseLeave={(e) => {
             if (document.activeElement !== e.currentTarget) {
-              e.currentTarget.style.borderColor = '#ced4da'
+              e.currentTarget.style.borderColor = STYLES.COLORS.INPUT_BORDER
               e.currentTarget.style.background = 'white'
               e.currentTarget.style.boxShadow = 'none'
             }
@@ -210,7 +249,7 @@ export const NavigationBar: React.FC<NavigationBarProps> = ({
             style={{
               height: '100%',
               width: '30%',
-              background: '#007bff',
+              background: STYLES.COLORS.PRIMARY,
               animation: 'loadingBar 1.1s linear infinite'
             }}
           />

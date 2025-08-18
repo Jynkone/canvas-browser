@@ -136,62 +136,65 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null) {
   // IPC
 
   ipcMain.handle('overlay:create-tab', async (_e, payload?: { url?: string }): Promise<CreateTabResponse> => {
-    const win = getWindow()
-    if (!win || win.isDestroyed()) return { ok: false, error: 'No window' }
-    if (views.size >= MAX_VIEWS) return { ok: false, error: `Too many tabs (${views.size})` }
+  const win = getWindow()
+  if (!win || win.isDestroyed()) return { ok: false, error: 'No window' }
+  if (views.size >= MAX_VIEWS) return { ok: false, error: `Too many tabs (${views.size})` }
 
-    return enqueue(async () => {
-      const tabId = randomUUID()
-      let state: ViewState | undefined
+  return enqueue(async () => {
+    const tabId = randomUUID()
+    let state: ViewState | undefined
 
-      try {
-        const view = new WebContentsView({
-          webPreferences: { devTools: true, contextIsolation: true, nodeIntegration: false, backgroundThrottling: false },
-        })
-        try { view.webContents.setZoomFactor(1); view.webContents.setVisualZoomLevelLimits(1, 1) } catch {}
+    try {
+      const view = new WebContentsView({
+        webPreferences: { devTools: true, contextIsolation: true, nodeIntegration: false, backgroundThrottling: false },
+      })
+      try { view.webContents.setZoomFactor(1); view.webContents.setVisualZoomLevelLimits(1, 1) } catch {}
 
-        state = {
-          view, attached: false,
-          lastBounds: { x: 0, y: 0, w: 1, h: 1 },
-          lastAppliedZoom: 1,
-          navState: { currentUrl: payload?.url || 'https://google.com/', canGoBack: false, canGoForward: false, title: '' },
-        }
-        views.set(tabId, state)
-
-        const safeReapply = () => { if (!state) return; void S.reapply(state); S.updateNav(state) }
-        view.webContents.on('dom-ready', safeReapply)
-        view.webContents.on('did-navigate', safeReapply)
-        view.webContents.on('did-navigate-in-page', safeReapply)
-        view.webContents.on('page-title-updated', () => { if (state) S.updateNav(state) })
-        view.webContents.on('render-process-gone', () => { try { const w = getWindow(); if (w && !w.isDestroyed() && state) S.detach(w, state) } catch {}; views.delete(tabId) })
-
-        view.webContents.on('before-input-event', (event, input: Input) => {
-          if (!state) return
-          try {
-            const mod = input.control || input.meta
-            const key = (input.key || '').toLowerCase()
-            if ((key === 'i' && mod && input.shift) || key === 'f12') {
-              event.preventDefault()
-              if (view.webContents.isDevToolsOpened()) view.webContents.closeDevTools()
-              else view.webContents.openDevTools({ mode: 'detach' }); return
-            }
-            if (input.alt && key === 'arrowleft' && state.navState.canGoBack) { event.preventDefault(); view.webContents.navigationHistory.goBack(); return }
-            if (input.alt && key === 'arrowright' && state.navState.canGoForward) { event.preventDefault(); view.webContents.navigationHistory.goForward(); return }
-            if ((mod && key === 'r') || key === 'f5') { event.preventDefault(); view.webContents.reload(); return }
-            if (mod && ['=', '+', '-', '_', '0'].includes(key)) event.preventDefault()
-            if (input.type === 'mouseWheel' && mod) event.preventDefault()
-          } catch {}
-        })
-
-        await S.reapply(state)
-        try { await view.webContents.loadURL(state.navState.currentUrl) } catch {}
-        return { ok: true, tabId }
-      } catch (err) {
-        if (state) { try { const w2 = getWindow(); if (w2 && !w2.isDestroyed()) S.detach(w2, state) } catch {}; views.delete(tabId) }
-        throw err instanceof Error ? err : new Error('Create failed')
+      state = {
+        view, attached: false,
+        lastBounds: { x: 0, y: 0, w: 1, h: 1 },
+        lastAppliedZoom: 1,
+        navState: { currentUrl: payload?.url || 'https://google.com/', canGoBack: false, canGoForward: false, title: '' },
       }
-    }) as Promise<CreateTabResponse>
+      views.set(tabId, state)
+
+      const safeReapply = () => { if (!state) return; void S.reapply(state); S.updateNav(state) }
+      view.webContents.on('dom-ready', safeReapply)
+      view.webContents.on('did-navigate', safeReapply)
+      view.webContents.on('did-navigate-in-page', safeReapply)
+      view.webContents.on('page-title-updated', () => { if (state) S.updateNav(state) })
+      view.webContents.on('render-process-gone', () => { try { const w = getWindow(); if (w && !w.isDestroyed() && state) S.detach(w, state) } catch {}; views.delete(tabId) })
+
+      view.webContents.on('before-input-event', (event, input: Input) => {
+        if (!state) return
+        try {
+          const mod = input.control || input.meta
+          const key = (input.key || '').toLowerCase()
+          if ((key === 'i' && mod && input.shift) || key === 'f12') {
+            event.preventDefault()
+            if (view.webContents.isDevToolsOpened()) view.webContents.closeDevTools()
+            else view.webContents.openDevTools({ mode: 'detach' }); return
+          }
+          if (input.alt && key === 'arrowleft' && state.navState.canGoBack) { event.preventDefault(); view.webContents.navigationHistory.goBack(); return }
+          if (input.alt && key === 'arrowright' && state.navState.canGoForward) { event.preventDefault(); view.webContents.navigationHistory.goForward(); return }
+          if ((mod && key === 'r') || key === 'f5') { event.preventDefault(); view.webContents.reload(); return }
+          if (mod && ['=', '+', '-', '_', '0'].includes(key)) event.preventDefault()
+          if (input.type === 'mouseWheel' && mod) event.preventDefault()
+        } catch {}
+      })
+
+      await S.reapply(state)
+      try { await view.webContents.loadURL(state.navState.currentUrl) } catch {}
+
+      // ✅ No cast needed — ok is a literal true, so TSuccess = { ok: true; tabId: string }
+      return { ok: true as const, tabId }
+    } catch (err) {
+      if (state) { try { const w2 = getWindow(); if (w2 && !w2.isDestroyed()) S.detach(w2, state) } catch {}; views.delete(tabId) }
+      // Let enqueue’s catch path turn this into { ok:false, error }
+      throw err ?? new Error('Create failed')
+    }
   })
+})
 
   ipcMain.handle('overlay:get-zoom', async (): Promise<number> => canvasZoom)
 

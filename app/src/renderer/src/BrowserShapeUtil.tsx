@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import {
   HTMLContainer,
   Rectangle2d,
@@ -9,37 +9,31 @@ import {
   useEditor,
 } from 'tldraw'
 import { NavigationBar, NAV_BAR_HEIGHT } from './NavigationBar'
+import type { OverlayAPI } from '../../types/overlay'
 
-export type BrowserShape = TLBaseShape<'browser-shape', {
-  w: number
-  h: number
-  url: string
-  tabId: string
-}>
+export type BrowserShape = TLBaseShape<
+  'browser-shape',
+  {
+    w: number
+    h: number
+    url: string
+    tabId: string
+  }
+>
 
+// World-space minimum logical size (not zoomed)
 const MIN_W = 900
 const MIN_H = 525 + NAV_BAR_HEIGHT
-const HIT_PAD_PX = 10
-const MIN_STROKE_PX = 1
+
+// Screen-space affordances
+const HIT_PAD_PX = 10      // extra grab halo in screen pixels
+const MIN_STROKE_PX = 1    // min indicator stroke in screen pixels
 
 type NavState = {
   currentUrl: string
   canGoBack: boolean
   canGoForward: boolean
   title: string
-}
-
-enum TabState {
-  CREATING = 'creating',
-  READY = 'ready',
-  ERROR = 'error',
-  DESTROYED = 'destroyed',
-}
-
-interface TabManager {
-  tabId: string | null
-  state: TabState
-  error: string | null
 }
 
 export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
@@ -54,19 +48,28 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
   }
 
   override onResize(shape: BrowserShape, info: TLResizeInfo<BrowserShape>) {
-    const partial = resizeBox(shape, info)
-    const w = Math.max(MIN_W, partial.props.w)
-    const h = Math.max(MIN_H, partial.props.h)
-    return { ...partial, props: { ...partial.props, w, h } }
+    const resized = resizeBox(shape, info)
+    const w = Math.max(MIN_W, resized.props.w)
+    const h = Math.max(MIN_H, resized.props.h)
+    return { ...resized, props: { ...resized.props, w, h } }
   }
 
+  // Make the hit-area bigger in screen pixels by inflating the geometry.
+  // Indicator stays at the visual bounds (see indicator below).
   override getGeometry(shape: BrowserShape) {
     const { w, h } = shape.props
     const zoom = this.editor.getZoomLevel()
-    const pad = HIT_PAD_PX / Math.max(zoom, 0.001)
-    return new Rectangle2d({ x: -pad, y: -pad, width: w + pad * 2, height: h + pad * 2, isFilled: false })
+    const pad = HIT_PAD_PX / Math.max(zoom, 0.001) // px → world units
+    return new Rectangle2d({
+      x: -pad,
+      y: -pad,
+      width: w + pad * 2,
+      height: h + pad * 2,
+      isFilled: false,
+    })
   }
 
+  // Visual selection outline: scale stroke so it stays visible at low zoom.
   override indicator(shape: BrowserShape) {
     const { w, h } = shape.props
     const zoom = this.editor.getZoomLevel()
@@ -76,13 +79,11 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
 
   override component(shape: BrowserShape) {
     const editor = useEditor()
-    const hostRef = useRef<HTMLDivElement>(null)
+    const hostRef = useRef<HTMLDivElement | null>(null)
+    const tabIdRef = useRef<string | null>(null)
 
-    const [tabManager, setTabManager] = useState<TabManager>({
-      tabId: null,
-      state: TabState.CREATING,
-      error: null,
-    })
+    const overlay: OverlayAPI | undefined = (window as unknown as { overlay?: OverlayAPI }).overlay
+
     const [navState, setNavState] = useState<NavState>({
       currentUrl: shape.props.url,
       canGoBack: false,
@@ -92,115 +93,97 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
     const [isLoading, setIsLoading] = useState(false)
     const [isGrabbing, setIsGrabbing] = useState(false)
 
-    // ---- single-flight guards (kills StrictMode double-invoke too)
-    const creatingRef = useRef(false)     // prevents concurrent create calls
-    const createdOnceRef = useRef(false)  // ignore duplicate dev StrictMode mount
-
-    // create tab exactly once per shape instance
+    // Create the tab once for this component instance
     useEffect(() => {
       let cancelled = false
+      if (!overlay) return
+      if (tabIdRef.current) return
 
-      const create = async () => {
-        if (cancelled || createdOnceRef.current || creatingRef.current) return
-        if (!window.overlay) {
-          setTabManager({ tabId: null, state: TabState.ERROR, error: 'Overlay unavailable' })
-          return
-        }
-        creatingRef.current = true
+      ;(async () => {
         try {
-          const res = await window.overlay.createTab({ url: shape.props.url })
-          if (cancelled) return
-          if (res.ok && res.tabId) {
-            createdOnceRef.current = true
-            setTabManager({ tabId: res.tabId, state: TabState.READY, error: null })
-          } else {
-            setTabManager({ tabId: null, state: TabState.ERROR, error: res.error ?? 'Create failed' })
+          const res = await overlay.createTab({ url: shape.props.url })
+          if (!cancelled && res.ok) {
+            tabIdRef.current = res.tabId
           }
-        } catch (err) {
-          if (!cancelled) {
-            setTabManager({
-              tabId: null,
-              state: TabState.ERROR,
-              error: err instanceof Error ? err.message : 'Create failed',
+        } catch {
+          // ignore (fail-soft)
+        }
+      })()
+
+      return () => {
+        cancelled = true
+      }
+    }, [overlay, shape.props.url])
+
+    // Update navigation state (polled)
+    useEffect(() => {
+      if (!overlay) return
+      let cancelled = false
+      const tick = async () => {
+        const id = tabIdRef.current
+        if (!id) return
+        try {
+          const res = await overlay.getNavigationState({ tabId: id })
+          if (!cancelled && res.ok) {
+            setNavState({
+                   currentUrl: res.currentUrl ?? 'about:blank',
+                   canGoBack: res.canGoBack ?? false,
+                   canGoForward: res.canGoForward ?? false,  
+                   title: res.title ?? '',
             })
+            setIsLoading(res.isLoading)
           }
-        } finally {
-          creatingRef.current = false
+        } catch {
+          // ignore
         }
       }
+      const handle = window.setInterval(tick, 500)
+      return () => {
+        cancelled = true
+        window.clearInterval(handle)
+      }
+    }, [overlay])
 
-      void create()
-      return () => { cancelled = true }
-      // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [shape.id, shape.props.url])
+    // Navigation handlers (typed SimpleResult but we ignore failures)
+    const handleUrlChange = async (url: string) => {
+      const id = tabIdRef.current
+      if (!overlay || !id) return
+      setIsLoading(true)
+      try { await overlay.navigate({ tabId: id, url }) } catch {}
+    }
 
-    // nav polling
-    const updateNavState = useCallback(async () => {
-      const id = tabManager.tabId
-      if (!id || !window.overlay) return
-      try {
-        const res = await window.overlay.getNavigationState({ tabId: id })
-        if (res.ok) {
-          setNavState({
-            currentUrl: res.currentUrl ?? 'about:blank',
-            canGoBack: !!res.canGoBack,
-            canGoForward: !!res.canGoForward,
-            title: res.title ?? '',
-          })
-          setIsLoading(!!res.isLoading)
-        }
-      } catch {}
-    }, [tabManager.tabId])
+    const handleBack = async () => {
+      const id = tabIdRef.current
+      if (!overlay || !id || !navState.canGoBack) return
+      setIsLoading(true)
+      try { await overlay.goBack({ tabId: id }) } catch {}
+    }
 
+    const handleForward = async () => {
+      const id = tabIdRef.current
+      if (!overlay || !id || !navState.canGoForward) return
+      setIsLoading(true)
+      try { await overlay.goForward({ tabId: id }) } catch {}
+    }
+
+    const handleReload = async () => {
+      const id = tabIdRef.current
+      if (!overlay || !id) return
+      setIsLoading(true)
+      try { await overlay.reload({ tabId: id }) } catch {}
+    }
+
+    // rAF: follow host element's rect (CSS px) and editor zoom exactly
     useEffect(() => {
-      const t = window.setInterval(updateNavState, 500)
-      return () => window.clearInterval(t)
-    }, [updateNavState])
-
-    // toolbar
-    const handleUrlChange = useCallback(async (url: string) => {
-      const id = tabManager.tabId
-      if (!id || !window.overlay) return
-      setIsLoading(true)
-      try { await window.overlay.navigate({ tabId: id, url }) } catch {}
-    }, [tabManager.tabId])
-
-    const handleBack = useCallback(async () => {
-      const id = tabManager.tabId
-      if (!id || !window.overlay || !navState.canGoBack) return
-      setIsLoading(true)
-      try { await window.overlay.goBack({ tabId: id }) } catch {}
-    }, [tabManager.tabId, navState.canGoBack])
-
-    const handleForward = useCallback(async () => {
-      const id = tabManager.tabId
-      if (!id || !window.overlay || !navState.canGoForward) return
-      setIsLoading(true)
-      try { await window.overlay.goForward({ tabId: id }) } catch {}
-    }, [tabManager.tabId, navState.canGoForward])
-
-    const handleReload = useCallback(async () => {
-      const id = tabManager.tabId
-      if (!id || !window.overlay) return
-      setIsLoading(true)
-      try { await window.overlay.reload({ tabId: id }) } catch {}
-    }, [tabManager.tabId])
-
-    // rAF bounds + zoom (same as your working version)
-    useEffect(() => {
-      if (tabManager.state !== TabState.READY || !tabManager.tabId || !window.overlay) return
-
+      if (!overlay) return
       let raf = 0
-      let lastZoom = -1
-      const lastRect = { x: -1, y: -1, width: -1, height: -1 }
       let shown = false
+      const lastRect = { x: -1, y: -1, width: -1, height: -1 }
+      let lastZoom = -1
 
-      const tick = () => {
-        raf = requestAnimationFrame(tick)
+      const currentRect = () => {
         const el = hostRef.current
-        const id = tabManager.tabId!
-        if (!el) return
-
+        if (!el) return null
         const dpr = window.devicePixelRatio || 1
         const b = el.getBoundingClientRect()
 
@@ -215,53 +198,73 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
           width: Math.ceil(rw),
           height: Math.ceil(rh),
         }
+        return rect
+      }
+
+      const loop = () => {
+        raf = requestAnimationFrame(loop)
+        const id = tabIdRef.current
+        const el = hostRef.current
+        if (!overlay || !id || !el) return
+
+        const rect = currentRect()
+        if (!rect) return
 
         if (!shown) {
           shown = true
-          window.overlay.show({ tabId: id, rect }).catch(() => {})
-          Object.assign(lastRect, rect)
+          overlay.show({ tabId: id, rect }).catch(() => {})
+          lastRect.x = rect.x
+          lastRect.y = rect.y
+          lastRect.width = rect.width
+          lastRect.height = rect.height
         } else {
-          const moved = rect.x !== lastRect.x || rect.y !== lastRect.y || rect.width !== lastRect.width || rect.height !== lastRect.height
+          const moved =
+            rect.x !== lastRect.x ||
+            rect.y !== lastRect.y ||
+            rect.width !== lastRect.width ||
+            rect.height !== lastRect.height
+
           if (moved) {
-            window.overlay.setBounds({ tabId: id, rect }).catch(() => {})
-            Object.assign(lastRect, rect)
+            overlay.setBounds({ tabId: id, rect }).catch(() => {})
+            lastRect.x = rect.x
+            lastRect.y = rect.y
+            lastRect.width = rect.width
+            lastRect.height = rect.height
           }
         }
 
         const z = editor.getZoomLevel()
         if (Math.abs(z - lastZoom) > 0.0005) {
-          window.overlay.setZoom({ tabId: id, factor: z }).catch(() => {})
+          overlay.setZoom({ tabId: id, factor: z }).catch(() => {})
           lastZoom = z
         }
       }
 
-      raf = requestAnimationFrame(tick)
+      raf = requestAnimationFrame(loop)
       return () => cancelAnimationFrame(raf)
-    }, [editor, tabManager.state, tabManager.tabId])
+    }, [overlay, editor, shape.props.w, shape.props.h])
 
-    // make visible on first pointer
+    // Ensure visible before interaction (helps if tab is hidden)
     const onPointerDown = () => {
-      const id = tabManager.tabId
-      if (!id || !window.overlay) return
+      const id = tabIdRef.current
+      if (!overlay || !id) return
       const el = hostRef.current
       if (!el) return
-      const r = el.getBoundingClientRect()
-      const rect = { x: Math.floor(r.left), y: Math.floor(r.top), width: Math.ceil(r.width), height: Math.ceil(r.height) }
-      window.overlay.show({ tabId: id, rect }).catch(() => {})
+      const b = el.getBoundingClientRect()
+      const rect = { x: Math.floor(b.x), y: Math.floor(b.y), width: Math.ceil(b.width), height: Math.ceil(b.height) }
+      overlay.show({ tabId: id, rect }).catch(() => {})
     }
 
-    // destroy tab on unmount
+    // Cleanup: destroy the tab when this shape unmounts
     useEffect(() => {
       return () => {
-        const id = tabManager.tabId
-        if (!id || !window.overlay) return
-        window.overlay.destroy({ tabId: id }).catch(() => {
-          window.overlay.hide({ tabId: id }).catch(() => {})
-        })
+        const id = tabIdRef.current
+        if (!overlay || !id) return
+        overlay.destroy({ tabId: id }).catch(() => {})
       }
-      // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [tabManager.tabId])
+    }, [overlay])
 
+    // Render
     return (
       <HTMLContainer
         style={{
@@ -271,12 +274,20 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
           pointerEvents: 'auto',
           cursor: isGrabbing ? 'grabbing' : 'grab',
         }}
-        onPointerDown={() => setIsGrabbing(true)}
-        onPointerUp={() => setIsGrabbing(false)}
-        onPointerCancel={() => setIsGrabbing(false)}
-        onPointerLeave={() => setIsGrabbing(false)}
       >
-        <div style={{ width: '100%', height: '100%', display: 'flex', flexDirection: 'column', position: 'relative' }}>
+        <div
+          style={{
+            width: '100%',
+            height: '100%',
+            display: 'flex',
+            flexDirection: 'column',
+            position: 'relative',
+          }}
+          onPointerDown={() => setIsGrabbing(true)}
+          onPointerUp={() => setIsGrabbing(false)}
+          onPointerCancel={() => setIsGrabbing(false)}
+          onPointerLeave={() => setIsGrabbing(false)}
+        >
           <NavigationBar
             navState={navState}
             isLoading={isLoading}
@@ -287,8 +298,14 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
           />
           <div
             ref={hostRef}
-            style={{ width: '100%', flex: 1, background: 'transparent', position: 'relative', pointerEvents: 'none' }}
             onPointerDown={onPointerDown}
+            style={{
+              width: '100%',
+              flex: 1,
+              background: 'transparent',
+              position: 'relative',
+              pointerEvents: 'none', // overlay handles interaction
+            }}
           />
         </div>
       </HTMLContainer>
