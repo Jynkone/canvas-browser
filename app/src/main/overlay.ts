@@ -43,13 +43,15 @@ type NavigatePayload = { tabId: string; url: string }
 type CreateTabResult = { ok: boolean; tabId?: string }
 type CaptureResult = { ok: boolean; dataUrl?: string }
 type NavigationResult = { ok: boolean }
-type NavigationStateResult = { 
-  ok: boolean; 
-  currentUrl?: string; 
-  canGoBack?: boolean; 
-  canGoForward?: boolean; 
-  title?: string 
+type NavigationStateResult = {
+  ok: boolean
+  currentUrl?: string
+  canGoBack?: boolean
+  canGoForward?: boolean
+  title?: string
+  isLoading?: boolean
 }
+
 
 // Validation functions
 function isValidUrl(url: string): boolean {
@@ -104,75 +106,107 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null): void {
   const currentEff = (): number => clamp((canvasZoom || 1) * ZOOM_RATIO, 0.05, CHROME_MAX)
 
   async function clearEmuIfAny(view: WebContentsView): Promise<void> {
-    try {
-      const wc = view.webContents
-      if (!hasDebuggerAPI(wc)) {
-        console.warn('[overlay] WebContents does not have debugger API')
-        return
-      }
+  try {
+    const wc = view.webContents
+    if (wc.isDestroyed()) return
+    if (!hasDebuggerAPI(wc)) return
 
-      if (wc.debugger.isAttached()) {
+    if (wc.debugger.isAttached()) {
+      try {
         await wc.debugger.sendCommand('Emulation.clearDeviceMetricsOverride', {})
-        wc.debugger.detach()
+      } catch (err: any) {
+        const msg = String(err?.message || err)
+        // Swallow the common navigation race
+        if (!msg.includes('target closed')) {
+          console.error('[overlay] Failed to clear emulation:', err)
+        }
+      } finally {
+        try { wc.debugger.detach() } catch {}
       }
-    } catch (error) {
-      console.error('[overlay] Failed to clear emulation:', error)
     }
+  } catch (error) {
+    console.error('[overlay] clearEmuIfAny outer error:', error)
   }
+}
+
 
   // Apply one effective zoom to a view (native >= 0.25; minimal emu below)
   async function setEff(view: WebContentsView, eff: number): Promise<void> {
-    if (eff >= CHROME_MIN) {
-      try {
-        await view.webContents.setZoomFactor(eff)
-        await clearEmuIfAny(view)
-        return
-      } catch (error) {
-        console.error('[overlay] Failed to set zoom factor:', error)
-        return
-      }
-    }
+  const wc = view.webContents
+  if (wc.isDestroyed()) return
 
-    // eff < 0.25 → keep Chromium at 0.25 and emulate remaining scale
+  // ≥ native minimum: no emulation
+  if (eff >= CHROME_MIN) {
     try {
-      await view.webContents.setZoomFactor(CHROME_MIN)
+      await wc.setZoomFactor(eff)
+      await clearEmuIfAny(view)
     } catch (error) {
-      console.error('[overlay] Failed to set minimum zoom factor:', error)
+      console.error('[overlay] Failed to set zoom factor:', error)
+    }
+    return
+  }
+
+  // < native minimum: use device-metrics emulation
+  try {
+    await wc.setZoomFactor(CHROME_MIN)
+  } catch (error) {
+    console.error('[overlay] Failed to set minimum zoom factor:', error)
+    return
+  }
+
+  // one-shot sender with optional retry on "target closed"
+  const apply = async (): Promise<void> => {
+    if (wc.isDestroyed()) return
+    if (!hasDebuggerAPI(wc)) {
+      console.warn('[overlay] Cannot use emulation: WebContents lacks debugger API')
       return
     }
-
-    try {
-      const wc = view.webContents
-      if (!hasDebuggerAPI(wc)) {
-        console.warn('[overlay] Cannot use emulation: WebContents lacks debugger API')
-        return
+    if (!wc.debugger.isAttached()) {
+      try { wc.debugger.attach('1.3') } catch (e) {
+        const msg = String((e as any)?.message || e)
+        if (!msg.includes('Already attached')) {
+          console.error('[overlay] debugger.attach failed:', e)
+          return
+        }
       }
+    }
 
-      if (!wc.debugger.isAttached()) {
-        wc.debugger.attach('1.3')
+    const scale = Math.max(0.05, Math.min(1, eff / CHROME_MIN))
+    const b = view.getBounds()
+    const emuW = Math.max(1, Math.floor(b.width / scale))
+    const emuH = Math.max(1, Math.floor(b.height / scale))
+
+    await wc.debugger.sendCommand('Emulation.setDeviceMetricsOverride', {
+      width: emuW,
+      height: emuH,
+      deviceScaleFactor: 0,
+      scale,
+      mobile: false,
+      screenWidth: emuW,
+      screenHeight: emuH,
+      positionX: 0,
+      positionY: 0,
+      dontSetVisibleSize: false,
+    })
+  }
+
+  try {
+    await apply()
+  } catch (err: any) {
+    const msg = String(err?.message || err)
+    if (msg.includes('target closed')) {
+      // target died during nav; try once more
+      try { await apply() } catch (err2) {
+        if (!String((err2 as any)?.message || err2).includes('target closed')) {
+          console.error('[overlay] Emulation retry failed:', err2)
+        }
       }
-
-      const scale = Math.max(0.05, Math.min(1, eff / CHROME_MIN))
-      const b = view.getBounds()
-      const emuW = Math.max(1, Math.floor(b.width / scale))
-      const emuH = Math.max(1, Math.floor(b.height / scale))
-
-      await wc.debugger.sendCommand('Emulation.setDeviceMetricsOverride', {
-        width: emuW,
-        height: emuH,
-        deviceScaleFactor: 0,
-        scale,
-        mobile: false,
-        screenWidth: emuW,
-        screenHeight: emuH,
-        positionX: 0,
-        positionY: 0,
-        dontSetVisibleSize: false,
-      })
-    } catch (error) {
-      console.error('[overlay] Failed to set device emulation:', error)
+    } else {
+      console.error('[overlay] Failed to set device emulation:', err)
     }
   }
+}
+
 
   // Reapply exact current effective zoom (no animations)
   async function reapplyNoAnim(view: WebContentsView, state: ViewState): Promise<void> {
@@ -182,13 +216,13 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null): void {
   }
 
   // Update navigation state for a view
-  function updateNavigationState(view: WebContentsView, state: ViewState): void {
+    function updateNavigationState(view: WebContentsView, state: ViewState): void {
     try {
       const wc = view.webContents
       state.navigationState = {
         currentUrl: wc.getURL() || 'about:blank',
-        canGoBack: wc.canGoBack(),
-        canGoForward: wc.canGoForward(),
+        canGoBack: wc.navigationHistory.canGoBack(),
+        canGoForward: wc.navigationHistory.canGoForward(),
         title: wc.getTitle() || ''
       }
     } catch (error) {
@@ -266,6 +300,7 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null): void {
           backgroundThrottling: false,
         }
       })
+      view.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
     } catch (error) {
       console.error('[overlay] Failed to create WebContentsView:', error)
       return { ok: false }
@@ -320,11 +355,24 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null): void {
     view.webContents.on('page-title-updated', updateNavState)
 
     // Minimal key handling: DevTools toggle + block page zoom combos
+    // Enhanced key handling: DevTools toggle, navigation shortcuts, block page zoom combos
     view.webContents.on('before-input-event', (event, input) => {
       const mod = input.control || input.meta
       const key = (input.key || '').toLowerCase()
 
-      // DevTools
+      if (mod && (key === 't' || key === 'w' || key === 'n' || key === 'q')) {
+  event.preventDefault()
+  return
+}
+if (mod && input.shift && key === 'n') {
+  event.preventDefault()
+  return
+}
+if (input.key === 'Tab' && (input.control || input.meta)) {
+  event.preventDefault()
+  return
+}
+      // DevTools toggle
       if ((key === 'i' && mod && input.shift) || input.key === 'F12') {
         event.preventDefault()
         try {
@@ -335,6 +383,53 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null): void {
           }
         } catch (error) {
           console.error('[overlay] Failed to toggle DevTools:', error)
+        }
+        return
+      }
+
+      // Navigation shortcuts
+      if (input.alt && key === 'arrowleft') {
+        event.preventDefault()
+        try {
+          if (view.webContents.navigationHistory.canGoBack()) {
+            view.webContents.navigationHistory.goBack()
+          }
+        } catch (error) {
+          console.error('[overlay] Failed to go back:', error)
+        }
+        return
+      }
+
+      if (input.alt && key === 'arrowright') {
+        event.preventDefault()
+        try {
+          if (view.webContents.navigationHistory.canGoForward()) {
+            view.webContents.navigationHistory.goForward()
+          }
+        } catch (error) {
+          console.error('[overlay] Failed to go forward:', error)
+        }
+        return
+      }
+
+      // Reload shortcuts
+      if ((mod && key === 'r') || input.key === 'F5') {
+        event.preventDefault()
+        try {
+          view.webContents.reload()
+        } catch (error) {
+          console.error('[overlay] Failed to reload:', error)
+        }
+        return
+      }
+
+      // Hard reload
+      if (mod && input.shift && key === 'r') {
+        event.preventDefault()
+        try {
+          view.webContents.reloadIgnoringCache()
+        } catch (error) {
+          console.error('[overlay] Failed to hard reload:', error)
         }
         return
       }
@@ -469,6 +564,29 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null): void {
     }
     detach(win, view)
   })
+
+  ipcMain.handle('overlay:get-suggestions', async (_e, payload: unknown) => {
+  try {
+    if (!payload || typeof (payload as any).q !== 'string') return { ok: false as const }
+    const q = (payload as any).q.trim()
+    if (!q) return { ok: true as const, suggestions: [] }
+
+    // Google suggest (Chrome client). Returns: [query, [suggestions...], …]
+    const url = `https://suggestqueries.google.com/complete/search?client=chrome&hl=en&q=${encodeURIComponent(q)}`
+    const res = await fetch(url, {
+      // UA helps keep the response in the expected format
+      headers: { 'User-Agent': 'Mozilla/5.0 Chrome/120 Safari/537.36' }
+    })
+    if (!res.ok) return { ok: true as const, suggestions: [] }
+
+    const data = await res.json() as [string, string[]]
+    const suggestions = Array.isArray(data?.[1]) ? data[1].slice(0, 8) : []
+    return { ok: true as const, suggestions }
+  } catch {
+    return { ok: true as const, suggestions: [] }
+  }
+})
+
 
   ipcMain.handle('overlay:destroy', async (_event: IpcMainInvokeEvent, payload: unknown): Promise<void> => {
     // Destroy must work no matter what - be permissive with validation
@@ -634,7 +752,7 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null): void {
     }
 
     try {
-      view.webContents.goBack()
+      view.webContents.navigationHistory.goBack()
       return { ok: true }
     } catch (error) {
       console.error('[overlay] Failed to go back:', error)
@@ -642,7 +760,7 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null): void {
     }
   })
 
-  ipcMain.handle('overlay:go-forward', async (_event: IpcMainInvokeEvent, payload: unknown): Promise<NavigationResult> => {
+ipcMain.handle('overlay:go-forward', async (_event: IpcMainInvokeEvent, payload: unknown): Promise<NavigationResult> => {
     if (!isValidTabIdPayload(payload)) {
       console.error('[overlay] Invalid go-forward payload:', payload)
       return { ok: false }
@@ -659,14 +777,13 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null): void {
     }
 
     try {
-      view.webContents.goForward()
+      view.webContents.navigationHistory.goForward()
       return { ok: true }
     } catch (error) {
       console.error('[overlay] Failed to go forward:', error)
       return { ok: false }
     }
   })
-
   ipcMain.handle('overlay:reload', async (_event: IpcMainInvokeEvent, payload: unknown): Promise<NavigationResult> => {
     if (!isValidTabIdPayload(payload)) {
       console.error('[overlay] Invalid reload payload:', payload)
@@ -705,7 +822,16 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null): void {
       currentUrl: state.navigationState.currentUrl,
       canGoBack: state.navigationState.canGoBack,
       canGoForward: state.navigationState.canGoForward,
-      title: state.navigationState.title
+      title: state.navigationState.title,
+
+      isLoading: (() => {
+    try {
+      return state.view.webContents.isLoading()
+    } catch {
+      return false
+    }
+  })(),
+
     }
   })
 }

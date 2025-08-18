@@ -8,7 +8,7 @@ import {
   resizeBox,
   useEditor,
 } from 'tldraw'
-import type { NavigationState } from  '../../types/overlay'
+import type { NavigationState } from '../../types/overlay'
 
 export type BrowserShape = TLBaseShape<'browser-shape', {
   w: number
@@ -25,63 +25,77 @@ const MIN_W = 840
 const MIN_H = 525 + NAV_BAR_HEIGHT // Ensure minimum content area plus nav bar
 
 // Type guard to check if window.overlay exists and has required methods
-function hasOverlayAPI(win: Window): win is Window & { overlay: NonNullable<Window['overlay']> } {
-  return typeof win.overlay === 'object' && 
-         win.overlay !== null &&
-         typeof win.overlay.createTab === 'function' &&
-         typeof win.overlay.show === 'function' &&
-         typeof win.overlay.setBounds === 'function' &&
-         typeof win.overlay.setZoom === 'function' &&
-         typeof win.overlay.destroy === 'function' &&
-         typeof win.overlay.navigate === 'function' &&
-         typeof win.overlay.goBack === 'function' &&
-         typeof win.overlay.goForward === 'function' &&
-         typeof win.overlay.reload === 'function' &&
-         typeof win.overlay.getNavigationState === 'function'
+function hasOverlayAPI(
+  win: Window
+): win is Window & { overlay: NonNullable<Window['overlay']> } {
+  const anyWin = win as any
+  if (typeof anyWin.overlay !== 'object' || anyWin.overlay === null) return false
+  const o = anyWin.overlay
+  if (typeof o.createTab !== 'function') return false
+  if (typeof o.show !== 'function') return false
+  if (typeof o.setBounds !== 'function') return false
+  if (typeof o.setZoom !== 'function') return false
+  if (typeof o.destroy !== 'function') return false
+  if (typeof o.navigate !== 'function') return false
+  if (typeof o.goBack !== 'function') return false
+  if (typeof o.goForward !== 'function') return false
+  if (typeof o.reload !== 'function') return false
+  if (typeof o.getNavigationState !== 'function') return false
+  return true
 }
 
 // Navigation bar component
 interface NavigationBarProps {
-  tabId: string
   navState: NavigationState
+  isLoading: boolean
   onUrlChange: (url: string) => void
   onBack: () => void
   onForward: () => void
   onReload: () => void
 }
-
 const NavigationBar: React.FC<NavigationBarProps> = ({
-  tabId,
   navState,
+  isLoading,
   onUrlChange,
   onBack,
   onForward,
   onReload
 }) => {
   const [urlInput, setUrlInput] = useState(navState.currentUrl)
-  
-  // Update input when navigation state changes
+  const [clicking, setClicking] = useState<string | null>(null)
+
   useEffect(() => {
     setUrlInput(navState.currentUrl)
   }, [navState.currentUrl])
 
+  const isLikelyUrl = (text: string): boolean => {
+    if (/^[a-zA-Z]+:\/\//.test(text)) return true
+    if (/^[\w-]+(\.[\w-]+)+(:\d+)?(\/.*)?$/.test(text)) return true
+    return false
+  }
+
+  const navigateFromInput = (value: string) => {
+    const trimmed = value.trim()
+    if (!trimmed) return
+    if (isLikelyUrl(trimmed)) {
+      const url = /^[a-zA-Z]+:\/\//.test(trimmed) ? trimmed : `https://${trimmed}`
+      onUrlChange(url)
+    } else {
+      onUrlChange(`https://www.google.com/search?q=${encodeURIComponent(trimmed)}`)
+    }
+  }
+
   const handleUrlSubmit = useCallback((e: React.FormEvent) => {
     e.preventDefault()
-    const trimmed = urlInput.trim()
-    if (trimmed && trimmed !== navState.currentUrl) {
-      // Add protocol if missing
-      const url = trimmed.startsWith('http://') || trimmed.startsWith('https://') 
-        ? trimmed 
-        : `https://${trimmed}`
-      onUrlChange(url)
-    }
-  }, [urlInput, navState.currentUrl, onUrlChange])
+    navigateFromInput(urlInput)
+  }, [urlInput])
 
   const handleUrlInputChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
     setUrlInput(e.target.value)
   }, [])
 
-  const buttonStyle: React.CSSProperties = {
+  // Button styles (with bounce)
+  const baseButton: React.CSSProperties = {
     width: '32px',
     height: '32px',
     border: 'none',
@@ -92,15 +106,25 @@ const NavigationBar: React.FC<NavigationBarProps> = ({
     alignItems: 'center',
     justifyContent: 'center',
     fontSize: '14px',
-    color: '#333'
+    color: '#333',
+    zIndex: 1000,
+    position: 'relative',
+    transition: 'transform 0.15s ease'
   }
-
-  const disabledButtonStyle: React.CSSProperties = {
-    ...buttonStyle,
-    background: '#e0e0e0',
-    color: '#999',
-    cursor: 'not-allowed'
+  const disabledButton: React.CSSProperties = {
+    ...baseButton, background: '#e0e0e0', color: '#999', cursor: 'not-allowed'
   }
+  const makeButton = (key: string, label: string, handler: () => void, disabled?: boolean, title?: string) => (
+    <button
+      type="button"
+      onPointerDown={() => { if (!disabled) { setClicking(key); handler(); setTimeout(() => setClicking(null), 200) } }}
+      disabled={disabled}
+      style={{ ...(disabled ? disabledButton : baseButton), transform: clicking === key ? 'scale(0.9)' : 'scale(1.0)' }}
+      title={title}
+    >
+      {label}
+    </button>
+  )
 
   return (
     <div style={{
@@ -116,43 +140,24 @@ const NavigationBar: React.FC<NavigationBarProps> = ({
       gap: '6px',
       boxSizing: 'border-box',
       fontSize: '13px',
-      fontFamily: 'system-ui, -apple-system, sans-serif'
+      fontFamily: 'system-ui, -apple-system, sans-serif',
+      position: 'relative',
+      zIndex: 1000,
+      pointerEvents: 'auto'
     }}>
-      <button
-        type="button"
-        onClick={onBack}
-        disabled={!navState.canGoBack}
-        style={navState.canGoBack ? buttonStyle : disabledButtonStyle}
-        title="Go back"
-      >
-        ←
-      </button>
-      
-      <button
-        type="button"
-        onClick={onForward}
-        disabled={!navState.canGoForward}
-        style={navState.canGoForward ? buttonStyle : disabledButtonStyle}
-        title="Go forward"
-      >
-        →
-      </button>
-      
-      <button
-        type="button"
-        onClick={onReload}
-        style={buttonStyle}
-        title="Reload"
-      >
-        ↻
-      </button>
-      
-      <form onSubmit={handleUrlSubmit} style={{ flex: 1, display: 'flex' }}>
+      {makeButton('back', '←', onBack, !navState.canGoBack, 'Go back')}
+      {makeButton('forward', '→', onForward, !navState.canGoForward, 'Go forward')}
+      {makeButton('reload', '↻', onReload, false, 'Reload')}
+
+      <form onSubmit={handleUrlSubmit} style={{ flex: 1, display: 'flex', zIndex: 1000, position: 'relative' }}>
         <input
           type="text"
           value={urlInput}
           onChange={handleUrlInputChange}
-          placeholder="Enter URL or search term..."
+          placeholder="Search or enter address"
+          autoCorrect="off"
+          autoCapitalize="off"
+          spellCheck={false}
           style={{
             flex: 1,
             height: '32px',
@@ -163,14 +168,28 @@ const NavigationBar: React.FC<NavigationBarProps> = ({
             fontSize: '13px',
             fontFamily: 'system-ui, -apple-system, sans-serif',
             background: 'white',
-            boxSizing: 'border-box'
+            boxSizing: 'border-box',
+            zIndex: 1000,
+            position: 'relative'
           }}
           onFocus={(e) => e.target.select()}
         />
       </form>
+
+      {/* Loading bar */}
+      {isLoading && (
+        <div style={{ position: 'absolute', bottom: 0, left: 0, height: '2px', width: '100%', overflow: 'hidden' }}>
+          <div style={{ height: '100%', width: '30%', background: '#007bff', animation: 'loadingAnim 1.1s linear infinite' }} />
+        </div>
+      )}
+
+      <style>
+        {`@keyframes loadingAnim { 0% { margin-left: -30%; } 100% { margin-left: 100%; } }`}
+      </style>
     </div>
   )
 }
+
 
 export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
   static override type = 'browser-shape' as const
@@ -203,12 +222,16 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
     const hostRef = useRef<HTMLDivElement>(null)
     const editor = useEditor()
     const tabIdRef = useRef<string>('')
+
     const [navState, setNavState] = useState<NavigationState>({
       currentUrl: shape.props.url,
       canGoBack: false,
       canGoForward: false,
       title: ''
     })
+
+    const [isLoading, setIsLoading] = useState(false)
+    const lastUrlRef = useRef<string>(shape.props.url)
 
     // Create the tab once with proper error handling
     useEffect(() => {
@@ -227,7 +250,7 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
           if (!cancelled && res?.ok && res.tabId) {
             tabIdRef.current = res.tabId
             // Get initial navigation state
-            updateNavigationState()
+            void updateNavigationState()
           } else {
             console.error('[BrowserShape] Failed to create tab:', res)
           }
@@ -238,14 +261,11 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
         }
       }
 
-      createTab()
-      
-      return () => { 
-        cancelled = true 
-      }
+      void createTab()
+      return () => { cancelled = true }
     }, [shape.props.url])
 
-    // Navigation state updater
+    // Navigation state updater (real isLoading support)
     const updateNavigationState = useCallback(async (): Promise<void> => {
       const id = tabIdRef.current
       if (!id || !hasOverlayAPI(window)) return
@@ -259,6 +279,18 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
             canGoForward: res.canGoForward ?? false,
             title: res.title ?? ''
           })
+
+          if (typeof (res as any).isLoading === 'boolean') {
+            setIsLoading(Boolean((res as any).isLoading))
+          } else {
+            // Fallback heuristic if main doesn't provide isLoading
+            if (lastUrlRef.current !== res.currentUrl) {
+              lastUrlRef.current = res.currentUrl
+              setIsLoading(true)
+            } else if (res.title && res.title.length > 0) {
+              setIsLoading(false)
+            }
+          }
         }
       } catch (error) {
         console.error('[BrowserShape] Failed to get navigation state:', error)
@@ -267,22 +299,18 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
 
     // Poll for navigation state updates
     useEffect(() => {
-      const interval = setInterval(updateNavigationState, 500)
+      const interval = setInterval(() => { void updateNavigationState() }, 500)
       return () => clearInterval(interval)
     }, [updateNavigationState])
 
-    // Navigation handlers
+    // Navigation handlers (optimistically set isLoading)
     const handleUrlChange = useCallback(async (url: string): Promise<void> => {
       const id = tabIdRef.current
       if (!id || !hasOverlayAPI(window)) return
-
       try {
+        setIsLoading(true)
         const res = await window.overlay.navigate({ tabId: id, url })
-        if (res.ok) {
-          // Update will come through polling
-        } else {
-          console.error('[BrowserShape] Failed to navigate:', res)
-        }
+        if (!res.ok) console.error('[BrowserShape] Failed to navigate:', res)
       } catch (error) {
         console.error('[BrowserShape] Error navigating:', error)
       }
@@ -291,12 +319,10 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
     const handleBack = useCallback(async (): Promise<void> => {
       const id = tabIdRef.current
       if (!id || !hasOverlayAPI(window) || !navState.canGoBack) return
-
       try {
+        setIsLoading(true)
         const res = await window.overlay.goBack({ tabId: id })
-        if (!res.ok) {
-          console.error('[BrowserShape] Failed to go back:', res)
-        }
+        if (!res.ok) console.error('[BrowserShape] Failed to go back:', res)
       } catch (error) {
         console.error('[BrowserShape] Error going back:', error)
       }
@@ -305,12 +331,10 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
     const handleForward = useCallback(async (): Promise<void> => {
       const id = tabIdRef.current
       if (!id || !hasOverlayAPI(window) || !navState.canGoForward) return
-
       try {
+        setIsLoading(true)
         const res = await window.overlay.goForward({ tabId: id })
-        if (!res.ok) {
-          console.error('[BrowserShape] Failed to go forward:', res)
-        }
+        if (!res.ok) console.error('[BrowserShape] Failed to go forward:', res)
       } catch (error) {
         console.error('[BrowserShape] Error going forward:', error)
       }
@@ -319,18 +343,16 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
     const handleReload = useCallback(async (): Promise<void> => {
       const id = tabIdRef.current
       if (!id || !hasOverlayAPI(window)) return
-
       try {
+        setIsLoading(true)
         const res = await window.overlay.reload({ tabId: id })
-        if (!res.ok) {
-          console.error('[BrowserShape] Failed to reload:', res)
-        }
+        if (!res.ok) console.error('[BrowserShape] Failed to reload:', res)
       } catch (error) {
         console.error('[BrowserShape] Error reloading:', error)
       }
     }, [])
 
-    // Sync bounds & zoom with proper error handling (accounting for nav bar)
+    // Sync bounds & zoom with proper error handling (FIXED positioning)
     useEffect(() => {
       let raf = 0
       const lastRect = { x: -1, y: -1, width: -1, height: -1 }
@@ -339,12 +361,12 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
 
       const tick = (): void => {
         raf = requestAnimationFrame(tick)
-        
+
         const el = hostRef.current
         const id = tabIdRef.current
-        
+
         if (!el || !id) return
-        
+
         if (!hasOverlayAPI(window)) {
           console.error('[BrowserShape] window.overlay API not available during sync')
           return
@@ -353,11 +375,10 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
         const dpr = window.devicePixelRatio || 1
         const b = el.getBoundingClientRect()
 
-        // device-pixel aware alignment (CSS px) - account for nav bar
         const rx = Math.round(b.x * dpr) / dpr
-        const ry = Math.round((b.y + NAV_BAR_HEIGHT) * dpr) / dpr // Offset by nav bar height
+        const ry = Math.round(b.y * dpr) / dpr
         const rw = Math.round(b.width * dpr) / dpr
-        const rh = Math.round((b.height - NAV_BAR_HEIGHT) * dpr) / dpr // Reduce height by nav bar
+        const rh = Math.round(b.height * dpr) / dpr
 
         const rect = {
           x: Math.floor(rx),
@@ -398,7 +419,7 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
       }
 
       tick()
-      
+
       return () => {
         if (raf) {
           cancelAnimationFrame(raf)
@@ -412,13 +433,10 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
         const id = tabIdRef.current
         if (!id) return
 
-        // Type-safe cleanup with fallbacks
         if (hasOverlayAPI(window)) {
-          // Prefer destroy method
           if (typeof window.overlay.destroy === 'function') {
             window.overlay.destroy({ tabId: id }).catch((error) => {
               console.error('[BrowserShape] Failed to destroy tab:', error)
-              // Fallback to hide if destroy fails
               if (typeof window.overlay.hide === 'function') {
                 window.overlay.hide({ tabId: id }).catch((hideError) => {
                   console.error('[BrowserShape] Failed to hide tab as fallback:', hideError)
@@ -426,7 +444,6 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
               }
             })
           } else if (typeof window.overlay.hide === 'function') {
-            // Fallback to hide if destroy doesn't exist
             window.overlay.hide({ tabId: id }).catch((error) => {
               console.error('[BrowserShape] Failed to hide tab:', error)
             })
@@ -438,11 +455,25 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
     }, [])
 
     return (
-      <HTMLContainer style={{ width: shape.props.w, height: shape.props.h }}>
-        <div style={{ width: '100%', height: '100%', display: 'flex', flexDirection: 'column' }}>
+      <HTMLContainer
+        style={{
+          width: shape.props.w,
+          height: shape.props.h,
+          position: 'relative',
+          pointerEvents: 'auto'
+        }}
+      >
+        <div style={{
+          width: '100%',
+          height: '100%',
+          display: 'flex',
+          flexDirection: 'column',
+          position: 'relative',
+          pointerEvents: 'auto'
+        }}>
           <NavigationBar
-            tabId={tabIdRef.current}
             navState={navState}
+            isLoading={isLoading}
             onUrlChange={handleUrlChange}
             onBack={handleBack}
             onForward={handleForward}
@@ -454,6 +485,8 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
               width: '100%',
               flex: 1,
               background: 'transparent',
+              position: 'relative',
+              pointerEvents: 'none' // Let the WebContentsView handle events
             }}
           />
         </div>

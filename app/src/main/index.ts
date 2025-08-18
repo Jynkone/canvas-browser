@@ -53,7 +53,7 @@ function createWindow(): void {
     title: "Paper",  
     backgroundColor: '#111111',
     icon: getWindowIconPath(),
-    autoHideMenuBar: true,
+    autoHideMenuBar: false,
     webPreferences: {
       // IMPORTANT: points to the built preload (electron-vite outputs to out/preload/index.js)
       preload: join(__dirname, '../preload/index.js'),
@@ -62,6 +62,7 @@ function createWindow(): void {
       contextIsolation: true,
     },
   })
+
 
   console.log('[main] Preload path:', join(__dirname, '../preload/index.js'))
 
@@ -113,7 +114,7 @@ function createWindow(): void {
     })
   })
 
-  mainWindow.setMenuBarVisibility(false)
+  mainWindow.setMenuBarVisibility(true)
 }
 
 // Standard app lifecycle
