@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react'
+import React, { useEffect, useRef } from 'react'
 import {
   HTMLContainer,
   Rectangle2d,
@@ -53,12 +53,12 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
     return new Rectangle2d({ width: shape.props.w, height: shape.props.h, isFilled: false })
   }
 
-  override indicator(shape: BrowserShape): JSX.Element {
+  override indicator(shape: BrowserShape): React.JSX.Element {
     const { w, h } = shape.props
     return <rect x={0} y={0} width={w} height={h} />
   }
 
-  override component(shape: BrowserShape): JSX.Element {
+  override component(shape: BrowserShape): React.JSX.Element {
     const hostRef = useRef<HTMLDivElement>(null)
     const editor = useEditor()
     const tabIdRef = useRef<string>('')
