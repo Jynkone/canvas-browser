@@ -12,7 +12,7 @@ if (!app.requestSingleInstanceLock()) {
   app.quit()
 }
 
-function getWindowIconPath() {
+function getWindowIconPath(): string | undefined {
   const isPackaged = app.isPackaged
   if (process.platform === 'win32') {
     // use ICO on Windows
@@ -30,12 +30,18 @@ function getWindowIconPath() {
   }
 }
 
+// Type guard for environment variables
+function getValidUrl(envVar: string | undefined): string | null {
+  return (typeof envVar === 'string' && envVar.trim().length > 0) ? envVar.trim() : null
+}
+
 // Optional (Windows): make sure the app ID is set for proper taskbar grouping
 app.setAppUserModelId('com.example.Paper')
 app.setName('Paper')
 let mainWindow: BrowserWindow | null = null
 Menu.setApplicationMenu(null)
-function createWindow() {
+
+function createWindow(): void {
   console.log('[main] Creating main window...')
   
   mainWindow = new BrowserWindow({
@@ -46,12 +52,12 @@ function createWindow() {
     show: true,
     title: "Paper",  
     backgroundColor: '#111111',
-        icon: getWindowIconPath(),
-        autoHideMenuBar: true,
+    icon: getWindowIconPath(),
+    autoHideMenuBar: true,
     webPreferences: {
       // IMPORTANT: points to the built preload (electron-vite outputs to out/preload/index.js)
       preload: join(__dirname, '../preload/index.js'),
-     devTools: false,          // 👈 disables devtools for the TLdraw window
+      devTools: false,          // 👈 disables devtools for the TLdraw window
       nodeIntegration: false,
       contextIsolation: true,
     },
@@ -64,19 +70,22 @@ function createWindow() {
   setupOverlayIPC(() => mainWindow)
   console.log('[main] Overlay IPC setup complete')
 
-  // DEV vs PROD load
-  const devUrl =
-    process.env.ELECTRON_RENDERER_URL ||
-    process.env.VITE_DEV_SERVER_URL ||
-    'http://localhost:5173/'
+  // DEV vs PROD load with proper type checking
+  const rendererUrl = getValidUrl(process.env.ELECTRON_RENDERER_URL)
+  const viteUrl = getValidUrl(process.env.VITE_DEV_SERVER_URL)
+  const devUrl = rendererUrl || viteUrl || 'http://localhost:5173/'
 
-  if (process.env.ELECTRON_RENDERER_URL || process.env.VITE_DEV_SERVER_URL) {
+  if (rendererUrl || viteUrl) {
     console.log('[main] loading DEV URL:', devUrl)
-    mainWindow.loadURL(devUrl)
+    mainWindow.loadURL(devUrl).catch((error) => {
+      console.error('[main] Failed to load DEV URL:', error)
+    })
   } else {
     const indexHtml = join(__dirname, '../renderer/index.html')
     console.log('[main] loading PROD file:', indexHtml)
-    mainWindow.loadFile(indexHtml)
+    mainWindow.loadFile(indexHtml).catch((error) => {
+      console.error('[main] Failed to load PROD file:', error)
+    })
   }
 
   mainWindow.on('closed', () => {
@@ -88,13 +97,23 @@ function createWindow() {
     console.log('[main] Renderer finished loading')
   })
   
-  // FIXED: Added missing event parameter
-  mainWindow.webContents.on('did-fail-load', (_event, errorCode, errorDescription) => {
-    console.error('[main] Renderer failed to load:', errorCode, errorDescription)
+  // Properly typed event handler with validation
+  mainWindow.webContents.on('did-fail-load', (
+    _event: Electron.Event, 
+    errorCode: number, 
+    errorDescription: string,
+    validatedURL?: string,
+    isMainFrame?: boolean
+  ) => {
+    console.error('[main] Renderer failed to load:', {
+      errorCode: typeof errorCode === 'number' ? errorCode : 'unknown',
+      errorDescription: typeof errorDescription === 'string' ? errorDescription : 'unknown error',
+      url: validatedURL,
+      isMainFrame: Boolean(isMainFrame)
+    })
   })
 
-    mainWindow.setMenuBarVisibility(false)
-
+  mainWindow.setMenuBarVisibility(false)
 }
 
 // Standard app lifecycle
@@ -107,6 +126,8 @@ app.whenReady().then(() => {
       createWindow()
     }
   })
+}).catch((error) => {
+  console.error('[main] App failed to initialize:', error)
 })
 
 app.on('window-all-closed', () => {
@@ -119,7 +140,9 @@ app.on('window-all-closed', () => {
 // If another instance is launched, focus the existing window
 app.on('second-instance', () => {
   if (mainWindow) {
-    if (mainWindow.isMinimized()) mainWindow.restore()
+    if (mainWindow.isMinimized()) {
+      mainWindow.restore()
+    }
     mainWindow.focus()
   }
 })

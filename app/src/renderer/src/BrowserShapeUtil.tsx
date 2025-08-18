@@ -20,64 +20,101 @@ export type BrowserShape = TLBaseShape<'browser-shape', {
 const MIN_W = 840
 const MIN_H = 525
 
+// Type guard to check if window.overlay exists and has required methods
+function hasOverlayAPI(win: Window): win is Window & { overlay: NonNullable<Window['overlay']> } {
+  return typeof win.overlay === 'object' && 
+         win.overlay !== null &&
+         typeof win.overlay.createTab === 'function' &&
+         typeof win.overlay.show === 'function' &&
+         typeof win.overlay.setBounds === 'function' &&
+         typeof win.overlay.setZoom === 'function' &&
+         typeof win.overlay.destroy === 'function'
+}
+
 export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
   static override type = 'browser-shape' as const
 
-  override isAspectRatioLocked = () => false
-  override canResize = () => true
-  override hideResizeHandles = () => false
+  override isAspectRatioLocked = (): boolean => false
+  override canResize = (): boolean => true
+  override hideResizeHandles = (): boolean => false
 
   override getDefaultProps(): BrowserShape['props'] {
-    return { w: 1200, h: 600,url: 'https://google.com', tabId: '' }
+    return { w: 1200, h: 600, url: 'https://google.com', tabId: '' }
   }
 
-  override onResize(shape: BrowserShape, info: TLResizeInfo<BrowserShape>) {
+  override onResize(shape: BrowserShape, info: TLResizeInfo<BrowserShape>): Partial<BrowserShape> {
     const partial = resizeBox(shape, info)
     const w = Math.max(MIN_W, partial.props.w)
     const h = Math.max(MIN_H, partial.props.h)
     return { ...partial, props: { ...partial.props, w, h } }
   }
 
-  override getGeometry(shape: BrowserShape) {
+  override getGeometry(shape: BrowserShape): Rectangle2d {
     return new Rectangle2d({ width: shape.props.w, height: shape.props.h, isFilled: false })
   }
 
-  // ✅ Add the missing indicator to satisfy ShapeUtil's abstract contract
-  override indicator(shape: BrowserShape) {
+  override indicator(shape: BrowserShape): JSX.Element {
     const { w, h } = shape.props
     return <rect x={0} y={0} width={w} height={h} />
   }
 
-  override component(shape: BrowserShape) {
+  override component(shape: BrowserShape): JSX.Element {
     const hostRef = useRef<HTMLDivElement>(null)
     const editor = useEditor()
     const tabIdRef = useRef<string>('')
 
-    // Create the tab once
+    // Create the tab once with proper error handling
     useEffect(() => {
       let cancelled = false
-      ;(async () => {
+
+      const createTab = async (): Promise<void> => {
         if (cancelled || tabIdRef.current) return
+
+        if (!hasOverlayAPI(window)) {
+          console.error('[BrowserShape] window.overlay API not available')
+          return
+        }
+
         try {
           const res = await window.overlay.createTab({ url: shape.props.url })
-          if (res?.tabId) tabIdRef.current = res.tabId
-        } catch {}
-      })()
-      return () => { cancelled = true }
+          if (!cancelled && res?.ok && res.tabId) {
+            tabIdRef.current = res.tabId
+          } else {
+            console.error('[BrowserShape] Failed to create tab:', res)
+          }
+        } catch (error) {
+          if (!cancelled) {
+            console.error('[BrowserShape] Error creating tab:', error)
+          }
+        }
+      }
+
+      createTab()
+      
+      return () => { 
+        cancelled = true 
+      }
     }, [shape.props.url])
 
-    // Sync bounds & zoom (no extra smoothing = no jello)
+    // Sync bounds & zoom with proper error handling
     useEffect(() => {
       let raf = 0
       const lastRect = { x: -1, y: -1, width: -1, height: -1 }
       let lastZoom = -1
       let shown = false
 
-      const tick = () => {
+      const tick = (): void => {
         raf = requestAnimationFrame(tick)
+        
         const el = hostRef.current
         const id = tabIdRef.current
+        
         if (!el || !id) return
+        
+        if (!hasOverlayAPI(window)) {
+          console.error('[BrowserShape] window.overlay API not available during sync')
+          return
+        }
 
         const dpr = window.devicePixelRatio || 1
         const b = el.getBoundingClientRect()
@@ -97,7 +134,9 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
 
         if (!shown) {
           shown = true
-          window.overlay.show({ tabId: id, rect }).catch(() => {})
+          window.overlay.show({ tabId: id, rect }).catch((error) => {
+            console.error('[BrowserShape] Failed to show overlay:', error)
+          })
           Object.assign(lastRect, rect)
         } else {
           const moved =
@@ -107,33 +146,60 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
             rect.height !== lastRect.height
 
           if (moved) {
-            // Send updated bounds to overlay
-            window.overlay.setBounds({ tabId: id, rect }).catch(() => {})
+            window.overlay.setBounds({ tabId: id, rect }).catch((error) => {
+              console.error('[BrowserShape] Failed to set bounds:', error)
+            })
             Object.assign(lastRect, rect)
           }
         }
 
-        // Follow editor zoom exactly
+        // Follow editor zoom exactly with error handling
         const z = editor.getZoomLevel()
         if (Math.abs(z - lastZoom) > 0.0005) {
-          window.overlay.setZoom({ tabId: id, factor: z }).catch(() => {})
+          window.overlay.setZoom({ tabId: id, factor: z }).catch((error) => {
+            console.error('[BrowserShape] Failed to set zoom:', error)
+          })
           lastZoom = z
         }
       }
 
       tick()
-      return () => cancelAnimationFrame(raf)
+      
+      return () => {
+        if (raf) {
+          cancelAnimationFrame(raf)
+        }
+      }
     }, [editor])
 
-    // Cleanup
+    // Cleanup with comprehensive error handling
     useEffect(() => {
       return () => {
         const id = tabIdRef.current
         if (!id) return
-        // Prefer destroy; fall back to hide if needed
-        const o = (window as any).overlay
-        if (o?.destroy) o.destroy({ tabId: id }).catch?.(() => {})
-        else o?.hide?.({ tabId: id }).catch?.(() => {})
+
+        // Type-safe cleanup with fallbacks
+        if (hasOverlayAPI(window)) {
+          // Prefer destroy method
+          if (typeof window.overlay.destroy === 'function') {
+            window.overlay.destroy({ tabId: id }).catch((error) => {
+              console.error('[BrowserShape] Failed to destroy tab:', error)
+              // Fallback to hide if destroy fails
+              if (typeof window.overlay.hide === 'function') {
+                window.overlay.hide({ tabId: id }).catch((hideError) => {
+                  console.error('[BrowserShape] Failed to hide tab as fallback:', hideError)
+                })
+              }
+            })
+          } else if (typeof window.overlay.hide === 'function') {
+            // Fallback to hide if destroy doesn't exist
+            window.overlay.hide({ tabId: id }).catch((error) => {
+              console.error('[BrowserShape] Failed to hide tab:', error)
+            })
+          }
+        } else {
+          console.warn('[BrowserShape] window.overlay not available during cleanup')
+        }
       }
     }, [])
 
