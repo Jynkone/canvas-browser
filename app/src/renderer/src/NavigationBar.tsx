@@ -36,18 +36,22 @@ const STYLES = {
     BORDER_BOTTOM: '#adb5bd',
     INPUT_BORDER: '#ced4da',
     INPUT_FOCUS_SHADOW: 'rgba(0, 123, 255, 0.35)',
-    INPUT_HOVER_SHADOW: 'rgba(0,0,0,0.12)',
-    ACTIVE_BACKGROUND: '#d0e4ff'
+    INPUT_HOVER_SHADOW: 'rgba(0,0,0,0.12)'
   },
   TRANSITIONS: {
     TRANSFORM: 'transform 0.25s cubic-bezier(0.2, 0, 0, 1.2)',
     BACKGROUND: 'background-color 0.25s ease',
     ALL: 'all 0.25s ease'
-  },
-  ANIMATION_DURATION: 250
+  }
 } as const
 
 export const NAV_BAR_HEIGHT = STYLES.NAV_BAR_HEIGHT
+
+// Type-safe input focus state
+interface InputFocusState {
+  isFocused: boolean
+  isHovered: boolean
+}
 
 export const NavigationBar: React.FC<NavigationBarProps> = ({
   navState,
@@ -58,7 +62,11 @@ export const NavigationBar: React.FC<NavigationBarProps> = ({
   onReload
 }) => {
   const [urlInput, setUrlInput] = useState(navState.currentUrl)
-  const [clicking, setClicking] = useState<ButtonKey | null>(null)
+  const [activeButton, setActiveButton] = useState<ButtonKey | null>(null)
+  const [inputState, setInputState] = useState<InputFocusState>({
+    isFocused: false,
+    isHovered: false
+  })
 
   useEffect(() => {
     setUrlInput(navState.currentUrl)
@@ -82,61 +90,128 @@ export const NavigationBar: React.FC<NavigationBarProps> = ({
     }
   }, [urlInput, onUrlChange])
 
-  // Type-safe styles - exactly like original but with constants
-  const baseButton: React.CSSProperties = {
-    width: '32px',
-    height: '32px',
-    border: 'none',
-    borderRadius: '4px',
-    background: STYLES.COLORS.BACKGROUND,
-    cursor: 'pointer',
-    display: 'flex',
-    alignItems: 'center',
-    justifyContent: 'center',
-    fontSize: '14px',
-    color: STYLES.COLORS.TEXT,
-    transition: `${STYLES.TRANSITIONS.TRANSFORM}, ${STYLES.TRANSITIONS.BACKGROUND}`,
-    userSelect: 'none'
-  }
-
-  const disabledButton: React.CSSProperties = {
-    ...baseButton,
-    background: STYLES.COLORS.DISABLED_BACKGROUND,
-    color: STYLES.COLORS.DISABLED_TEXT,
-    cursor: 'not-allowed'
-  }
-
-  // Helper for buttons - exactly like original logic
-  const makeButton = (
-    key: ButtonKey,
-    label: string,
-    handler: () => void,
-    disabled: boolean,
+  // Type-safe button configuration
+  interface ButtonConfig {
+    key: ButtonKey
+    label: string
+    handler: () => void
+    disabled: boolean
     title: string
-  ) => {
-    const isActive = clicking === key
-    return (
-      <button
-        type="button"
-        onPointerDown={() => {
-          if (!disabled) {
-            setClicking(key)
-            handler()
-            setTimeout(() => setClicking(null), STYLES.ANIMATION_DURATION)
-          }
-        }}
-        disabled={disabled}
-        style={{
-          ...(disabled ? disabledButton : baseButton),
-          transform: isActive ? 'scale(0.8)' : 'scale(1.0)',
-          background: isActive ? STYLES.COLORS.ACTIVE_BACKGROUND : 
-                     (disabled ? STYLES.COLORS.DISABLED_BACKGROUND : STYLES.COLORS.BACKGROUND)
-        }}
-        title={title}
-      >
-        {label}
-      </button>
-    )
+  }
+
+  const buttonConfigs: ButtonConfig[] = [
+    {
+      key: BUTTON_KEYS.BACK,
+      label: '←',
+      handler: onBack,
+      disabled: !navState.canGoBack,
+      title: 'Go back'
+    },
+    {
+      key: BUTTON_KEYS.FORWARD,
+      label: '→',
+      handler: onForward,
+      disabled: !navState.canGoForward,
+      title: 'Go forward'
+    },
+    {
+      key: BUTTON_KEYS.RELOAD,
+      label: '↻',
+      handler: onReload,
+      disabled: false,
+      title: 'Reload'
+    }
+  ]
+
+  // Type-safe style computation
+  const getButtonStyle = (config: ButtonConfig): React.CSSProperties => {
+    const isActive = activeButton === config.key
+    const baseStyle: React.CSSProperties = {
+      width: '32px',
+      height: '32px',
+      border: 'none',
+      borderRadius: '4px',
+      cursor: config.disabled ? 'not-allowed' : 'pointer',
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'center',
+      fontSize: '14px',
+      transition: `${STYLES.TRANSITIONS.TRANSFORM}, ${STYLES.TRANSITIONS.BACKGROUND}`,
+      userSelect: 'none'
+    }
+
+    if (config.disabled) {
+      return {
+        ...baseStyle,
+        background: STYLES.COLORS.DISABLED_BACKGROUND,
+        color: STYLES.COLORS.DISABLED_TEXT,
+        transform: 'scale(1.0)'
+      }
+    }
+
+    return {
+      ...baseStyle,
+      background: isActive ? '#d0e4ff' : STYLES.COLORS.BACKGROUND,
+      color: STYLES.COLORS.TEXT,
+      transform: isActive ? 'scale(0.8)' : 'scale(1.0)'
+    }
+  }
+
+  const getInputStyle = (): React.CSSProperties => {
+    const baseStyle: React.CSSProperties = {
+      flex: 1,
+      height: '32px',
+      padding: '0 12px',
+      borderRadius: '6px',
+      outline: 'none',
+      fontSize: '13px',
+      fontFamily: 'system-ui, sans-serif',
+      background: 'white',
+      boxSizing: 'border-box',
+      transition: STYLES.TRANSITIONS.ALL
+    }
+
+    if (inputState.isFocused) {
+      return {
+        ...baseStyle,
+        border: `1px solid ${STYLES.COLORS.PRIMARY}`,
+        boxShadow: `0 0 6px ${STYLES.COLORS.INPUT_FOCUS_SHADOW}`,
+        whiteSpace: 'nowrap',
+        overflow: 'visible',
+        textOverflow: 'clip'
+      }
+    }
+
+    if (inputState.isHovered) {
+      return {
+        ...baseStyle,
+        border: '1px solid #bbb',
+        background: '#fefefe',
+        boxShadow: `0 0 6px ${STYLES.COLORS.INPUT_HOVER_SHADOW}`,
+        whiteSpace: 'nowrap',
+        overflow: 'hidden',
+        textOverflow: 'ellipsis'
+      }
+    }
+
+    return {
+      ...baseStyle,
+      border: `1px solid ${STYLES.COLORS.INPUT_BORDER}`,
+      boxShadow: 'none',
+      whiteSpace: 'nowrap',
+      overflow: 'hidden',
+      textOverflow: 'ellipsis'
+    }
+  }
+
+  const handleButtonPress = (config: ButtonConfig) => {
+    if (config.disabled) return
+    
+    setActiveButton(config.key)
+    config.handler()
+    
+    // Clear active state after animation
+    setTimeout(() => setActiveButton(null), 250)
   }
 
   return (
@@ -166,9 +241,18 @@ export const NavigationBar: React.FC<NavigationBarProps> = ({
       onMouseUp={(e) => e.stopPropagation()}
       onClick={(e) => e.stopPropagation()}
     >
-      {makeButton(BUTTON_KEYS.BACK, '←', onBack, !navState.canGoBack, 'Go back')}
-      {makeButton(BUTTON_KEYS.FORWARD, '→', onForward, !navState.canGoForward, 'Go forward')}
-      {makeButton(BUTTON_KEYS.RELOAD, '↻', onReload, false, 'Reload')}
+      {buttonConfigs.map((config) => (
+        <button
+          key={config.key}
+          type="button"
+          onPointerDown={() => handleButtonPress(config)}
+          disabled={config.disabled}
+          style={getButtonStyle(config)}
+          title={config.title}
+        >
+          {config.label}
+        </button>
+      ))}
 
       <form onSubmit={handleSubmit} style={{ flex: 1, display: 'flex' }}>
         <input
@@ -176,36 +260,13 @@ export const NavigationBar: React.FC<NavigationBarProps> = ({
           value={urlInput}
           onChange={(e) => setUrlInput(e.target.value)}
           placeholder="Search or enter address"
-          style={{
-            flex: 1,
-            height: '32px',
-            padding: '0 12px',
-            border: `1px solid ${STYLES.COLORS.INPUT_BORDER}`,
-            borderRadius: '6px',
-            outline: 'none',
-            fontSize: '13px',
-            fontFamily: 'system-ui, sans-serif',
-            background: 'white',
-            boxSizing: 'border-box',
-            transition: STYLES.TRANSITIONS.ALL,
-            whiteSpace: 'nowrap',
-            overflow: 'hidden',
-            textOverflow: 'ellipsis'
-          }}
+          style={getInputStyle()}
           onFocus={(e) => {
             e.currentTarget.select()
-            e.currentTarget.style.borderColor = STYLES.COLORS.PRIMARY
-            e.currentTarget.style.boxShadow = `0 0 6px ${STYLES.COLORS.INPUT_FOCUS_SHADOW}`
-            e.currentTarget.style.background = '#ffffff'
-            e.currentTarget.style.overflow = 'visible'
-            e.currentTarget.style.textOverflow = 'clip'
+            setInputState(prev => ({ ...prev, isFocused: true }))
           }}
-          onBlur={(e) => {
-            e.currentTarget.style.borderColor = STYLES.COLORS.INPUT_BORDER
-            e.currentTarget.style.boxShadow = 'none'
-            e.currentTarget.style.background = 'white'
-            e.currentTarget.style.overflow = 'hidden'
-            e.currentTarget.style.textOverflow = 'ellipsis'
+          onBlur={() => {
+            setInputState(prev => ({ ...prev, isFocused: false }))
           }}
           onMouseDown={(e) => e.stopPropagation()}
           onMouseUp={(e) => {
@@ -217,19 +278,13 @@ export const NavigationBar: React.FC<NavigationBarProps> = ({
             e.preventDefault()
             e.currentTarget.select()
           }}
-          onMouseEnter={(e) => {
-            if (document.activeElement !== e.currentTarget) {
-              e.currentTarget.style.borderColor = '#bbb'
-              e.currentTarget.style.background = '#fefefe'
-              e.currentTarget.style.boxShadow = `0 0 6px ${STYLES.COLORS.INPUT_HOVER_SHADOW}`
+          onMouseEnter={() => {
+            if (!inputState.isFocused) {
+              setInputState(prev => ({ ...prev, isHovered: true }))
             }
           }}
-          onMouseLeave={(e) => {
-            if (document.activeElement !== e.currentTarget) {
-              e.currentTarget.style.borderColor = STYLES.COLORS.INPUT_BORDER
-              e.currentTarget.style.background = 'white'
-              e.currentTarget.style.boxShadow = 'none'
-            }
+          onMouseLeave={() => {
+            setInputState(prev => ({ ...prev, isHovered: false }))
           }}
         />
       </form>
