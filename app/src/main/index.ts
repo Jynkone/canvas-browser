@@ -20,7 +20,7 @@ function getWindowIconPath() {
       ? join(process.resourcesPath, 'assets', 'icon.ico')
       : join(process.cwd(), 'build', 'icon.ico')
   } else if (process.platform === 'linux') {
-    // use PNG on Linux (you’ll need a PNG — see Option B)
+    // use PNG on Linux (you'll need a PNG — see Option B)
     return isPackaged
       ? join(process.resourcesPath, 'assets', 'icon.png')
       : join(process.cwd(), 'build', 'icon.png')
@@ -88,7 +88,8 @@ function createWindow() {
     console.log('[main] Renderer finished loading')
   })
   
-  mainWindow.webContents.on('did-fail-load', ( errorCode, errorDescription) => {
+  // FIXED: Added missing event parameter
+  mainWindow.webContents.on('did-fail-load', (_event, errorCode, errorDescription) => {
     console.error('[main] Renderer failed to load:', errorCode, errorDescription)
   })
 

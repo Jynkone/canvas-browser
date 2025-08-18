@@ -2,7 +2,7 @@
 // Uses WebContentsView + Views hierarchy. One global zoom = canvasZoom * 0.8.
 // Consistent across sites: native zoom when >= 0.25, minimal emulation below 0.25.
 
-import { BrowserWindow, WebContentsView, ipcMain } from 'electron'
+import { BrowserWindow, WebContentsView, ipcMain, IpcMainInvokeEvent } from 'electron'
 import { randomUUID } from 'crypto'
 
 type Rect = { x: number; y: number; width: number; height: number }
@@ -11,6 +11,17 @@ type ViewState = {
   view: WebContentsView
   lastBounds: { x: number; y: number; w: number; h: number } | null
   lastAppliedZoom?: number
+}
+
+// Type for WebContents with debugger API (avoiding interface extension issues)
+type WebContentsWithDebugger = Electron.WebContents & {
+  debugger: {
+    attach(protocolVersion?: string): void
+    isAttached(): boolean
+    detach(): void
+    sendCommand(method: string, commandParams?: any): Promise<any>
+  }
+  destroy(): void
 }
 
 const CHROME_MIN = 0.25
@@ -40,7 +51,7 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null) {
 
   async function clearEmuIfAny(view: WebContentsView) {
     try {
-      const wc = view.webContents as any
+      const wc = view.webContents as WebContentsWithDebugger
       if (wc.debugger.isAttached()) {
         await wc.debugger.sendCommand('Emulation.clearDeviceMetricsOverride', {})
         wc.debugger.detach()
@@ -58,7 +69,7 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null) {
     // eff < 0.25 → keep Chromium at 0.25 and emulate remaining scale
     try { await view.webContents.setZoomFactor(CHROME_MIN) } catch {}
     try {
-      const wc = view.webContents as any
+      const wc = view.webContents as WebContentsWithDebugger
       if (!wc.debugger.isAttached()) wc.debugger.attach('1.3')
       const scale = Math.max(0.05, Math.min(1, eff / CHROME_MIN))
       const b = view.getBounds()
@@ -81,7 +92,7 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null) {
 
   // ----------------------------- IPC -----------------------------
 
-  ipcMain.handle('overlay:create-tab', async (_e, payload?: { url?: string }) => {
+  ipcMain.handle('overlay:create-tab', async (_event: IpcMainInvokeEvent, payload?: { url?: string }) => {
     const win = getWindow()
     if (!win) return { ok: false }
 
@@ -144,7 +155,7 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null) {
 
   ipcMain.handle('overlay:get-zoom', async () => canvasZoom)
 
-  ipcMain.handle('overlay:show', async (_e, { tabId, rect }: { tabId: string; rect: Rect }) => {
+  ipcMain.handle('overlay:show', async (_event: IpcMainInvokeEvent, { tabId, rect }: { tabId: string; rect: Rect }) => {
     const win = getWindow()
     const { view, state } = resolve(tabId)
     if (!win || !view || !state) return
@@ -156,9 +167,13 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null) {
     if (currentEff() < CHROME_MIN) await reapplyNoAnim(view, state) // emu needs bounds
   })
 
-  ipcMain.handle('overlay:set-bounds', async (_e, { tabId, rect }: { tabId: string; rect: Rect }) => {
+  ipcMain.handle('overlay:set-bounds', async (
+    _event: IpcMainInvokeEvent, 
+    { tabId, rect }: { tabId: string; rect: Rect }
+  ) => {
     const { view, state } = resolve(tabId)
     if (!view || !state) return
+    
     const x = Math.floor(rect.x), y = Math.floor(rect.y)
     const w = Math.ceil(rect.width), h = Math.ceil(rect.height)
     const b = state.lastBounds
@@ -170,7 +185,10 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null) {
   })
 
   // Renderer tells us the raw canvas zoom; compute effective once and push (no animation)
-  ipcMain.handle('overlay:set-zoom', async (_e, { tabId, factor }: { tabId?: string; factor: number }) => {
+  ipcMain.handle('overlay:set-zoom', async (
+    _event: IpcMainInvokeEvent, 
+    { tabId, factor }: { tabId?: string; factor: number }
+  ) => {
     canvasZoom = factor || 1
     const target = currentEff()
 
@@ -187,14 +205,14 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null) {
     }
   })
 
-  ipcMain.handle('overlay:hide', async (_e, { tabId }: { tabId: string }) => {
+  ipcMain.handle('overlay:hide', async (_event: IpcMainInvokeEvent, { tabId }: { tabId: string }) => {
     const win = getWindow()
     const { view } = resolve(tabId)
     if (!win || !view) return
     detach(win, view)
   })
 
-  ipcMain.handle('overlay:destroy', async (_e, { tabId }: { tabId: string }) => {
+  ipcMain.handle('overlay:destroy', async (_event: IpcMainInvokeEvent, { tabId }: { tabId: string }) => {
     const win = getWindow()
     const { view } = resolve(tabId)
     if (win && view) {
@@ -203,14 +221,15 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null) {
         detach(win, view)
         try { view.webContents.stop() } catch {}
         try { view.webContents.setAudioMuted(true) } catch {}
-        try { (view.webContents as any).destroy() } catch {}
+        // FIXED: Properly typed destroy method
+        try { (view.webContents as WebContentsWithDebugger).destroy() } catch {}
       } finally {
         for (const [k, s] of views) if (s.view === view) { views.delete(k); break }
       }
     }
   })
 
-  ipcMain.handle('overlay:capture', async (_e, { tabId }: { tabId: string }) => {
+  ipcMain.handle('overlay:capture', async (_event: IpcMainInvokeEvent, { tabId }: { tabId: string }) => {
     const { view } = resolve(tabId)
     if (!view) return { ok: false }
     try {
@@ -221,10 +240,11 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null) {
     } catch { return { ok: false } }
   })
 
-  ipcMain.handle('overlay:focus', async (_e, p?: { tabId?: string }) => {
+  ipcMain.handle('overlay:focus', async (_event: IpcMainInvokeEvent, p?: { tabId?: string }) => {
     const { view } = resolve(p?.tabId ?? null)
     if (view) try { view.webContents.focus() } catch {}
   })
+  
   ipcMain.handle('overlay:blur', async () => {
     const win = getWindow()
     if (win) try { win.webContents.focus() } catch {}

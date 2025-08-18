@@ -107,7 +107,8 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
             rect.height !== lastRect.height
 
           if (moved) {
-            window.overlay.setBounds({ tabId: id, rect, dpr }).catch(() => {})
+            // Send updated bounds to overlay
+            window.overlay.setBounds({ tabId: id, rect }).catch(() => {})
             Object.assign(lastRect, rect)
           }
         }
@@ -127,14 +128,13 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
     // Cleanup
     useEffect(() => {
       return () => {
-  const id = tabIdRef.current
-  if (!id) return
-  // Prefer destroy; fall back to hide if needed
-  const o = (window as any).overlay
-  if (o?.destroy) o.destroy({ tabId: id }).catch?.(() => {})
-  else o?.hide?.({ tabId: id }).catch?.(() => {})
-}
-
+        const id = tabIdRef.current
+        if (!id) return
+        // Prefer destroy; fall back to hide if needed
+        const o = (window as any).overlay
+        if (o?.destroy) o.destroy({ tabId: id }).catch?.(() => {})
+        else o?.hide?.({ tabId: id }).catch?.(() => {})
+      }
     }, [])
 
     return (
