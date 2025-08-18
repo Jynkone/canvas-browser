@@ -1,9 +1,6 @@
-// overlay.ts — type-safe version with proper error handling
-// Uses WebContentsView + Views hierarchy. One global zoom = canvasZoom * 0.8.
-// Consistent across sites: native zoom when >= 0.25, minimal emulation below 0.25.
-
 import { BrowserWindow, WebContentsView, ipcMain, IpcMainInvokeEvent } from 'electron'
 import { randomUUID } from 'crypto'
+import type { NavigationState } from '../types/overlay'
 
 type Rect = { x: number; y: number; width: number; height: number }
 
@@ -11,6 +8,7 @@ type ViewState = {
   view: WebContentsView
   lastBounds: { x: number; y: number; w: number; h: number } | null
   lastAppliedZoom?: number
+  navigationState: NavigationState
 }
 
 // Type guard to check if WebContents has debugger API
@@ -39,10 +37,41 @@ type SetBoundsPayload = { tabId: string; rect: Rect }
 type SetZoomPayload = { tabId?: string; factor: number }
 type TabIdPayload = { tabId: string }
 type FocusPayload = { tabId?: string }
+type NavigatePayload = { tabId: string; url: string }
 
 // Result types
 type CreateTabResult = { ok: boolean; tabId?: string }
 type CaptureResult = { ok: boolean; dataUrl?: string }
+type NavigationResult = { ok: boolean }
+type NavigationStateResult = { 
+  ok: boolean; 
+  currentUrl?: string; 
+  canGoBack?: boolean; 
+  canGoForward?: boolean; 
+  title?: string 
+}
+
+// Validation functions
+function isValidUrl(url: string): boolean {
+  try {
+    new URL(url)
+    return true
+  } catch {
+    return false
+  }
+}
+
+function sanitizeUrl(url: string): string {
+  const trimmed = url.trim()
+  if (!trimmed) return 'about:blank'
+  
+  // Add protocol if missing
+  if (!trimmed.startsWith('http://') && !trimmed.startsWith('https://') && !trimmed.startsWith('about:')) {
+    return `https://${trimmed}`
+  }
+  
+  return trimmed
+}
 
 export function setupOverlayIPC(getWindow: () => BrowserWindow | null): void {
   const views = new Map<string, ViewState>()
@@ -152,7 +181,22 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null): void {
     state.lastAppliedZoom = eff
   }
 
-  // Validate payload types
+  // Update navigation state for a view
+  function updateNavigationState(view: WebContentsView, state: ViewState): void {
+    try {
+      const wc = view.webContents
+      state.navigationState = {
+        currentUrl: wc.getURL() || 'about:blank',
+        canGoBack: wc.canGoBack(),
+        canGoForward: wc.canGoForward(),
+        title: wc.getTitle() || ''
+      }
+    } catch (error) {
+      console.error('[overlay] Failed to update navigation state:', error)
+    }
+  }
+
+  // Validation functions for payloads
   function isValidCreateTabPayload(payload: unknown): payload is CreateTabPayload {
     return payload === undefined || payload === null || 
            (typeof payload === 'object' && payload !== null && 
@@ -188,6 +232,12 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null): void {
     return payload === undefined || payload === null ||
            (typeof payload === 'object' && payload !== null &&
             ((payload as any).tabId === undefined || typeof (payload as any).tabId === 'string'))
+  }
+
+  function isValidNavigatePayload(payload: unknown): payload is NavigatePayload {
+    return typeof payload === 'object' && payload !== null &&
+           typeof (payload as any).tabId === 'string' &&
+           typeof (payload as any).url === 'string'
   }
 
   // ----------------------------- IPC -----------------------------
@@ -229,7 +279,18 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null): void {
       console.error('[overlay] Failed to set zoom limits:', error)
     }
 
-    const state: ViewState = { view, lastBounds: null, lastAppliedZoom: undefined }
+    const initialUrl = sanitizeUrl(payload?.url || 'https://google.com/')
+    const state: ViewState = { 
+      view, 
+      lastBounds: null, 
+      lastAppliedZoom: undefined,
+      navigationState: {
+        currentUrl: initialUrl,
+        canGoBack: false,
+        canGoForward: false,
+        title: ''
+      }
+    }
     views.set(tabId, state)
 
     // Keep zoom consistent across navigations (reapply exact current eff, no compounding)
@@ -239,9 +300,24 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null): void {
       })
     }
 
-    view.webContents.on('dom-ready', reapply)
-    view.webContents.on('did-navigate', reapply)
-    view.webContents.on('did-navigate-in-page', reapply)
+    // Navigation event listeners
+    const updateNavState = (): void => {
+      updateNavigationState(view, state)
+    }
+
+    view.webContents.on('dom-ready', () => {
+      reapply()
+      updateNavState()
+    })
+    view.webContents.on('did-navigate', () => {
+      reapply()
+      updateNavState()
+    })
+    view.webContents.on('did-navigate-in-page', () => {
+      reapply()
+      updateNavState()
+    })
+    view.webContents.on('page-title-updated', updateNavState)
 
     // Minimal key handling: DevTools toggle + block page zoom combos
     view.webContents.on('before-input-event', (event, input) => {
@@ -279,7 +355,7 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null): void {
     await reapplyNoAnim(view, state)
 
     try {
-      await view.webContents.loadURL(payload?.url || 'https://google.com/')
+      await view.webContents.loadURL(initialUrl)
     } catch (error) {
       console.error('[overlay] Failed to load URL:', error)
     }
@@ -509,6 +585,127 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null): void {
       } catch (error) {
         console.error('[overlay] Failed to focus main window:', error)
       }
+    }
+  })
+
+  // Navigation IPC handlers
+  ipcMain.handle('overlay:navigate', async (_event: IpcMainInvokeEvent, payload: unknown): Promise<NavigationResult> => {
+    if (!isValidNavigatePayload(payload)) {
+      console.error('[overlay] Invalid navigate payload:', payload)
+      return { ok: false }
+    }
+
+    const { view, state } = resolve(payload.tabId)
+    if (!view || !state) {
+      console.error('[overlay] Invalid view or state for navigate')
+      return { ok: false }
+    }
+
+    const sanitizedUrl = sanitizeUrl(payload.url)
+    if (!isValidUrl(sanitizedUrl)) {
+      console.error('[overlay] Invalid URL for navigate:', sanitizedUrl)
+      return { ok: false }
+    }
+
+    try {
+      await view.webContents.loadURL(sanitizedUrl)
+      // Navigation state will be updated via event listeners
+      return { ok: true }
+    } catch (error) {
+      console.error('[overlay] Failed to navigate:', error)
+      return { ok: false }
+    }
+  })
+
+  ipcMain.handle('overlay:go-back', async (_event: IpcMainInvokeEvent, payload: unknown): Promise<NavigationResult> => {
+    if (!isValidTabIdPayload(payload)) {
+      console.error('[overlay] Invalid go-back payload:', payload)
+      return { ok: false }
+    }
+
+    const { view, state } = resolve(payload.tabId)
+    if (!view || !state) {
+      console.error('[overlay] Invalid view or state for go-back')
+      return { ok: false }
+    }
+
+    if (!state.navigationState.canGoBack) {
+      return { ok: false }
+    }
+
+    try {
+      view.webContents.goBack()
+      return { ok: true }
+    } catch (error) {
+      console.error('[overlay] Failed to go back:', error)
+      return { ok: false }
+    }
+  })
+
+  ipcMain.handle('overlay:go-forward', async (_event: IpcMainInvokeEvent, payload: unknown): Promise<NavigationResult> => {
+    if (!isValidTabIdPayload(payload)) {
+      console.error('[overlay] Invalid go-forward payload:', payload)
+      return { ok: false }
+    }
+
+    const { view, state } = resolve(payload.tabId)
+    if (!view || !state) {
+      console.error('[overlay] Invalid view or state for go-forward')
+      return { ok: false }
+    }
+
+    if (!state.navigationState.canGoForward) {
+      return { ok: false }
+    }
+
+    try {
+      view.webContents.goForward()
+      return { ok: true }
+    } catch (error) {
+      console.error('[overlay] Failed to go forward:', error)
+      return { ok: false }
+    }
+  })
+
+  ipcMain.handle('overlay:reload', async (_event: IpcMainInvokeEvent, payload: unknown): Promise<NavigationResult> => {
+    if (!isValidTabIdPayload(payload)) {
+      console.error('[overlay] Invalid reload payload:', payload)
+      return { ok: false }
+    }
+
+    const { view } = resolve(payload.tabId)
+    if (!view) {
+      console.error('[overlay] Invalid view for reload')
+      return { ok: false }
+    }
+
+    try {
+      view.webContents.reload()
+      return { ok: true }
+    } catch (error) {
+      console.error('[overlay] Failed to reload:', error)
+      return { ok: false }
+    }
+  })
+
+  ipcMain.handle('overlay:get-navigation-state', async (_event: IpcMainInvokeEvent, payload: unknown): Promise<NavigationStateResult> => {
+    if (!isValidTabIdPayload(payload)) {
+      console.error('[overlay] Invalid get-navigation-state payload:', payload)
+      return { ok: false }
+    }
+
+    const { state } = resolve(payload.tabId)
+    if (!state) {
+      console.error('[overlay] Invalid state for get-navigation-state')
+      return { ok: false }
+    }
+
+    return {
+      ok: true,
+      currentUrl: state.navigationState.currentUrl,
+      canGoBack: state.navigationState.canGoBack,
+      canGoForward: state.navigationState.canGoForward,
+      title: state.navigationState.title
     }
   })
 }

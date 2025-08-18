@@ -6,7 +6,7 @@ contextBridge.exposeInMainWorld('electron', {
   process: { versions: process.versions }
 })
 
-// 2) Overlay bridge (typed via OverlayAPI)
+// 2) Overlay bridge (typed via OverlayAPI) with navigation support
 const overlay: OverlayAPI = {
   createTab: (payload) => ipcRenderer.invoke('overlay:create-tab', payload),
   show: (payload) => ipcRenderer.invoke('overlay:show', payload),
@@ -17,6 +17,13 @@ const overlay: OverlayAPI = {
   capture: (payload) => ipcRenderer.invoke('overlay:capture', payload),
   focus: (payload) => ipcRenderer.invoke('overlay:focus', payload),
   blur: () => ipcRenderer.invoke('overlay:blur'),
+  
+  // Navigation methods
+  navigate: (payload) => ipcRenderer.invoke('overlay:navigate', payload),
+  goBack: (payload) => ipcRenderer.invoke('overlay:go-back', payload),
+  goForward: (payload) => ipcRenderer.invoke('overlay:go-forward', payload),
+  reload: (payload) => ipcRenderer.invoke('overlay:reload', payload),
+  getNavigationState: (payload) => ipcRenderer.invoke('overlay:get-navigation-state', payload),
 }
 
 contextBridge.exposeInMainWorld('overlay', overlay)
