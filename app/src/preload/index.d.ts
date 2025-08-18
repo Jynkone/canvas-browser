@@ -1,4 +1,6 @@
-import type { OverlayAPI } from '../../types/overlay'
+// renderer/src/preload/index.d.ts (or similar)
+
+import type { OverlayAPI } from './overlay' // ← adjust path if needed
 
 export {}
 

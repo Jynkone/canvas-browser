@@ -1,11 +1,13 @@
 import { BrowserWindow, WebContentsView, ipcMain } from 'electron'
+import type { Debugger as ElectronDebugger, Input } from 'electron'
 import { randomUUID } from 'crypto'
 
 type Rect = { x: number; y: number; width: number; height: number }
 
 type ViewState = {
   view: WebContentsView
-  lastBounds: { x: number; y: number; w: number; h: number } | null
+  attached: boolean
+  lastBounds: { x: number; y: number; w: number; h: number }
   lastAppliedZoom?: number
   navState: {
     currentUrl: string
@@ -15,324 +17,295 @@ type ViewState = {
   }
 }
 
+type Ok<T extends object = {}> = { ok: true } & T
+type Err = { ok: false; error: string }
+type CreateTabResponse = Ok<{ tabId: string }> | Err
+type SimpleResponse = Ok | Err
+type CaptureResponse = Ok<{ dataUrl: string }> | Err
+type GetNavStateResponse = (Ok & ViewState['navState'] & { isLoading: boolean }) | Err
+
 const CHROME_MIN = 0.25
 const CHROME_MAX = 5
 const ZOOM_RATIO = 0.8
+const MAX_VIEWS = 32
 const clamp = (n: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, n))
 
-// Raw canvas zoom from renderer; effective = canvasZoom * ZOOM_RATIO (no compounding)
 let canvasZoom = 1
 
 export function setupOverlayIPC(getWindow: () => BrowserWindow | null) {
   const views = new Map<string, ViewState>()
 
-  const resolve = (id?: string | null) => {
-    if (id && views.has(id)) {
-      const s = views.get(id)!
-      return { view: s.view, state: s }
-    }
-    return { view: null as unknown as WebContentsView | null, state: null as unknown as ViewState | null }
-  }
-
-  // Views API attach/detach
-  const attach = (win: BrowserWindow, view: WebContentsView) => { try { win.contentView.addChildView(view) } catch {} }
-  const detach = (win: BrowserWindow, view: WebContentsView) => { try { win.contentView.removeChildView(view) } catch {} }
-
-  const currentEff = () => clamp((canvasZoom || 1) * ZOOM_RATIO, 0.05, CHROME_MAX)
-
-  async function clearEmuIfAny(view: WebContentsView) {
-    try {
-      const wc = view.webContents as any
-      if (wc.debugger.isAttached()) {
-        await wc.debugger.sendCommand('Emulation.clearDeviceMetricsOverride', {})
-        wc.debugger.detach()
+  const S = {
+    resolve(id?: string | null) {
+      if (id && views.has(id)) {
+        const s = views.get(id)!
+        return { view: s.view, state: s }
       }
-    } catch {}
+      return { view: null as WebContentsView | null, state: null as ViewState | null }
+    },
+    attach(win: BrowserWindow, s: ViewState) {
+      if (s.attached) return
+      try { win.contentView.addChildView(s.view); s.attached = true } catch {}
+    },
+    detach(win: BrowserWindow, s: ViewState) {
+      if (!s.attached) return
+      try { win.contentView.removeChildView(s.view); s.attached = false } catch {}
+    },
+    currentEff() { return clamp((canvasZoom || 1) * ZOOM_RATIO, 0.05, CHROME_MAX) },
+    hasRealBounds(b?: { width: number; height: number } | null) { return !!b && b.width >= 2 && b.height >= 2 },
+    async clearEmuIfAny(view: WebContentsView) {
+      try {
+        const dbg: ElectronDebugger = view.webContents.debugger
+        if (dbg.isAttached()) { await dbg.sendCommand('Emulation.clearDeviceMetricsOverride', {}); dbg.detach() }
+      } catch {}
+    },
+    async setEff(view: WebContentsView, eff: number) {
+      if (eff >= CHROME_MIN) {
+        try { await view.webContents.setZoomFactor(eff) } catch {}
+        await S.clearEmuIfAny(view)
+        return
+      }
+      try { await view.webContents.setZoomFactor(CHROME_MIN) } catch {}
+      let b: { width: number; height: number }
+      try { b = view.getBounds() } catch { return }
+      if (!S.hasRealBounds(b)) return
+      try {
+        const dbg: ElectronDebugger = view.webContents.debugger
+        if (!dbg.isAttached()) dbg.attach('1.3')
+        const scale = Math.max(0.05, Math.min(1, eff / CHROME_MIN))
+        const emuW = Math.max(1, Math.floor(b.width / scale))
+        const emuH = Math.max(1, Math.floor(b.height / scale))
+        await dbg.sendCommand('Emulation.setDeviceMetricsOverride', {
+          width: emuW, height: emuH, deviceScaleFactor: 0, scale,
+          mobile: false, screenWidth: emuW, screenHeight: emuH,
+          positionX: 0, positionY: 0, dontSetVisibleSize: false,
+        })
+      } catch {}
+    },
+    async reapply(state: ViewState) {
+      try { const eff = S.currentEff(); await S.setEff(state.view, eff); state.lastAppliedZoom = eff } catch {}
+    },
+    updateNav(state: ViewState) {
+      try {
+        const wc = state.view.webContents
+        state.navState = {
+          currentUrl: wc.getURL() || 'about:blank',
+          canGoBack: wc.navigationHistory.canGoBack(),
+          canGoForward: wc.navigationHistory.canGoForward(),
+          title: wc.getTitle() || '',
+        }
+      } catch {}
+    },
+    safeDestroy(state: ViewState) {
+      try { void S.clearEmuIfAny(state.view) } catch {}
+      try { state.view.webContents.stop() } catch {}
+      try { state.view.webContents.setAudioMuted(true) } catch {}
+      try {
+        const win = getWindow()
+        if (win && !win.isDestroyed()) { win.contentView.removeChildView(state.view); state.attached = false }
+      } catch {}
+      try { (state.view.webContents as unknown as { destroy?: () => void }).destroy?.() } catch {}
+    },
+    roundRect(rect: Rect) {
+      const x = Math.floor(rect.x), y = Math.floor(rect.y)
+      const w = Math.ceil(rect.width), h = Math.ceil(rect.height)
+      return { x, y, w, h }
+    },
   }
 
-  // Apply one effective zoom to a view (native >= 0.25; minimal emu below)
-  async function setEff(view: WebContentsView, eff: number) {
-    if (eff >= CHROME_MIN) {
-      try { await view.webContents.setZoomFactor(eff) } catch {}
-      await clearEmuIfAny(view)
-      return
-    }
-    // eff < 0.25 → keep Chromium at 0.25 and emulate remaining scale
-    try { await view.webContents.setZoomFactor(CHROME_MIN) } catch {}
-    try {
-      const wc = view.webContents as any
-      if (!wc.debugger.isAttached()) wc.debugger.attach('1.3')
-      const scale = Math.max(0.05, Math.min(1, eff / CHROME_MIN))
-      const b = view.getBounds()
-      const emuW = Math.max(1, Math.floor(b.width / scale))
-      const emuH = Math.max(1, Math.floor(b.height / scale))
-      await wc.debugger.sendCommand('Emulation.setDeviceMetricsOverride', {
-        width: emuW, height: emuH, deviceScaleFactor: 0, scale,
-        mobile: false, screenWidth: emuW, screenHeight: emuH,
-        positionX: 0, positionY: 0, dontSetVisibleSize: false,
+  // creation queue
+  let creating = false
+  const q: Array<() => void> = []
+  function runQ() {
+    if (creating) return
+    const task = q.shift()
+    if (!task) return
+    creating = true
+    setImmediate(async () => { try { await task() } finally { creating = false; runQ() } })
+  }
+  function enqueue<TSuccess extends { ok: true }>(fn: () => Promise<TSuccess>): Promise<TSuccess | Err> {
+    return new Promise((resolve) => {
+      q.push(async () => {
+        try { resolve(await fn()) }
+        catch (e) { resolve({ ok: false, error: e instanceof Error ? e.message : 'Operation failed' }) }
       })
-    } catch {}
+      runQ()
+    })
   }
 
-  // Reapply exact current effective zoom (no animations)
-  async function reapplyNoAnim(view: WebContentsView, state: ViewState) {
-    const eff = currentEff()
-    await setEff(view, eff)
-    state.lastAppliedZoom = eff
-  }
+  // IPC
 
-  function updateNavState(view: WebContentsView, state: ViewState) {
-    try {
-      const wc = view.webContents
-      state.navState = {
-        currentUrl: wc.getURL() || 'about:blank',
-        canGoBack: wc.navigationHistory.canGoBack(),
-        canGoForward: wc.navigationHistory.canGoForward(),
-        title: wc.getTitle() || ''
-      }
-    } catch {}
-  }
-
-  // IPC Handlers
-  ipcMain.handle('overlay:create-tab', async (_, payload?: { url?: string }) => {
+  ipcMain.handle('overlay:create-tab', async (_e, payload?: { url?: string }): Promise<CreateTabResponse> => {
     const win = getWindow()
-    if (!win) return { ok: false }
+    if (!win || win.isDestroyed()) return { ok: false, error: 'No window' }
+    if (views.size >= MAX_VIEWS) return { ok: false, error: `Too many tabs (${views.size})` }
 
-    const tabId = randomUUID()
-    const view = new WebContentsView({
-      webPreferences: {
-        devTools: true,
-        contextIsolation: true,
-        nodeIntegration: false,
-        backgroundThrottling: false,
+    return enqueue(async () => {
+      const tabId = randomUUID()
+      let state: ViewState | undefined
+
+      try {
+        const view = new WebContentsView({
+          webPreferences: { devTools: true, contextIsolation: true, nodeIntegration: false, backgroundThrottling: false },
+        })
+        try { view.webContents.setZoomFactor(1); view.webContents.setVisualZoomLevelLimits(1, 1) } catch {}
+
+        state = {
+          view, attached: false,
+          lastBounds: { x: 0, y: 0, w: 1, h: 1 },
+          lastAppliedZoom: 1,
+          navState: { currentUrl: payload?.url || 'https://google.com/', canGoBack: false, canGoForward: false, title: '' },
+        }
+        views.set(tabId, state)
+
+        const safeReapply = () => { if (!state) return; void S.reapply(state); S.updateNav(state) }
+        view.webContents.on('dom-ready', safeReapply)
+        view.webContents.on('did-navigate', safeReapply)
+        view.webContents.on('did-navigate-in-page', safeReapply)
+        view.webContents.on('page-title-updated', () => { if (state) S.updateNav(state) })
+        view.webContents.on('render-process-gone', () => { try { const w = getWindow(); if (w && !w.isDestroyed() && state) S.detach(w, state) } catch {}; views.delete(tabId) })
+
+        view.webContents.on('before-input-event', (event, input: Input) => {
+          if (!state) return
+          try {
+            const mod = input.control || input.meta
+            const key = (input.key || '').toLowerCase()
+            if ((key === 'i' && mod && input.shift) || key === 'f12') {
+              event.preventDefault()
+              if (view.webContents.isDevToolsOpened()) view.webContents.closeDevTools()
+              else view.webContents.openDevTools({ mode: 'detach' }); return
+            }
+            if (input.alt && key === 'arrowleft' && state.navState.canGoBack) { event.preventDefault(); view.webContents.navigationHistory.goBack(); return }
+            if (input.alt && key === 'arrowright' && state.navState.canGoForward) { event.preventDefault(); view.webContents.navigationHistory.goForward(); return }
+            if ((mod && key === 'r') || key === 'f5') { event.preventDefault(); view.webContents.reload(); return }
+            if (mod && ['=', '+', '-', '_', '0'].includes(key)) event.preventDefault()
+            if (input.type === 'mouseWheel' && mod) event.preventDefault()
+          } catch {}
+        })
+
+        await S.reapply(state)
+        try { await view.webContents.loadURL(state.navState.currentUrl) } catch {}
+        return { ok: true, tabId }
+      } catch (err) {
+        if (state) { try { const w2 = getWindow(); if (w2 && !w2.isDestroyed()) S.detach(w2, state) } catch {}; views.delete(tabId) }
+        throw err instanceof Error ? err : new Error('Create failed')
       }
-    })
-
-    // Lock user page-zoom (we control it centrally)
-    try {
-      view.webContents.setZoomFactor(1)
-      view.webContents.setVisualZoomLevelLimits(1, 1)
-    } catch {}
-
-    const state: ViewState = { 
-      view, 
-      lastBounds: null, 
-      lastAppliedZoom: undefined,
-      navState: {
-        currentUrl: payload?.url || 'https://google.com/',
-        canGoBack: false,
-        canGoForward: false,
-        title: ''
-      }
-    }
-    views.set(tabId, state)
-
-    // Keep zoom consistent across navigations (reapply exact current eff, no compounding)
-    const reapply = () => {
-      reapplyNoAnim(view, state)
-      updateNavState(view, state)
-    }
-    view.webContents.on('dom-ready', reapply)
-    view.webContents.on('did-navigate', reapply)
-    view.webContents.on('did-navigate-in-page', reapply)
-    view.webContents.on('page-title-updated', () => updateNavState(view, state))
-
-    // Key handling
-    view.webContents.on('before-input-event', (event, input) => {
-      const mod = input.control || input.meta
-      const key = input.key?.toLowerCase() || ''
-
-      // DevTools
-      if ((key === 'i' && mod && input.shift) || key === 'f12') {
-        event.preventDefault()
-        if (view.webContents.isDevToolsOpened()) view.webContents.closeDevTools()
-        else view.webContents.openDevTools({ mode: 'detach' })
-        return
-      }
-
-      // Navigation
-      if (input.alt && key === 'arrowleft' && state.navState.canGoBack) {
-        event.preventDefault()
-        view.webContents.navigationHistory.goBack()
-        return
-      }
-      if (input.alt && key === 'arrowright' && state.navState.canGoForward) {
-        event.preventDefault()
-        view.webContents.navigationHistory.goForward()
-        return
-      }
-      if ((mod && key === 'r') || key === 'f5') {
-        event.preventDefault()
-        view.webContents.reload()
-        return
-      }
-
-      // Block zoom shortcuts
-      if (mod && ['=', '+', '-', '_', '0'].includes(key)) {
-        event.preventDefault()
-      }
-      if (input.type === 'mouseWheel' && mod) {
-        event.preventDefault()
-      }
-    })
-
-    attach(win, view)
-
-    // Apply current global zoom immediately (no animation)
-    await reapplyNoAnim(view, state)
-    
-    try { await view.webContents.loadURL(state.navState.currentUrl) } catch {}
-    return { ok: true, tabId }
+    }) as Promise<CreateTabResponse>
   })
 
-  ipcMain.handle('overlay:get-zoom', async () => canvasZoom)
+  ipcMain.handle('overlay:get-zoom', async (): Promise<number> => canvasZoom)
 
-  ipcMain.handle('overlay:show', async (_, { tabId, rect }: { tabId: string; rect: Rect }) => {
+  ipcMain.handle('overlay:show', async (_e, { tabId, rect }: { tabId: string; rect: Rect }): Promise<void> => {
     const win = getWindow()
-    const { view, state } = resolve(tabId)
-    if (!win || !view || !state) return
-    const x = Math.floor(rect.x), y = Math.floor(rect.y)
-    const w = Math.ceil(rect.width), h = Math.ceil(rect.height)
+    const { state } = S.resolve(tabId)
+    if (!win || !state) return
+    const { x, y, w, h } = S.roundRect(rect)
     state.lastBounds = { x, y, w, h }
-    attach(win, view)
-    try { view.setBounds({ x, y, width: w, height: h }) } catch {}
-    if (currentEff() < CHROME_MIN) await reapplyNoAnim(view, state) // emu needs bounds
+    S.attach(win, state)
+    try { state.view.setBounds({ x, y, width: w, height: h }) } catch {}
+    if (S.currentEff() < CHROME_MIN) await S.reapply(state)
   })
 
-  ipcMain.handle('overlay:set-bounds', async (_, { tabId, rect }: { tabId: string; rect: Rect }) => {
-    const { view, state } = resolve(tabId)
-    if (!view || !state) return
-    const x = Math.floor(rect.x), y = Math.floor(rect.y)
-    const w = Math.ceil(rect.width), h = Math.ceil(rect.height)
+  ipcMain.handle('overlay:set-bounds', async (_e, { tabId, rect }: { tabId: string; rect: Rect }): Promise<void> => {
+    const { state } = S.resolve(tabId)
+    if (!state) return
+    const { x, y, w, h } = S.roundRect(rect)
     const b = state.lastBounds
     if (!b || x !== b.x || y !== b.y || w !== b.w || h !== b.h) {
       state.lastBounds = { x, y, w, h }
-      try { view.setBounds({ x, y, width: w, height: h }) } catch {}
-      if (currentEff() < CHROME_MIN) await reapplyNoAnim(view, state)
+      try { state.view.setBounds({ x, y, width: w, height: h }) } catch {}
+      if (S.currentEff() < CHROME_MIN) await S.reapply(state)
     }
   })
 
-  // Renderer tells us the raw canvas zoom; compute effective once and push (no animation)
-  ipcMain.handle('overlay:set-zoom', async (_, { tabId, factor }: { tabId?: string; factor: number }) => {
+  ipcMain.handle('overlay:set-zoom', async (_e, { tabId, factor }: { tabId?: string; factor: number }): Promise<void> => {
     canvasZoom = factor || 1
-    const target = currentEff()
-
+    const target = S.currentEff()
     if (tabId) {
-      const { view, state } = resolve(tabId)
-      if (!view || !state) return
-      await setEff(view, target)
-      state.lastAppliedZoom = target
+      const { state } = S.resolve(tabId)
+      if (!state) return
+      await S.setEff(state.view, target); state.lastAppliedZoom = target
     } else {
-      for (const [, s] of views) {
-        await setEff(s.view, target)
-        s.lastAppliedZoom = target
-      }
+      for (const [, s] of views) { await S.setEff(s.view, target); s.lastAppliedZoom = target }
     }
   })
 
-  ipcMain.handle('overlay:hide', async (_, { tabId }: { tabId: string }) => {
+  ipcMain.handle('overlay:hide', async (_e, p?: { tabId?: string }): Promise<void> => {
     const win = getWindow()
-    const { view } = resolve(tabId)
-    if (!win || !view) return
-    detach(win, view)
-  })
-
-  ipcMain.handle('overlay:destroy', async (_, { tabId }: { tabId: string }) => {
-    const win = getWindow()
-    const { view } = resolve(tabId)
-    if (win && view) {
-      try {
-        await clearEmuIfAny(view)
-        detach(win, view)
-        try { view.webContents.stop() } catch {}
-        try { view.webContents.setAudioMuted(true) } catch {}
-        try { (view.webContents as any).destroy() } catch {}
-      } finally {
-        for (const [k, s] of views) if (s.view === view) { views.delete(k); break }
-      }
+    if (!win) return
+    if (p?.tabId) {
+      const { state } = S.resolve(p.tabId)
+      if (state) S.detach(win, state)
+    } else {
+      for (const [, s] of views) S.detach(win, s)
     }
   })
 
-  ipcMain.handle('overlay:capture', async (_, { tabId }: { tabId: string }) => {
-    const { view } = resolve(tabId)
-    if (!view) return { ok: false }
+  ipcMain.handle('overlay:destroy', async (_e, { tabId }: { tabId: string }): Promise<void> => {
+    const { state } = S.resolve(tabId)
+    if (!state) return
+    try { S.safeDestroy(state) } finally { views.delete(tabId) }
+  })
+
+  ipcMain.handle('overlay:capture', async (_e, { tabId }: { tabId: string }): Promise<CaptureResponse> => {
+    const { state } = S.resolve(tabId)
+    if (!state) return { ok: false, error: 'No view' }
     try {
-      const image = await view.webContents.capturePage()
+      const image = await state.view.webContents.capturePage()
       const png = image.toPNG({ scaleFactor: 1 })
       const dataUrl = `data:image/png;base64,${Buffer.from(png).toString('base64')}`
       return { ok: true, dataUrl }
-    } catch { return { ok: false } }
+    } catch { return { ok: false, error: 'Capture failed' } }
   })
 
-  ipcMain.handle('overlay:focus', async (_, p?: { tabId?: string }) => {
-    const { view } = resolve(p?.tabId ?? null)
-    if (view) try { view.webContents.focus() } catch {}
+  ipcMain.handle('overlay:focus', async (_e, p?: { tabId?: string }): Promise<void> => {
+    const { state } = S.resolve(p?.tabId ?? null)
+    if (state) try { state.view.webContents.focus() } catch {}
   })
-  
-  ipcMain.handle('overlay:blur', async () => {
+
+  ipcMain.handle('overlay:blur', async (): Promise<void> => {
     const win = getWindow()
     if (win) try { win.webContents.focus() } catch {}
   })
 
-  // Navigation handlers
-  ipcMain.handle('overlay:navigate', async (_, { tabId, url }) => {
-    const { view, state } = resolve(tabId)
-    if (!view || !state) return { ok: false }
-    
+  ipcMain.handle('overlay:navigate', async (_e, { tabId, url }: { tabId: string; url: string }): Promise<SimpleResponse> => {
+    const { state } = S.resolve(tabId)
+    if (!state) return { ok: false, error: 'No view' }
     try {
-      await view.webContents.loadURL(url.trim().startsWith('http') ? url : `https://${url}`)
+      const u = url.trim()
+      await state.view.webContents.loadURL(u.startsWith('http') ? u : `https://${u}`)
       return { ok: true }
-    } catch {
-      return { ok: false }
-    }
+    } catch { return { ok: false, error: 'Navigate failed' } }
   })
 
-  ipcMain.handle('overlay:go-back', async (_, { tabId }) => {
-    const { view, state } = resolve(tabId)
-    if (!view || !state || !state.navState.canGoBack) return { ok: false }
-    
-    try {
-      view.webContents.navigationHistory.goBack()
-      return { ok: true }
-    } catch {
-      return { ok: false }
-    }
+  ipcMain.handle('overlay:go-back', async (_e, { tabId }: { tabId: string }): Promise<SimpleResponse> => {
+    const { state } = S.resolve(tabId)
+    if (!state || !state.navState.canGoBack) return { ok: false, error: 'Cannot go back' }
+    try { state.view.webContents.navigationHistory.goBack(); return { ok: true } }
+    catch { return { ok: false, error: 'Back failed' } }
   })
 
-  ipcMain.handle('overlay:go-forward', async (_, { tabId }) => {
-    const { view, state } = resolve(tabId)
-    if (!view || !state || !state.navState.canGoForward) return { ok: false }
-    
-    try {
-      view.webContents.navigationHistory.goForward()
-      return { ok: true }
-    } catch {
-      return { ok: false }
-    }
+  ipcMain.handle('overlay:go-forward', async (_e, { tabId }: { tabId: string }): Promise<SimpleResponse> => {
+    const { state } = S.resolve(tabId)
+    if (!state || !state.navState.canGoForward) return { ok: false, error: 'Cannot go forward' }
+    try { state.view.webContents.navigationHistory.goForward(); return { ok: true } }
+    catch { return { ok: false, error: 'Forward failed' } }
   })
 
-  ipcMain.handle('overlay:reload', async (_, { tabId }) => {
-    const { view } = resolve(tabId)
-    if (!view) return { ok: false }
-    
-    try {
-      view.webContents.reload()
-      return { ok: true }
-    } catch {
-      return { ok: false }
-    }
+  ipcMain.handle('overlay:reload', async (_e, { tabId }: { tabId: string }): Promise<SimpleResponse> => {
+    const { state } = S.resolve(tabId)
+    if (!state) return { ok: false, error: 'No view' }
+    try { state.view.webContents.reload(); return { ok: true } }
+    catch { return { ok: false, error: 'Reload failed' } }
   })
 
-  ipcMain.handle('overlay:get-navigation-state', async (_, { tabId }) => {
-    const { state } = resolve(tabId)
-    if (!state) return { ok: false }
-    
+  ipcMain.handle('overlay:get-navigation-state', async (_e, { tabId }: { tabId: string }): Promise<GetNavStateResponse> => {
+    const { state } = S.resolve(tabId)
+    if (!state) return { ok: false, error: 'No view' }
     return {
       ok: true,
       ...state.navState,
-      isLoading: (() => {
-        try { return state.view.webContents.isLoading() } catch { return false }
-      })()
+      isLoading: (() => { try { return state.view.webContents.isLoading() } catch { return false } })(),
     }
   })
 }
