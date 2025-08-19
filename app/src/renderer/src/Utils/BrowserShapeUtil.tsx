@@ -8,8 +8,7 @@ import {
   resizeBox,
   useEditor,
 } from 'tldraw'
-import { NavigationBar, NAV_BAR_HEIGHT } from './NavigationBar'
-import type { OverlayAPI } from '../../types/overlay'
+import { NavigationBar, NAV_BAR_HEIGHT } from '../components/NavigationBar'
 
 export type BrowserShape = TLBaseShape<
   'browser-shape',
@@ -82,7 +81,7 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
     const hostRef = useRef<HTMLDivElement | null>(null)
     const tabIdRef = useRef<string | null>(null)
 
-    const overlay: OverlayAPI | undefined = (window as unknown as { overlay?: OverlayAPI }).overlay
+    const overlay = window.overlay
 
     const [navState, setNavState] = useState<NavState>({
       currentUrl: shape.props.url,
