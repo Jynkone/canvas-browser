@@ -12,13 +12,18 @@ interface NavigationBarProps {
   onBack: () => void
   onForward: () => void
   onReload: () => void
+
+  // NEW: fit-screen toggle
+  fitMode: boolean
+  onToggleFit: () => void
 }
 
 // Type-safe button keys
 const BUTTON_KEYS = {
   BACK: 'back',
   FORWARD: 'forward',
-  RELOAD: 'reload'
+  RELOAD: 'reload',
+  FIT: 'fit',
 } as const
 
 type ButtonKey = typeof BUTTON_KEYS[keyof typeof BUTTON_KEYS]
@@ -36,13 +41,13 @@ const STYLES = {
     BORDER_BOTTOM: '#adb5bd',
     INPUT_BORDER: '#ced4da',
     INPUT_FOCUS_SHADOW: 'rgba(0, 123, 255, 0.35)',
-    INPUT_HOVER_SHADOW: 'rgba(0,0,0,0.12)'
+    INPUT_HOVER_SHADOW: 'rgba(0,0,0,0.12)',
   },
   TRANSITIONS: {
     TRANSFORM: 'transform 0.25s cubic-bezier(0.2, 0, 0, 1.2)',
     BACKGROUND: 'background-color 0.25s ease',
-    ALL: 'all 0.25s ease'
-  }
+    ALL: 'all 0.25s ease',
+  },
 } as const
 
 export const NAV_BAR_HEIGHT = STYLES.NAV_BAR_HEIGHT
@@ -59,38 +64,41 @@ export const NavigationBar: React.FC<NavigationBarProps> = ({
   onUrlChange,
   onBack,
   onForward,
-  onReload
+  onReload,
+  fitMode,
+  onToggleFit,
 }) => {
   const [urlInput, setUrlInput] = useState(navState.currentUrl)
   const [activeButton, setActiveButton] = useState<ButtonKey | null>(null)
   const [inputState, setInputState] = useState<InputFocusState>({
     isFocused: false,
-    isHovered: false
+    isHovered: false,
   })
 
   useEffect(() => {
     setUrlInput(navState.currentUrl)
   }, [navState.currentUrl])
 
-  const handleSubmit = useCallback((e: React.FormEvent) => {
-    e.preventDefault()
-    const trimmed = urlInput.trim()
-    if (!trimmed) return
+  const handleSubmit = useCallback(
+    (e: React.FormEvent) => {
+      e.preventDefault()
+      const trimmed = urlInput.trim()
+      if (!trimmed) return
 
-    // Type-safe URL validation
-    const isHttpUrl = trimmed.startsWith('http://') || trimmed.startsWith('https://')
-    const isDomainLike = trimmed.includes('.')
+      const isHttpUrl = trimmed.startsWith('http://') || trimmed.startsWith('https://')
+      const isDomainLike = trimmed.includes('.')
 
-    if (isHttpUrl) {
-      onUrlChange(trimmed)
-    } else if (isDomainLike) {
-      onUrlChange(`https://${trimmed}`)
-    } else {
-      onUrlChange(`https://www.google.com/search?q=${encodeURIComponent(trimmed)}`)
-    }
-  }, [urlInput, onUrlChange])
+      if (isHttpUrl) {
+        onUrlChange(trimmed)
+      } else if (isDomainLike) {
+        onUrlChange(`https://${trimmed}`)
+      } else {
+        onUrlChange(`https://www.google.com/search?q=${encodeURIComponent(trimmed)}`)
+      }
+    },
+    [urlInput, onUrlChange]
+  )
 
-  // Type-safe button configuration
   interface ButtonConfig {
     key: ButtonKey
     label: string
@@ -105,25 +113,24 @@ export const NavigationBar: React.FC<NavigationBarProps> = ({
       label: '←',
       handler: onBack,
       disabled: !navState.canGoBack,
-      title: 'Go back'
+      title: 'Go back',
     },
     {
       key: BUTTON_KEYS.FORWARD,
       label: '→',
       handler: onForward,
       disabled: !navState.canGoForward,
-      title: 'Go forward'
+      title: 'Go forward',
     },
     {
       key: BUTTON_KEYS.RELOAD,
       label: '↻',
       handler: onReload,
       disabled: false,
-      title: 'Reload'
-    }
+      title: 'Reload',
+    },
   ]
 
-  // Type-safe style computation
   const getButtonStyle = (config: ButtonConfig): React.CSSProperties => {
     const isActive = activeButton === config.key
     const baseStyle: React.CSSProperties = {
@@ -137,7 +144,7 @@ export const NavigationBar: React.FC<NavigationBarProps> = ({
       justifyContent: 'center',
       fontSize: '14px',
       transition: `${STYLES.TRANSITIONS.TRANSFORM}, ${STYLES.TRANSITIONS.BACKGROUND}`,
-      userSelect: 'none'
+      userSelect: 'none',
     }
 
     if (config.disabled) {
@@ -145,7 +152,7 @@ export const NavigationBar: React.FC<NavigationBarProps> = ({
         ...baseStyle,
         background: STYLES.COLORS.DISABLED_BACKGROUND,
         color: STYLES.COLORS.DISABLED_TEXT,
-        transform: 'scale(1.0)'
+        transform: 'scale(1.0)',
       }
     }
 
@@ -153,8 +160,24 @@ export const NavigationBar: React.FC<NavigationBarProps> = ({
       ...baseStyle,
       background: isActive ? '#d0e4ff' : STYLES.COLORS.BACKGROUND,
       color: STYLES.COLORS.TEXT,
-      transform: isActive ? 'scale(0.8)' : 'scale(1.0)'
+      transform: isActive ? 'scale(0.8)' : 'scale(1.0)',
     }
+  }
+
+  const getFitButtonStyle = (): React.CSSProperties => {
+    const base: React.CSSProperties = {
+      height: '32px',
+      padding: '0 10px',
+      borderRadius: '6px',
+      border: '1px solid #cfd4da',
+      background: fitMode ? '#d0e4ff' : '#f8f9fa',
+      color: STYLES.COLORS.TEXT,
+      cursor: 'pointer',
+      fontSize: '12px',
+      userSelect: 'none',
+      transition: STYLES.TRANSITIONS.ALL,
+    }
+    return base
   }
 
   const getInputStyle = (): React.CSSProperties => {
@@ -168,7 +191,7 @@ export const NavigationBar: React.FC<NavigationBarProps> = ({
       fontFamily: 'system-ui, sans-serif',
       background: 'white',
       boxSizing: 'border-box',
-      transition: STYLES.TRANSITIONS.ALL
+      transition: STYLES.TRANSITIONS.ALL,
     }
 
     if (inputState.isFocused) {
@@ -178,7 +201,7 @@ export const NavigationBar: React.FC<NavigationBarProps> = ({
         boxShadow: `0 0 6px ${STYLES.COLORS.INPUT_FOCUS_SHADOW}`,
         whiteSpace: 'nowrap',
         overflow: 'visible',
-        textOverflow: 'clip'
+        textOverflow: 'clip',
       }
     }
 
@@ -190,7 +213,7 @@ export const NavigationBar: React.FC<NavigationBarProps> = ({
         boxShadow: `0 0 6px ${STYLES.COLORS.INPUT_HOVER_SHADOW}`,
         whiteSpace: 'nowrap',
         overflow: 'hidden',
-        textOverflow: 'ellipsis'
+        textOverflow: 'ellipsis',
       }
     }
 
@@ -200,17 +223,14 @@ export const NavigationBar: React.FC<NavigationBarProps> = ({
       boxShadow: 'none',
       whiteSpace: 'nowrap',
       overflow: 'hidden',
-      textOverflow: 'ellipsis'
+      textOverflow: 'ellipsis',
     }
   }
 
   const handleButtonPress = (config: ButtonConfig) => {
     if (config.disabled) return
-    
     setActiveButton(config.key)
     config.handler()
-    
-    // Clear active state after animation
     setTimeout(() => setActiveButton(null), 250)
   }
 
@@ -232,7 +252,7 @@ export const NavigationBar: React.FC<NavigationBarProps> = ({
         fontFamily: 'system-ui, sans-serif',
         position: 'relative',
         pointerEvents: 'auto',
-        zIndex: 1000
+        zIndex: 1000,
       }}
       onPointerDown={(e) => e.stopPropagation()}
       onPointerUp={(e) => e.stopPropagation()}
@@ -263,10 +283,10 @@ export const NavigationBar: React.FC<NavigationBarProps> = ({
           style={getInputStyle()}
           onFocus={(e) => {
             e.currentTarget.select()
-            setInputState(prev => ({ ...prev, isFocused: true }))
+            setInputState((prev) => ({ ...prev, isFocused: true }))
           }}
           onBlur={() => {
-            setInputState(prev => ({ ...prev, isFocused: false }))
+            setInputState((prev) => ({ ...prev, isFocused: false }))
           }}
           onMouseDown={(e) => e.stopPropagation()}
           onMouseUp={(e) => {
@@ -280,14 +300,26 @@ export const NavigationBar: React.FC<NavigationBarProps> = ({
           }}
           onMouseEnter={() => {
             if (!inputState.isFocused) {
-              setInputState(prev => ({ ...prev, isHovered: true }))
+              setInputState((prev) => ({ ...prev, isHovered: true }))
             }
           }}
           onMouseLeave={() => {
-            setInputState(prev => ({ ...prev, isHovered: false }))
+            setInputState((prev) => ({ ...prev, isHovered: false }))
           }}
         />
       </form>
+
+      {/* Right side: Fit screen toggle */}
+<button
+  type="button"
+  aria-label={fitMode ? 'Exit fit' : 'Fit screen'}
+  title={fitMode ? 'Exit fit' : 'Fit screen'}
+  onPointerDown={onToggleFit}
+  style={getFitButtonStyle()}
+>
+  {fitMode ? '⤡' : '⤢'}
+</button>
+
 
       {isLoading && (
         <div
@@ -297,7 +329,7 @@ export const NavigationBar: React.FC<NavigationBarProps> = ({
             left: 0,
             height: '2px',
             width: '100%',
-            overflow: 'hidden'
+            overflow: 'hidden',
           }}
         >
           <div
@@ -305,7 +337,7 @@ export const NavigationBar: React.FC<NavigationBarProps> = ({
               height: '100%',
               width: '30%',
               background: STYLES.COLORS.PRIMARY,
-              animation: 'loadingBar 1.1s linear infinite'
+              animation: 'loadingBar 1.1s linear infinite',
             }}
           />
         </div>
