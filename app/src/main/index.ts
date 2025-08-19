@@ -53,15 +53,18 @@ function createWindow(): void {
     title: "Paper",  
     backgroundColor: '#111111',
     icon: getWindowIconPath(),
-    autoHideMenuBar: false,
+    autoHideMenuBar: true,
     webPreferences: {
       // IMPORTANT: points to the built preload (electron-vite outputs to out/preload/index.js)
       preload: join(__dirname, '../preload/index.js'),
-      devTools: false,          // 👈 disables devtools for the TLdraw window
+      devTools: true,          // 👈 disables devtools for the TLdraw window
       nodeIntegration: false,
       contextIsolation: true,
     },
+    
   })
+  //mainWindow.webContents.openDevTools({ mode: 'detach' })
+
 
 
   console.log('[main] Preload path:', join(__dirname, '../preload/index.js'))

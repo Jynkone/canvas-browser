@@ -26,7 +26,7 @@ type GetNavStateResponse = (Ok & ViewState['navState'] & { isLoading: boolean })
 
 const CHROME_MIN = 0.25
 const CHROME_MAX = 5
-const ZOOM_RATIO = 0.6
+const ZOOM_RATIO = 1
 const MAX_VIEWS = 32
 const clamp = (n: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, n))
 

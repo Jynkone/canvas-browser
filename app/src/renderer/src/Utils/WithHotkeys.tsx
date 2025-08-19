@@ -1,5 +1,5 @@
 import { useEffect, useRef } from 'react'
-import type { BrowserShape } from '../Utils/BrowserShapeUtil'
+import type { BrowserShape } from './BrowserShapeUtil'
 
 export default function WithHotkeys({
   BROWSER_W,

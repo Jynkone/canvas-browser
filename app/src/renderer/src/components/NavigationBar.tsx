@@ -235,7 +235,7 @@ export const NavigationBar: React.FC<NavigationBarProps> = ({
   }
 
   return (
-    <div
+    <div data-nav-root="1"
       style={{
         height: `${STYLES.NAV_BAR_HEIGHT}px`,
         width: '100%',

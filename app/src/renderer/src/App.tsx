@@ -7,11 +7,10 @@ import type { BrowserShape } from './Utils/BrowserShapeUtil'
 import WithHotkeys from './Utils/WithHotkeys'
 import { useUiChromeManager } from './Utils/useUiChromeManager'
 
-// ---- Shared constants here
-const BROWSER_W = 1000
+const BROWSER_W = 1200
 const BROWSER_H = 660
-const ZOOM_HIDE = 0.80
-const ZOOM_SHOW = 0.75
+const ZOOM_HIDE = 0.65
+const ZOOM_SHOW = 0.60
 const DURATION_MS = 180
 const SLIDE_PX = 16
 
@@ -23,26 +22,21 @@ export default function App() {
   )
 
   const editorRef = useRef<Editor | null>(null)
-  const rootRef = useRef<HTMLDivElement | null>(null)
 
-  // slide-in/out manager now takes options from here
-  const hideUiProp = useUiChromeManager(rootRef, editorRef, {
-    DURATION_MS, SLIDE_PX, ZOOM_HIDE, ZOOM_SHOW,
-  })
+  // slide-in/out manager now only needs the editor and cfg
+  useUiChromeManager(editorRef, { DURATION_MS, SLIDE_PX, ZOOM_HIDE, ZOOM_SHOW })
 
-  // Delete/Backspace fallback
+  // Delete / Backspace fallback outside inputs
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key !== 'Delete' && e.key !== 'Backspace') return
-      const ed = editorRef.current
-      if (!ed) return
+      const ed = editorRef.current; if (!ed) return
       const ae = document.activeElement as HTMLElement | null
       const tag = (ae?.tagName || '').toLowerCase()
       if (tag === 'input' || tag === 'textarea' || ae?.isContentEditable) return
       const selected = ed.getSelectedShapeIds()
       if (selected.length === 0) return
-      e.preventDefault()
-      e.stopPropagation()
+      e.preventDefault(); e.stopPropagation()
       ed.deleteShapes(selected)
       ed.focus()
     }
@@ -51,32 +45,31 @@ export default function App() {
   }, [])
 
   return (
-    <div ref={rootRef} style={{ width: '100vw', height: '100vh' }}>
+    <div style={{ width: '100vw', height: '100vh' }}>
       <Tldraw
         shapeUtils={shapeUtils}
         assetUrls={assetUrls}
-        hideUi={hideUiProp}
+        hideUi={false}
         onMount={(editor) => {
-  window.__tldraw_editor = editor
-  editorRef.current = editor
+          window.__tldraw_editor = editor
+          editorRef.current = editor
 
-  const initial = {
-    type: 'browser-shape',
-    x: 100,
-    y: 100,
-    props: { w: BROWSER_W, h: BROWSER_H, url: 'https://google.com', tabId: '' },
-  } satisfies Parameters<typeof editor.createShape>[0]
+          const initial = {
+            type: 'browser-shape',
+            x: 100,
+            y: 100,
+            props: { w: BROWSER_W, h: BROWSER_H, url: 'https://google.com', tabId: '' },
+          } as const
 
-  editor.createShape(initial as BrowserShape)
-  editor.focus()
+          editor.createShape(initial as unknown as BrowserShape) // TS generic constraint workaround
+          editor.focus()
 
-  // 👇 Start at 60% zoom (use 0.5 for 50%)
-  requestAnimationFrame(() => {
-    const cam = editor.getCamera()
-    editor.setCamera({ ...cam, z: 0.6 }) // 0.6 = 60%, 0.5 = 50%
-  })
-}}
-
+          // Start at 60% canvas zoom
+          requestAnimationFrame(() => {
+            const cam = editor.getCamera()
+            editor.setCamera({ ...cam, z: 0.6 })
+          })
+        }}
       >
         <WithHotkeys BROWSER_W={BROWSER_W} BROWSER_H={BROWSER_H} />
       </Tldraw>

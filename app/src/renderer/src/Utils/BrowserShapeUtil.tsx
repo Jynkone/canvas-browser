@@ -7,6 +7,7 @@ import {
   TLResizeInfo,
   resizeBox,
   useEditor,
+  Box,
 } from 'tldraw'
 import { NavigationBar, NAV_BAR_HEIGHT } from '../components/NavigationBar'
 
@@ -15,32 +16,11 @@ export type BrowserShape = TLBaseShape<
   { w: number; h: number; url: string; tabId: string }
 >
 
-// ── sizing
-const MIN_W = 900
+const MIN_W = 1000
 const MIN_H = 525 + NAV_BAR_HEIGHT
-const HIT_PAD_PX = 10
-const MIN_STROKE_PX = 1
-
-// ── fit math / animation
-const DEFAULT_CANVAS_ZOOM = 0.6 as const
-const FIT_OVERLAY_FACTOR = 1 / DEFAULT_CANVAS_ZOOM
-const FIT_MS = 280 as const
-const UNFIT_MS = 300 as const
 
 type Rect = { x: number; y: number; width: number; height: number }
 type NavState = { currentUrl: string; canGoBack: boolean; canGoForward: boolean; title: string }
-
-const clamp01 = (t: number) => (t < 0 ? 0 : t > 1 ? 1 : t)
-const easeOutCubic = (t: number) => 1 - Math.pow(1 - clamp01(t), 3)
-const easeInOutCubic = (t: number) =>
-  (t = clamp01(t)) < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2
-const lerp = (a: number, b: number, t: number) => a + (b - a) * t
-const lerpRect = (a: Rect, b: Rect, t: number): Rect => ({
-  x: Math.round(lerp(a.x, b.x, t)),
-  y: Math.round(lerp(a.y, b.y, t)),
-  width: Math.round(lerp(a.width, b.width, t)),
-  height: Math.round(lerp(a.height, b.height, t)),
-})
 
 export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
   static override type = 'browser-shape' as const
@@ -60,21 +40,11 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
   }
 
   override getGeometry(shape: BrowserShape) {
-    const z = this.editor.getZoomLevel()
-    const pad = HIT_PAD_PX / Math.max(z, 0.001)
-    return new Rectangle2d({
-      x: -pad,
-      y: -pad,
-      width: shape.props.w + pad * 2,
-      height: shape.props.h + pad * 2,
-      isFilled: false,
-    })
+    return new Rectangle2d({ width: shape.props.w, height: shape.props.h, isFilled: false })
   }
 
   override indicator(shape: BrowserShape) {
-    const z = this.editor.getZoomLevel()
-    const sw = MIN_STROKE_PX / Math.max(z, 0.001)
-    return <rect x={0} y={0} width={shape.props.w} height={shape.props.h} strokeWidth={sw} />
+    return <rect x={0} y={0} width={shape.props.w} height={shape.props.h} />
   }
 
   override component(shape: BrowserShape) {
@@ -91,24 +61,13 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
       title: '',
     })
     const [isLoading, setIsLoading] = useState<boolean>(false)
+
     const [fitMode, setFitMode] = useState<boolean>(false)
     const preFitCamRef = useRef<{ x: number; y: number; z: number } | null>(null)
+    const preFitSizeRef = useRef<{ w: number; h: number } | null>(null)
+    const fitStopRef = useRef<(() => void) | null>(null)
 
-    // single compact anim descriptor (read by rAF)
-    const animRef = useRef<{
-      running: boolean
-      toFit: boolean
-      start: number
-      duration: number
-      fromRect: Rect
-      toRect: Rect
-      fromFactor: number
-      toFactor: number
-      fromCam?: { x: number; y: number; z: number }
-      toCam?: { x: number; y: number; z: number }
-    } | null>(null)
-
-    // ── create tab once
+    /* ── Overlay lifecycle ──────────────────────────────────────────────── */
     useEffect(() => {
       let cancelled = false
       if (!api || tabIdRef.current) return
@@ -116,12 +75,12 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
         try {
           const res = await api.createTab({ url: shape.props.url })
           if (!cancelled && res.ok) tabIdRef.current = res.tabId
-        } catch {}
+        } catch { /* noop */ }
       })()
       return () => { cancelled = true }
     }, [api, shape.props.url])
 
-    // ── poll nav state
+    // poll navigation state (overlay emits updates but we don’t have events wired here)
     useEffect(() => {
       if (!api) return
       let cancelled = false
@@ -138,144 +97,171 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
             })
             setIsLoading(res.isLoading ?? false)
           }
-        } catch {}
+        } catch { /* noop */ }
       }
       const h = window.setInterval(tick, 500)
       return () => { cancelled = true; window.clearInterval(h) }
     }, [api])
 
-    // ── handlers
-    const handleUrlChange = async (url: string): Promise<void> => {
-      const id = tabIdRef.current; if (!api || !id) return
-      setIsLoading(true); await api.navigate({ tabId: id, url })
-    }
-    const handleBack = async (): Promise<void> => {
-      const id = tabIdRef.current; if (!api || !id || !navState.canGoBack) return
-      setIsLoading(true); await api.goBack({ tabId: id })
-    }
-    const handleForward = async (): Promise<void> => {
-      const id = tabIdRef.current; if (!api || !id || !navState.canGoForward) return
-      setIsLoading(true); await api.goForward({ tabId: id })
-    }
-    const handleReload = async (): Promise<void> => {
-      const id = tabIdRef.current; if (!api || !id) return
-      setIsLoading(true); await api.reload({ tabId: id })
-    }
-
-    // ── rect helpers
-    const getHostRect = (): Rect | null => {
-      const el = hostRef.current; if (!el) return null
-      const b = el.getBoundingClientRect()
-      return { x: Math.floor(b.left), y: Math.floor(b.top), width: Math.ceil(b.width), height: Math.ceil(b.height) }
-    }
-    const getFitRect = (): Rect => ({
-      x: 0,
-      y: NAV_BAR_HEIGHT, // ← KEY: leave space for navbar so it stays visible & clickable
-      width: Math.floor(window.innerWidth),
-      height: Math.max(0, Math.floor(window.innerHeight) - NAV_BAR_HEIGHT),
-    })
-
-    // ── rAF: follow/animate & sync zoom (respect navbar gap)
+    /* ── BrowserView follow & zoom mapping (canvas → overlay) ───────────── */
     useEffect(() => {
       if (!api) return
+
       let raf = 0
       let shown = false
       let lastRect: Rect = { x: -1, y: -1, width: -1, height: -1 }
-      let lastFactor = -1
+      let lastFactor = Number.NaN
 
       const loop = () => {
         raf = requestAnimationFrame(loop)
+
         const id = tabIdRef.current; if (!id) return
+        const el = hostRef.current; if (!el) return
 
-        const now = performance.now()
-        let rect: Rect
-        let factor: number
-
-        const anim = animRef.current
-        if (anim && anim.running) {
-          const raw = (now - anim.start) / anim.duration
-          const t = anim.toFit ? easeOutCubic(raw) : easeInOutCubic(raw)
-          if (raw >= 1) {
-            rect = anim.toRect
-            factor = anim.toFactor
-            if (anim.toCam) editor.setCamera(anim.toCam)
-            anim.running = false
-            animRef.current = null
-            setFitMode(anim.toFit)
-          } else {
-            rect = lerpRect(anim.fromRect, anim.toRect, t)
-            factor = lerp(anim.fromFactor, anim.toFactor, t)
-            if (anim.fromCam && anim.toCam) {
-              editor.setCamera({
-                x: lerp(anim.fromCam.x, anim.toCam.x, t),
-                y: lerp(anim.fromCam.y, anim.toCam.y, t),
-                z: lerp(anim.fromCam.z, anim.toCam.z, t),
-              })
-            }
-          }
-        } else {
-          if (fitMode) { rect = getFitRect(); factor = FIT_OVERLAY_FACTOR }
-          else {
-            const host = getHostRect(); if (!host) return
-            rect = host; factor = editor.getZoomLevel()
-          }
+        const b = el.getBoundingClientRect()
+        const rect: Rect = {
+          x: Math.floor(b.left),
+          y: Math.floor(b.top),
+          width: Math.ceil(b.width),
+          height: Math.ceil(b.height),
         }
 
-        if (!shown) { shown = true; void api.show({ tabId: id, rect }); lastRect = rect }
-        else if (rect.x !== lastRect.x || rect.y !== lastRect.y || rect.width !== lastRect.width || rect.height !== lastRect.height) {
-          void api.setBounds({ tabId: id, rect }); lastRect = rect
+        if (!shown) {
+          shown = true
+          void api.show({ tabId: id, rect })
+          lastRect = rect
+        } else if (
+          rect.x !== lastRect.x ||
+          rect.y !== lastRect.y ||
+          rect.width !== lastRect.width ||
+          rect.height !== lastRect.height
+        ) {
+          void api.setBounds({ tabId: id, rect })
+          lastRect = rect
         }
 
-        if (Math.abs(factor - lastFactor) > 1e-4) { void api.setZoom({ tabId: id, factor }); lastFactor = factor }
+        // Push canvas zoom; overlay scales by its internal base (e.g. 0.8)
+        const factor = editor.getZoomLevel()
+        if (!Number.isFinite(lastFactor) || Math.abs(factor - lastFactor) > 1e-3) {
+          void api.setZoom({ tabId: id, factor })
+          lastFactor = factor
+        }
       }
 
       raf = requestAnimationFrame(loop)
       return () => cancelAnimationFrame(raf)
-    }, [api, editor, shape.props.w, shape.props.h, fitMode])
+    }, [api, editor])
 
-    // ── toggle fit (animated), ALWAYS leaves navbar visible
-    const onToggleFit = (): void => {
-      if (!api) return
-      const id = tabIdRef.current
-      const hostEl = hostRef.current
-      if (!id || !hostEl) return
+    /* ── Fit mode (locks camera, preserves center & size) ───────────────── */
+    const getViewportPx = (): { vw: number; vh: number } => {
+      const vb = editor.getViewportScreenBounds()
+      return { vw: Math.max(1, Math.round(vb.width)), vh: Math.max(1, Math.round(vb.height)) }
+    }
 
-      const cam = editor.getCamera()
+    const fitShapeToViewport = (s: BrowserShape, vw: number, vh: number): void => {
+      if (s.props.w === vw && s.props.h === vh) return
+      const cx = s.x + s.props.w / 2
+      const cy = s.y + s.props.h / 2
+      const x = Math.round(cx - vw / 2)
+      const y = Math.round(cy - vh / 2)
+      editor.updateShapes([{ id: s.id, type: 'browser-shape', x, y, props: { w: vw, h: vh } }])
+    }
 
-      if (!fitMode) {
-        // enter fit
-        preFitCamRef.current = cam
-        const b = hostEl.getBoundingClientRect()
-        const fromRect: Rect = { x: Math.floor(b.left), y: Math.floor(b.top), width: Math.ceil(b.width), height: Math.ceil(b.height) }
-        const toRect = getFitRect()
-        animRef.current = {
-          running: true, toFit: true, start: performance.now(), duration: FIT_MS,
-          fromRect, toRect, fromFactor: editor.getZoomLevel(), toFactor: FIT_OVERLAY_FACTOR,
+    const zoomToShapeNow = (s: BrowserShape): void => {
+      editor.zoomToBounds(new Box(s.x, s.y, s.props.w, s.props.h), { inset: 0 })
+    }
+
+    // Allow all events inside navbar; block TL camera elsewhere while in fit
+    function startInputGuards(): () => void {
+      const isInNav = (t: EventTarget | null): boolean =>
+        t instanceof Element && !!t.closest('[data-nav-root="1"]')
+
+      const onWheel = (e: WheelEvent) => { if (!isInNav(e.target)) { e.stopImmediatePropagation(); e.preventDefault() } }
+      const onPointer = (e: PointerEvent) => { if (!isInNav(e.target)) e.stopImmediatePropagation() }
+      const onKey = (e: KeyboardEvent) => {
+        const ae = document.activeElement as Element | null
+        if (isInNav(ae)) return
+        if (e.key === ' ' || e.key === '+' || e.key === '-' || e.key === '=' || e.key === '_') {
+          e.stopImmediatePropagation(); e.preventDefault()
         }
-      } else {
-        // exit fit
-        const targetCam = preFitCamRef.current ?? { x: cam.x, y: cam.y, z: DEFAULT_CANVAS_ZOOM }
-        const hb = hostEl.getBoundingClientRect()
-        const fromRect = getFitRect()
-        const toRect: Rect = { x: Math.floor(hb.left), y: Math.floor(hb.top), width: Math.ceil(hb.width), height: Math.ceil(hb.height) }
-        animRef.current = {
-          running: true, toFit: false, start: performance.now(), duration: UNFIT_MS,
-          fromRect, toRect, fromFactor: FIT_OVERLAY_FACTOR, toFactor: targetCam.z,
-          fromCam: cam, toCam: targetCam,
-        }
+      }
+
+      window.addEventListener('wheel', onWheel, { capture: true, passive: false })
+      window.addEventListener('pointerdown', onPointer, { capture: true })
+      window.addEventListener('keydown', onKey, { capture: true })
+
+      return () => {
+        window.removeEventListener('wheel', onWheel, { capture: true } as AddEventListenerOptions)
+        window.removeEventListener('pointerdown', onPointer, { capture: true } as AddEventListenerOptions)
+        window.removeEventListener('keydown', onKey, { capture: true } as AddEventListenerOptions)
       }
     }
 
-    // ── ensure visible before interaction
-    const onPointerDown = (): void => {
-      const id = tabIdRef.current; if (!api || !id) return
-      const el = hostRef.current; if (!el) return
-      const b = el.getBoundingClientRect()
-      const rect: Rect = { x: Math.floor(b.left), y: Math.floor(b.top), width: Math.ceil(b.width), height: Math.ceil(b.height) }
-      void api.show({ tabId: id, rect })
+    const runFitOnce = (): void => {
+      if (!preFitCamRef.current) preFitCamRef.current = editor.getCamera()
+      if (!preFitSizeRef.current) preFitSizeRef.current = { w: shape.props.w, h: shape.props.h }
+      const s0 = editor.getShape<BrowserShape>(shape.id); if (!s0) return
+      const { vw, vh } = getViewportPx()
+      fitShapeToViewport(s0, vw, vh)
+      const s1 = editor.getShape<BrowserShape>(shape.id); if (s1) zoomToShapeNow(s1)
     }
 
-    // ── cleanup
+    const fitOn = (): void => {
+      runFitOnce()
+      let raf = 0
+      let last = { vw: -1, vh: -1, w: -1, h: -1 }
+      const step = () => {
+        raf = requestAnimationFrame(step)
+        const s = editor.getShape<BrowserShape>(shape.id); if (!s) return
+        const { vw, vh } = getViewportPx()
+        const vpChanged = vw !== last.vw || vh !== last.vh
+        const sizeChanged = s.props.w !== last.w || s.props.h !== last.h
+        if (vpChanged) fitShapeToViewport(s, vw, vh)
+        if (vpChanged || sizeChanged) {
+          const fresh = editor.getShape<BrowserShape>(shape.id)
+          if (fresh) {
+            zoomToShapeNow(fresh)
+            last = { vw, vh, w: fresh.props.w, h: fresh.props.h }
+          } else {
+            last = { vw, vh, w: s.props.w, h: s.props.h }
+          }
+        }
+      }
+      raf = requestAnimationFrame(step)
+
+      const stopGuards = startInputGuards()
+      fitStopRef.current = () => { cancelAnimationFrame(raf); stopGuards() }
+      setFitMode(true)
+    }
+
+    const fitOff = (): void => {
+      // stop guards / raf set during fitOn
+      fitStopRef.current?.()
+      fitStopRef.current = null
+
+      // restore shape size (preserve center)
+      const prev = preFitSizeRef.current
+      const s = editor.getShape<BrowserShape>(shape.id)
+      if (prev && s) {
+        const cx = s.x + s.props.w / 2
+        const cy = s.y + s.props.h / 2
+        const x = Math.round(cx - prev.w / 2)
+        const y = Math.round(cy - prev.h / 2)
+        editor.updateShapes([{ id: s.id, type: 'browser-shape', x, y, props: { ...s.props, w: prev.w, h: prev.h } }])
+      }
+
+      // reset camera zoom to 60% (keep previous center if saved)
+      const base = preFitCamRef.current ?? editor.getCamera()
+      editor.setCamera({ ...base, z: 0.6 })
+
+      preFitCamRef.current = null
+      preFitSizeRef.current = null
+      setFitMode(false)
+    }
+
+    const onToggleFit = (): void => { (fitMode ? fitOff : fitOn)() }
+
+    /* ── Cleanup overlay on unmount ─────────────────────────────────────── */
     useEffect(() => {
       return () => {
         const id = tabIdRef.current
@@ -284,39 +270,51 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
       }
     }, [api])
 
-    // while animating into fit, dock the wrapper so the bar pins to window top
-    const isDocked = fitMode || (animRef.current?.running === true && animRef.current.toFit)
-
+    /* ── Render ─────────────────────────────────────────────────────────── */
     return (
       <HTMLContainer
-        style={{ width: shape.props.w, height: shape.props.h, position: 'relative', pointerEvents: 'auto', cursor: 'default' }}
+        style={{
+          width: shape.props.w,
+          height: shape.props.h,
+          position: 'relative',
+          pointerEvents: 'auto',
+          cursor: 'default',
+        }}
       >
         <div
           style={{
-            width: isDocked ? '100vw' : '100%',
-            height: isDocked ? '100vh' : '100%',
+            width: '100%',
+            height: '100%',
             display: 'flex',
             flexDirection: 'column',
-            position: isDocked ? ('fixed' as const) : ('relative' as const),
-            top: isDocked ? 0 : undefined,
-            left: isDocked ? 0 : undefined,
-            zIndex: isDocked ? 2000 : 'auto',
+            position: 'relative',
           }}
         >
           <NavigationBar
             navState={navState}
             isLoading={isLoading}
-            onUrlChange={handleUrlChange}
-            onBack={handleBack}
-            onForward={handleForward}
-            onReload={handleReload}
+            onUrlChange={async (url) => {
+              const id = tabIdRef.current
+              if (api && id) { setIsLoading(true); await api.navigate({ tabId: id, url }) }
+            }}
+            onBack={async () => {
+              const id = tabIdRef.current
+              if (api && id && navState.canGoBack) { setIsLoading(true); await api.goBack({ tabId: id }) }
+            }}
+            onForward={async () => {
+              const id = tabIdRef.current
+              if (api && id && navState.canGoForward) { setIsLoading(true); await api.goForward({ tabId: id }) }
+            }}
+            onReload={async () => {
+              const id = tabIdRef.current
+              if (api && id) { setIsLoading(true); await api.reload({ tabId: id }) }
+            }}
             fitMode={fitMode}
             onToggleFit={onToggleFit}
           />
-          {/* Click-through region; BrowserView handles input */}
+          {/* host for BrowserView: native input goes here, navbar remains interactive */}
           <div
             ref={hostRef}
-            onPointerDown={onPointerDown}
             style={{ width: '100%', flex: 1, background: 'transparent', position: 'relative', pointerEvents: 'none' }}
           />
         </div>

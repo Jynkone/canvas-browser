@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect } from 'react'
 import type { Editor } from 'tldraw'
 
 type Cfg = { DURATION_MS: number; SLIDE_PX: number; ZOOM_HIDE: number; ZOOM_SHOW: number }
@@ -15,8 +15,6 @@ const raf2 = () =>
       requestAnimationFrame(() => resolve())
     })
   })
-
-/* ---------------- inline animation helpers (same as your demo) ---------------- */
 
 function setVisible(t: Target, cfg: Cfg, immediate = false) {
   const dur = immediate ? 0 : cfg.DURATION_MS
@@ -45,16 +43,12 @@ function setHidden(t: Target, cfg: Cfg, immediate = false) {
   s.pointerEvents = 'none'
 }
 
-/* ---------------- DOM targeting (covers portals + the rounded chips) ---------------- */
-
 function collectTargets(): Target[] {
   const pick = (sel: string) => Array.from(document.querySelectorAll<HTMLElement>(sel))
   const uniq = <T,>(xs: T[]) => Array.from(new Set(xs))
 
-  // top bar & wrappers (the rounded grey panel you screenshotted)
   const topCandidates = pick(
     [
-      // canonical
       '[data-testid="tlui-top-zone"]',
       '.tlui-top-zone',
       '.tlui-toolbar',
@@ -62,17 +56,15 @@ function collectTargets(): Target[] {
       '.tlui-main-menu',
       '.tlui-actions-menu',
       '.tlui-quick-actions',
-      // variants / wrappers
       '.tlui-top-bar',
       '.tlui-menu-bar',
       '[role="menubar"]',
-      // fallbacks
       '[class*="tlui-top"]',
       '[class*="toolbar"]',
+      '[class*="tlui-menu"]',
+
     ].join(',')
   )
-
-  // bottom zone + zoom/minimap HUD (portal-mounted in TL)
   const bottomCandidates = pick(
     [
       '[data-testid="tlui-bottom-zone"]',
@@ -81,7 +73,6 @@ function collectTargets(): Target[] {
       '.tlui-navigation-panel',
       '.tlui-page-menu',
       '.tlui-help-menu',
-      // zoom & minimap (critical)
       '[data-testid="tlui-zoom-zone"]',
       '.tlui-zoom',
       '.tlui-zoom-zone',
@@ -89,134 +80,64 @@ function collectTargets(): Target[] {
       '[data-testid="tlui-minimap-zone"]',
       '.tlui-minimap',
       '.tlui-minimap-zone',
-      // lenient fallbacks
       '[class*="zoom"]',
       '[class*="minimap"]',
     ].join(',')
   )
-
   const leftCandidates = pick(
-    [
-      '[data-testid="tlui-left-zone"]',
-      '.tlui-left-zone',
-      '.tlui-tools',
-      '.tlui-tools-dock',
-      '[class*="tlui-left"]',
-    ].join(',')
-  )
-
-  const rightCandidates = pick(
-    [
-      '[data-testid="tlui-right-zone"]',
-      '.tlui-right-zone',
-      '.tlui-style-panel',
-      '.tlui-inspector',
-      '[class*="tlui-right"]',
-    ].join(',')
-  )
-
-  // For the top bar specifically, animate the visible "panel" container
-  const selectPanelContainer = (el: HTMLElement): HTMLElement => {
-    const known = el.closest<HTMLElement>(
-      '.tlui-toolbar, .tlui-top-zone, [data-testid="tlui-top-zone"], .tlui-menu-bar'
+    ['[data-testid="tlui-left-zone"]', '.tlui-left-zone', '.tlui-tools', '.tlui-tools-dock', '[class*="tlui-left"]'].join(
+      ','
     )
-    if (known) return known
-
-    // otherwise walk up and pick first node that looks like the rounded chip
-    let cur: HTMLElement | null = el
-    for (let i = 0; i < 4 && cur; i++) {
-      const cs = getComputedStyle(cur)
-      const hasBg =
-        cs.backgroundColor &&
-        cs.backgroundColor !== 'rgba(0, 0, 0, 0)' &&
-        cs.backgroundColor !== 'transparent'
-      const hasShadow = !!cs.boxShadow && cs.boxShadow !== 'none'
-      const rounded = parseFloat(cs.borderRadius || '0') > 0
-      if (hasBg || hasShadow || rounded) return cur
-      cur = cur.parentElement
-    }
-    return el
-  }
+  )
+  const rightCandidates = pick(
+    ['[data-testid="tlui-right-zone"]', '.tlui-right-zone', '.tlui-style-panel', '.tlui-inspector', '[class*="tlui-right"]'].join(
+      ','
+    )
+  )
 
   const out: Target[] = []
-  for (const el of uniq(topCandidates)) out.push({ el: selectPanelContainer(el), pos: 'top' })
+  for (const el of uniq(topCandidates)) out.push({ el, pos: 'top' })
   for (const el of uniq(bottomCandidates)) out.push({ el, pos: 'bottom' })
   for (const el of uniq(leftCandidates)) out.push({ el, pos: 'left' })
   for (const el of uniq(rightCandidates)) out.push({ el, pos: 'right' })
-
-  if (out.length) return out
-
-  // Geometry fallback (rare): nearest edge for any tlui* node
-  const vw = window.innerWidth
-  const vh = window.innerHeight
-  const EDGE = 140
-  const candidates = Array.from(
-    document.querySelectorAll<HTMLElement>('.tlui, [class*="tlui"], [data-testid*="tlui"]')
-  )
-  for (const el of candidates) {
-    const r = el.getBoundingClientRect()
-    if (r.width === 0 || r.height === 0) continue
-    if (r.width > vw * 0.9 && r.height > vh * 0.9) continue
-    const nearTop = r.top <= EDGE
-    const nearBottom = vh - r.bottom <= EDGE
-    const nearLeft = r.left <= EDGE
-    const nearRight = vw - r.right <= EDGE
-    let pos: Pos
-    if (nearTop) pos = 'top'
-    else if (nearBottom) pos = 'bottom'
-    else if (nearLeft) pos = 'left'
-    else if (nearRight) pos = 'right'
-    else {
-      const dTop = r.top,
-        dBottom = vh - r.bottom,
-        dLeft = r.left,
-        dRight = vw - r.right
-      const min = Math.min(dTop, dBottom, dLeft, dRight)
-      pos = min === dTop ? 'top' : min === dBottom ? 'bottom' : min === dLeft ? 'left' : 'right'
-    }
-    out.push({ el: selectPanelContainer(el), pos })
-  }
   return out
 }
 
-/* ---------------- main hook ---------------- */
-
-export function useUiChromeManager(
-  _rootRef: React.RefObject<HTMLElement | null>,
-  editorRef: React.RefObject<Editor | null>,
-  cfg: Cfg
-) {
-  // keep TL UI mounted so animations can play (we always return false)
-  const [hideUiProp] = useState(false)
-
-  // prime nodes once TL portals are mounted, and when DOM changes
+/**
+ * Hides TL UI (slide/fade) when zoomed in beyond ZOOM_HIDE and shows it again
+ * when zoomed out below ZOOM_SHOW. Returns nothing; use with <Tldraw hideUi={false} />.
+ */
+export function useUiChromeManager(editorRef: React.RefObject<Editor | null>, cfg: Cfg): void {
+  // initial apply after portals mount, then on DOM changes / resize
   useEffect(() => {
-    const init = async () => {
-      await raf2()
+    const apply = (immediate = false) => {
+      const z = editorRef.current?.getZoomLevel() ?? 1
+      const hide = z >= cfg.ZOOM_HIDE
       const targets = collectTargets()
-      targets.forEach((t) => setVisible(t, cfg, true))
+      if (hide) targets.forEach((t) => setHidden(t, cfg, immediate))
+      else {
+        targets.forEach((t) => setHidden(t, cfg, true))
+        void targets[0]?.el.getBoundingClientRect()
+        targets.forEach((t) => setVisible(t, cfg, immediate))
+      }
     }
+
+    const init = async () => { await raf2(); apply(true) }
     void init()
 
-    const mo = new MutationObserver(() => {
-      const targets = collectTargets()
-      targets.forEach((t) => setVisible(t, cfg, true))
-    })
+    const mo = new MutationObserver(() => apply(true))
     mo.observe(document.body, { childList: true, subtree: true })
 
-    const onResize = () => {
-      const targets = collectTargets()
-      targets.forEach((t) => setVisible(t, cfg, true))
-    }
+    const onResize = () => apply(true)
     window.addEventListener('resize', onResize)
 
     return () => {
       mo.disconnect()
       window.removeEventListener('resize', onResize)
     }
-  }, [cfg])
+  }, [cfg, editorRef])
 
-  // hysteresis: hide ≥ ZOOM_HIDE, show ≤ ZOOM_SHOW
+  // hysteresis loop
   useEffect(() => {
     let rafId = 0
     let hidden = false
@@ -230,7 +151,6 @@ export function useUiChromeManager(
         if (hidden) {
           targets.forEach((t) => setHidden(t, cfg, false))
         } else {
-          // force a transition: start hidden immediately, then animate to visible
           targets.forEach((t) => setHidden(t, cfg, true))
           void targets[0]?.el.getBoundingClientRect()
           targets.forEach((t) => setVisible(t, cfg, false))
@@ -242,6 +162,4 @@ export function useUiChromeManager(
     rafId = requestAnimationFrame(step)
     return () => cancelAnimationFrame(rafId)
   }, [editorRef, cfg])
-
-  return hideUiProp
 }
