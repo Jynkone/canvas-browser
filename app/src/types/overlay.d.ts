@@ -22,34 +22,30 @@ export type NavigationStateResult =
   | ({ ok: true } & NavigationState & { /** surfaced from main via isLoading() */ isLoading: boolean })
   | { ok: false; error: string }
 
+/** Capture may also return an on-disk file path when shapeId is provided. */
 export type CaptureResult =
-  | { ok: true; dataUrl: string }
+  | { ok: true; dataUrl?: string; filePath?: string }
+  | { ok: false; error: string }
+
+export type GetOrCreateThumbnailResult =
+  | { ok: true; filePath?: string; dataUrl?: string }
   | { ok: false; error: string }
 
 // --- Payloads
-export interface CreateTabPayload {
-  url?: string
-}
+export interface CreateTabPayload { url?: string }
+export interface TabIdPayload { tabId: string }
+export interface BoundsPayload { tabId: string; /** screen-space rect for the WebContentsView */ rect: Rect }
+export interface ZoomPayload { tabId: string; /** TLDraw zoom factor (1 = 100%) */ factor: number }
+export interface NavigatePayload { tabId: string; url: string }
 
-export interface TabIdPayload {
-  tabId: string
-}
+/** Optional shapeId → write to userData/thumbs/<shapeId>.png */
+export interface CapturePayload extends TabIdPayload { shapeId?: string }
 
-export interface BoundsPayload {
-  tabId: string
-  /** screen-space rect for the WebContentsView */
-  rect: Rect
-}
-
-export interface ZoomPayload {
-  tabId: string
-  /** TLDraw zoom factor (1 = 100%) */
-  factor: number
-}
-
-export interface NavigatePayload {
-  tabId: string
+export interface GetOrCreateThumbnailPayload {
+  shapeId: string
   url: string
+  w?: number
+  h?: number
 }
 
 // --- API surface
@@ -62,10 +58,13 @@ export interface OverlayAPI {
   setBounds(payload: BoundsPayload): Promise<void>
   setZoom(payload: ZoomPayload): Promise<void>
 
-  // focus / capture (optional)
+  // focus / capture
   focus(payload?: Partial<TabIdPayload>): Promise<void>
   blur(): Promise<void>
-  capture(payload: TabIdPayload): Promise<CaptureResult>
+  capture(payload: CapturePayload): Promise<CaptureResult>
+
+  // cold-start thumbnails (muted offscreen)
+  getOrCreateThumbnail(payload: GetOrCreateThumbnailPayload): Promise<GetOrCreateThumbnailResult>
 
   // navigation
   navigate(payload: NavigatePayload): Promise<SimpleResult>
@@ -73,4 +72,8 @@ export interface OverlayAPI {
   goForward(payload: TabIdPayload): Promise<SimpleResult>
   reload(payload: TabIdPayload): Promise<SimpleResult>
   getNavigationState(payload: TabIdPayload): Promise<NavigationStateResult>
+}
+
+declare global {
+  interface Window { overlay: OverlayAPI }
 }
