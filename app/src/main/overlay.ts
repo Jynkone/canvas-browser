@@ -1,8 +1,6 @@
-import { app, BrowserWindow, WebContentsView, ipcMain } from 'electron'
+import { BrowserWindow, WebContentsView, ipcMain } from 'electron'
 import type { Debugger as ElectronDebugger, Input } from 'electron'
 import { randomUUID } from 'crypto'
-import * as fs from 'fs'
-import * as path from 'path'
 
 type Rect = { x: number; y: number; width: number; height: number }
 
@@ -23,13 +21,8 @@ type Ok<T extends object = {}> = { ok: true } & T
 type Err = { ok: false; error: string }
 type CreateTabResponse = Ok<{ tabId: string }> | Err
 type SimpleResponse = Ok | Err
-
-// Capture now may return a disk file path in addition to dataUrl.
-type CaptureUnifiedResponse = Ok<{ dataUrl?: string; filePath?: string }> | Err
+type CaptureResponse = Ok<{ dataUrl: string }> | Err
 type GetNavStateResponse = (Ok & ViewState['navState'] & { isLoading: boolean }) | Err
-
-// New: thumbnailer response for cold-start screenshots
-type GetOrCreateThumbResponse = Ok<{ filePath?: string; dataUrl?: string }> | Err
 
 const CHROME_MIN = 0.25
 const CHROME_MAX = 5
@@ -38,20 +31,6 @@ const MAX_VIEWS = 32
 const clamp = (n: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, n))
 
 let canvasZoom = 1
-
-function thumbsDir(): string {
-  const dir = path.join(app.getPath('userData'), 'thumbs')
-  try { fs.mkdirSync(dir, { recursive: true }) } catch {}
-  return dir
-}
-function thumbPath(shapeId: string): string {
-  return path.join(thumbsDir(), `${shapeId}.png`)
-}
-async function writeFileAtomic(filePath: string, buf: Buffer): Promise<void> {
-  const tmp = `${filePath}.${randomUUID()}.tmp`
-  await fs.promises.writeFile(tmp, buf)
-  await fs.promises.rename(tmp, filePath)
-}
 
 export function setupOverlayIPC(getWindow: () => BrowserWindow | null) {
   const views = new Map<string, ViewState>()
@@ -157,63 +136,65 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null) {
   // IPC
 
   ipcMain.handle('overlay:create-tab', async (_e, payload?: { url?: string }): Promise<CreateTabResponse> => {
-    const win = getWindow()
-    if (!win || win.isDestroyed()) return { ok: false, error: 'No window' }
-    if (views.size >= MAX_VIEWS) return { ok: false, error: `Too many tabs (${views.size})` }
+  const win = getWindow()
+  if (!win || win.isDestroyed()) return { ok: false, error: 'No window' }
+  if (views.size >= MAX_VIEWS) return { ok: false, error: `Too many tabs (${views.size})` }
 
-    return enqueue(async () => {
-      const tabId = randomUUID()
-      let state: ViewState | undefined
+  return enqueue(async () => {
+    const tabId = randomUUID()
+    let state: ViewState | undefined
 
-      try {
-        const view = new WebContentsView({
-          webPreferences: { devTools: true, contextIsolation: true, nodeIntegration: false, backgroundThrottling: false },
-        })
-        try { view.webContents.setZoomFactor(1); view.webContents.setVisualZoomLevelLimits(1, 1) } catch {}
+    try {
+      const view = new WebContentsView({
+        webPreferences: { devTools: true, contextIsolation: true, nodeIntegration: false, backgroundThrottling: false },
+      })
+      try { view.webContents.setZoomFactor(1); view.webContents.setVisualZoomLevelLimits(1, 1) } catch {}
 
-        state = {
-          view, attached: false,
-          lastBounds: { x: 0, y: 0, w: 1, h: 1 },
-          lastAppliedZoom: 1,
-          navState: { currentUrl: payload?.url || 'https://google.com/', canGoBack: false, canGoForward: false, title: '' },
-        }
-        views.set(tabId, state)
-
-        const safeReapply = () => { if (!state) return; void S.reapply(state); S.updateNav(state) }
-        view.webContents.on('dom-ready', safeReapply)
-        view.webContents.on('did-navigate', safeReapply)
-        view.webContents.on('did-navigate-in-page', safeReapply)
-        view.webContents.on('page-title-updated', () => { if (state) S.updateNav(state) })
-        view.webContents.on('render-process-gone', () => { try { const w = getWindow(); if (w && !w.isDestroyed() && state) S.detach(w, state) } catch {}; views.delete(tabId) })
-
-        view.webContents.on('before-input-event', (event, input: Input) => {
-          if (!state) return
-          try {
-            const mod = input.control || input.meta
-            const key = (input.key || '').toLowerCase()
-            if ((key === 'i' && mod && input.shift) || key === 'f12') {
-              event.preventDefault()
-              if (view.webContents.isDevToolsOpened()) view.webContents.closeDevTools()
-              else view.webContents.openDevTools({ mode: 'detach' }); return
-            }
-            if (input.alt && key === 'arrowleft' && state.navState.canGoBack) { event.preventDefault(); view.webContents.navigationHistory.goBack(); return }
-            if (input.alt && key === 'arrowright' && state.navState.canGoForward) { event.preventDefault(); view.webContents.navigationHistory.goForward(); return }
-            if ((mod && key === 'r') || key === 'f5') { event.preventDefault(); view.webContents.reload(); return }
-            if (mod && ['=', '+', '-', '_', '0'].includes(key)) event.preventDefault()
-            if (input.type === 'mouseWheel' && mod) event.preventDefault()
-          } catch {}
-        })
-
-        await S.reapply(state)
-        try { await view.webContents.loadURL(state.navState.currentUrl) } catch {}
-
-        return { ok: true as const, tabId }
-      } catch (err) {
-        if (state) { try { const w2 = getWindow(); if (w2 && !w2.isDestroyed()) S.detach(w2, state) } catch {}; views.delete(tabId) }
-        throw err ?? new Error('Create failed')
+      state = {
+        view, attached: false,
+        lastBounds: { x: 0, y: 0, w: 1, h: 1 },
+        lastAppliedZoom: 1,
+        navState: { currentUrl: payload?.url || 'https://google.com/', canGoBack: false, canGoForward: false, title: '' },
       }
-    })
+      views.set(tabId, state)
+
+      const safeReapply = () => { if (!state) return; void S.reapply(state); S.updateNav(state) }
+      view.webContents.on('dom-ready', safeReapply)
+      view.webContents.on('did-navigate', safeReapply)
+      view.webContents.on('did-navigate-in-page', safeReapply)
+      view.webContents.on('page-title-updated', () => { if (state) S.updateNav(state) })
+      view.webContents.on('render-process-gone', () => { try { const w = getWindow(); if (w && !w.isDestroyed() && state) S.detach(w, state) } catch {}; views.delete(tabId) })
+
+      view.webContents.on('before-input-event', (event, input: Input) => {
+        if (!state) return
+        try {
+          const mod = input.control || input.meta
+          const key = (input.key || '').toLowerCase()
+          if ((key === 'i' && mod && input.shift) || key === 'f12') {
+            event.preventDefault()
+            if (view.webContents.isDevToolsOpened()) view.webContents.closeDevTools()
+            else view.webContents.openDevTools({ mode: 'detach' }); return
+          }
+          if (input.alt && key === 'arrowleft' && state.navState.canGoBack) { event.preventDefault(); view.webContents.navigationHistory.goBack(); return }
+          if (input.alt && key === 'arrowright' && state.navState.canGoForward) { event.preventDefault(); view.webContents.navigationHistory.goForward(); return }
+          if ((mod && key === 'r') || key === 'f5') { event.preventDefault(); view.webContents.reload(); return }
+          if (mod && ['=', '+', '-', '_', '0'].includes(key)) event.preventDefault()
+          if (input.type === 'mouseWheel' && mod) event.preventDefault()
+        } catch {}
+      })
+
+      await S.reapply(state)
+      try { await view.webContents.loadURL(state.navState.currentUrl) } catch {}
+
+      // ✅ No cast needed — ok is a literal true, so TSuccess = { ok: true; tabId: string }
+      return { ok: true as const, tabId }
+    } catch (err) {
+      if (state) { try { const w2 = getWindow(); if (w2 && !w2.isDestroyed()) S.detach(w2, state) } catch {}; views.delete(tabId) }
+      // Let enqueue’s catch path turn this into { ok:false, error }
+      throw err ?? new Error('Create failed')
+    }
   })
+})
 
   ipcMain.handle('overlay:get-zoom', async (): Promise<number> => canvasZoom)
 
@@ -269,30 +250,15 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null) {
     try { S.safeDestroy(state) } finally { views.delete(tabId) }
   })
 
-  /**
-   * Capture the current tab into a PNG. If shapeId is provided, the PNG is also
-   * written to userData/thumbs/<shapeId>.png and filePath is returned.
-   */
-  ipcMain.handle('overlay:capture', async (_e, { tabId, shapeId }: { tabId: string; shapeId?: string }): Promise<CaptureUnifiedResponse> => {
+  ipcMain.handle('overlay:capture', async (_e, { tabId }: { tabId: string }): Promise<CaptureResponse> => {
     const { state } = S.resolve(tabId)
     if (!state) return { ok: false, error: 'No view' }
     try {
-      // Ensure no audio glitch during capture
-      try { state.view.webContents.setAudioMuted(true) } catch {}
-
       const image = await state.view.webContents.capturePage()
       const png = image.toPNG({ scaleFactor: 1 })
       const dataUrl = `data:image/png;base64,${Buffer.from(png).toString('base64')}`
-
-      if (shapeId) {
-        const filePath = thumbPath(shapeId)
-        try { await writeFileAtomic(filePath, png) } catch { /* fall back to dataUrl-only */ }
-        return { ok: true, dataUrl, filePath }
-      }
       return { ok: true, dataUrl }
-    } catch {
-      return { ok: false, error: 'Capture failed' }
-    }
+    } catch { return { ok: false, error: 'Capture failed' } }
   })
 
   ipcMain.handle('overlay:focus', async (_e, p?: { tabId?: string }): Promise<void> => {
@@ -343,61 +309,6 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null) {
       ok: true,
       ...state.navState,
       isLoading: (() => { try { return state.view.webContents.isLoading() } catch { return false } })(),
-    }
-  })
-
-  /**
-   * Cold-start thumbnail generator: muted, offscreen, no BrowserView usage.
-   * Returns a disk file when possible, falling back to dataUrl.
-   */
-  ipcMain.handle('overlay:get-or-create-thumbnail', async (_e, args: { shapeId: string; url: string; w?: number; h?: number }): Promise<GetOrCreateThumbResponse> => {
-    const out = thumbPath(args.shapeId)
-    try {
-      // If we already have a file, reuse it
-      if (fs.existsSync(out)) return { ok: true, filePath: out }
-
-      const w = Math.max(128, Math.min(1600, Math.floor(args.w ?? 1200)))
-      const h = Math.max(96, Math.min(1200, Math.floor(args.h ?? 800)))
-
-      const win = new BrowserWindow({
-        show: false,
-        width: w,
-        height: h,
-        webPreferences: {
-          offscreen: true,
-          backgroundThrottling: false,
-          contextIsolation: true,
-          nodeIntegration: false,
-        },
-      })
-
-      try {
-        // Never emit audio while we snapshot
-        win.webContents.setAudioMuted(true)
-        await win.loadURL(args.url.startsWith('http') ? args.url : `https://${args.url}`)
-
-        // Give the page a brief moment to paint its first frame
-        await new Promise((r) => setTimeout(r, 150))
-
-        const img = await win.webContents.capturePage()
-        const buf = img.toPNG()
-        await writeFileAtomic(out, buf)
-        return { ok: true, filePath: out }
-      } catch (e) {
-        // Fall back to returning a dataUrl so renderer can still show something
-        try {
-          const img = await win.webContents.capturePage()
-          const buf = img.toPNG()
-          const dataUrl = `data:image/png;base64,${Buffer.from(buf).toString('base64')}`
-          return { ok: true, dataUrl }
-        } catch {
-          return { ok: false, error: e instanceof Error ? e.message : 'Thumbnail failed' }
-        }
-      } finally {
-        try { win.destroy() } catch {}
-      }
-    } catch {
-      return { ok: false, error: 'Thumbnail failed' }
     }
   })
 }

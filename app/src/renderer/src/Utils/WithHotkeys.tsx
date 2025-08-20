@@ -1,7 +1,13 @@
 import { useEffect, useRef } from 'react'
-import { sessionStore } from './SessionStore'
+import type { BrowserShape } from './BrowserShapeUtil'
 
-export default function WithHotkeys({ BROWSER_W, BROWSER_H }: { BROWSER_W: number; BROWSER_H: number }) {
+export default function WithHotkeys({
+  BROWSER_W,
+  BROWSER_H,
+}: {
+  BROWSER_W: number
+  BROWSER_H: number
+}) {
   const cursorRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 })
   const lastTriggerAtRef = useRef(0)
 
@@ -43,17 +49,11 @@ export default function WithHotkeys({ BROWSER_W, BROWSER_H }: { BROWSER_W: numbe
       const x = pagePt.x - BROWSER_W / 2
       const y = pagePt.y - BROWSER_H / 2
 
-      const shape = editor.createShape({
+      editor.createShape<BrowserShape>({
         type: 'browser-shape',
-        x,
-        y,
+        x, y,
         props: { w: BROWSER_W, h: BROWSER_H, url: 'https://google.com', tabId: '' },
       })
-
-      sessionStore.ensure(shape.id, { url: 'https://google.com', w: BROWSER_W, h: BROWSER_H, x, y })
-      sessionStore.setRealization(shape.id, 'attached')
-      sessionStore.focus(shape.id)
-      sessionStore.save()
     }
 
     window.addEventListener('keydown', onKeyDown, opts)

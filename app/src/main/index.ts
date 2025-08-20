@@ -57,13 +57,13 @@ function createWindow(): void {
     webPreferences: {
       // IMPORTANT: points to the built preload (electron-vite outputs to out/preload/index.js)
       preload: join(__dirname, '../preload/index.js'),
-      devTools: true,          // 👈 disables devtools for the TLdraw window
+      devTools: false,          // 👈 disables devtools for the TLdraw window
       nodeIntegration: false,
       contextIsolation: true,
     },
     
   })
-  mainWindow.webContents.openDevTools({ mode: 'detach' })
+  //mainWindow.webContents.openDevTools({ mode: 'detach' })
 
 
 
