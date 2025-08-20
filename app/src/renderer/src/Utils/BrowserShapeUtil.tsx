@@ -16,11 +16,13 @@ export type BrowserShape = TLBaseShape<
   { w: number; h: number; url: string; tabId: string }
 >
 
-const DRAG_GUTTER = 8 // px: leave this much on L/R/B as an easy grab area
-
-// World-space minimum logical size (includes navbar and gutters)
+const DRAG_GUTTER = 8 // outside drag gutters
 const MIN_W = 1000
 const MIN_H = 525 + NAV_BAR_HEIGHT + DRAG_GUTTER * 2
+
+// Keep thresholds in sync with main hysteresis
+const SHOW_AT = 0.24
+const HIDE_AT = 0.26
 
 type Rect = { x: number; y: number; width: number; height: number }
 type NavState = { currentUrl: string; canGoBack: boolean; canGoForward: boolean; title: string }
@@ -32,7 +34,6 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
   override hideResizeHandles = () => false
 
   override getDefaultProps(): BrowserShape['props'] {
-    // default size includes navbar + gutters
     return { w: 1200, h: 600 + NAV_BAR_HEIGHT + DRAG_GUTTER * 2, url: 'https://google.com', tabId: '' }
   }
 
@@ -106,9 +107,8 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
           // Prime placement/zoom immediately
           await syncOverlayNow(id)
 
-          // Edge case: if we were already zoomed out (< 0.25),
-          // capture immediately so we have a screenshot to show at once.
-          if (editor.getZoomLevel() < 0.25) {
+          // If we start already zoomed out, capture once to avoid a pop
+          if (editor.getZoomLevel() < SHOW_AT) {
             try {
               const cap = await api.capture({ tabId: id })
               if (cap.ok && cap.dataUrl) setScreenshotUrl(cap.dataUrl)
@@ -143,7 +143,7 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
       return () => { cancelled = true; window.clearInterval(h) }
     }, [api])
 
-    // Bounds + zoom follow loop (canvas → overlay)
+    // Bounds + zoom follow loop (canvas → overlay), with failsafe to drop screenshot
     useEffect(() => {
       if (!api) return
 
@@ -178,12 +178,20 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
         if (!Number.isFinite(lastFactor) || Math.abs(factor - lastFactor) > 1e-3) {
           void api.setZoom({ tabId: id, factor })
           lastFactor = factor
+
+          // Failsafe: if the image is still up well above the hide band, pre-sync + drop it
+          if (screenshotUrl && factor > (HIDE_AT + 0.02)) {
+            void (async () => {
+              await syncOverlayNow(id)
+              setScreenshotUrl(null)
+            })()
+          }
         }
       }
 
       raf = requestAnimationFrame(loop)
       return () => cancelAnimationFrame(raf)
-    }, [api, editor])
+    }, [api, editor, screenshotUrl])
 
     // Imperceptible swap: keep screenshot visible until live view is reattached & synced
     useEffect(() => {
@@ -200,7 +208,7 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
           return
         }
 
-        // Leaving screenshot mode: pre-sync live view under the image, then drop it
+        // Leaving screenshot mode: pre-sync live view under the image, then drop it next frame
         try {
           await syncOverlayNow(id)
         } finally {
@@ -225,7 +233,7 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
       }
     }, [api])
 
-    // ---- Minimal fit toggle (kept simple) ---------------------------------
+    // ---- Minimal fit toggle ------------------------------------------------
     const [fitMode, setFitMode] = useState<boolean>(false)
     const onToggleFit = (): void => {
       const s = editor.getShape<BrowserShape>(shape.id)
@@ -234,7 +242,7 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
       setFitMode(!fitMode)
     }
 
-    // ---- Styles -----------------------------------------------------------
+    // ---- Styles ------------------------------------------------------------
     const contentStyle: React.CSSProperties = {
       position: 'absolute',
       top: NAV_BAR_HEIGHT,
@@ -246,7 +254,7 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
       background: 'transparent',
     }
 
-    // ---- Render -----------------------------------------------------------
+    // ---- Render ------------------------------------------------------------
     return (
       <HTMLContainer
         style={{
@@ -292,7 +300,7 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
 
           {/* Content box (live overlay proxy + screenshot) */}
           <div style={contentStyle}>
-            {/* Proxy element: its screen rect is used by main to place WebContentsView */}
+            {/* Proxy element: main uses this rect to place WebContentsView */}
             <div
               ref={hostRef}
               style={{
@@ -305,7 +313,7 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
               }}
             />
 
-            {/* Screenshot layer: fills the box exactly when active */}
+            {/* Screenshot layer */}
             {screenshotUrl && (
               <img
                 src={screenshotUrl}
