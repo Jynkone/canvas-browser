@@ -6,6 +6,8 @@ import { BrowserShapeUtil } from './Utils/BrowserShapeUtil'
 import type { BrowserShape } from './Utils/BrowserShapeUtil'
 import WithHotkeys from './Utils/WithHotkeys'
 import { useUiChromeManager } from './Utils/useUiChromeManager'
+import { sessionStore } from './state/sessionStore'
+
 
 const BROWSER_W = 1200
 const BROWSER_H = 660
@@ -51,25 +53,51 @@ export default function App() {
         assetUrls={assetUrls}
         hideUi={false}
         onMount={(editor) => {
-          window.__tldraw_editor = editor
-          editorRef.current = editor
+  window.__tldraw_editor = editor
+  editorRef.current = editor
 
-          const initial = {
-            type: 'browser-shape',
-            x: 100,
-            y: 100,
-            props: { w: BROWSER_W, h: BROWSER_H, url: 'https://google.com', tabId: '' },
-          } as const
+  // Initialize hot tabs from session store
+  const hotTabs = sessionStore.getAllTabs()
+    .filter(tab => tab.realization === 'attached')
+    .slice(0, 3)
 
-          editor.createShape(initial as unknown as BrowserShape) // TS generic constraint workaround
-          editor.focus()
+  if (hotTabs.length > 0) {
+  // Recreate hot tabs from previous session with their SAVED URLs
+  hotTabs.forEach(tab => {
+    const shape = {
+      type: 'browser-shape' as const,
+      x: tab.x,
+      y: tab.y,
+      props: { 
+        w: tab.w, 
+        h: tab.h, 
+        url: tab.url, // This is the saved URL from session
+        tabId: '' 
+      },
+    }
+    editor.createShape(shape as unknown as BrowserShape)
+  })
+} else {
+  // No existing hot tabs, create default
+  const initial = {
+    type: 'browser-shape',
+    x: 100,
+    y: 100,
+    props: { w: BROWSER_W, h: BROWSER_H, url: 'https://google.com', tabId: '' },
+  } as const
 
-          // Start at 60% canvas zoom
-          requestAnimationFrame(() => {
-            const cam = editor.getCamera()
-            editor.setCamera({ ...cam, z: 0.6 })
-          })
-        }}
+  editor.createShape(initial as unknown as BrowserShape)
+}
+
+  editor.focus()
+
+  // Start at 60% canvas zoom
+  requestAnimationFrame(() => {
+    const cam = editor.getCamera()
+    editor.setCamera({ ...cam, z: 0.6 })
+  })
+}}
+
       >
         <WithHotkeys BROWSER_W={BROWSER_W} BROWSER_H={BROWSER_H} />
       </Tldraw>

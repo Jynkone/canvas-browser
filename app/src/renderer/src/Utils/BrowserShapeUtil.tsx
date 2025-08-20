@@ -10,6 +10,7 @@ import {
   Box,
 } from 'tldraw'
 import { NavigationBar, NAV_BAR_HEIGHT } from '../components/NavigationBar'
+import { sessionStore, IDLE_EVICT_MS } from '../state/sessionStore'
 
 export type BrowserShape = TLBaseShape<
   'browser-shape',
@@ -41,6 +42,10 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
     const r = resizeBox(shape, info)
     const w = Math.max(MIN_W, r.props.w)
     const h = Math.max(MIN_H, r.props.h)
+    
+    // Update session store with new dimensions
+    sessionStore.setSizeAndPos(shape.id, r.x, r.y, w, h)
+    
     return { ...r, props: { ...r.props, w, h } }
   }
 
@@ -93,35 +98,165 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
       ])
     }
 
+    // Check if tab should be frozen
+    const session = sessionStore.get(shape.id)
+    const isFrozen = session?.realization === 'frozen'
+    const frozenScreenshot = session?.thumbDataUrl
+
+    // ---- Hot/Cold Tab Management -------------------------------------------
+    useEffect(() => {
+      if (!api) return
+      
+      const isNewTab = !sessionStore.get(shape.id)
+      
+      // Register this tab in session store
+      sessionStore.upsert(shape.id, {
+        shapeId: shape.id,
+        url: shape.props.url,
+        x: shape.x,
+        y: shape.y,
+        w: shape.props.w,
+        h: shape.props.h,
+        lastActivityAt: Date.now(),
+        lastFocusedAt: Date.now(),
+        realization: 'attached'
+      })
+
+      // NEW TABS: Always force to hot and evict coldest if needed
+      if (isNewTab) {
+        const allTabs = sessionStore.getAllTabs()
+        const hotTabs = allTabs.filter(t => t.realization === 'attached')
+        
+        // If we have 3+ hot tabs, make the oldest one cold
+        if (hotTabs.length >= 3) {
+          const oldest = hotTabs
+            .sort((a, b) => Math.max(a.lastActivityAt, a.lastFocusedAt) - Math.max(b.lastActivityAt, b.lastFocusedAt))
+            .shift()
+          
+          if (oldest && oldest.shapeId !== ensureShapePrefix(shape.id)) {
+            sessionStore.setRealization(oldest.shapeId, 'frozen')
+          }
+        }
+        
+        // Ensure this new tab is hot
+        sessionStore.setRealization(shape.id, 'attached')
+        sessionStore.trackActivity(shape.id)
+      }
+    }, [api, shape.id])
+
     // ---- Overlay lifecycle ------------------------------------------------
     useEffect(() => {
-      let cancelled = false
-      if (!api || tabIdRef.current) return
-      ;(async () => {
+  let cancelled = false
+  if (!api || tabIdRef.current || isFrozen) return
+  
+  ;(async () => {
+    try {
+      // IMPORTANT: Use saved URL from session store, not shape.props.url
+      const savedSession = sessionStore.get(shape.id)
+      const urlToLoad = savedSession?.url || shape.props.url
+      
+      const res = await api.createTab({ url: urlToLoad })
+      if (!res.ok || cancelled) return
+      const id = res.tabId
+      tabIdRef.current = id
+
+      // Prime placement/zoom immediately
+      await syncOverlayNow(id)
+
+      // If we start already zoomed out, capture once to avoid a pop
+      if (editor.getZoomLevel() < SHOW_AT) {
         try {
-          const res = await api.createTab({ url: shape.props.url })
-          if (!res.ok || cancelled) return
-          const id = res.tabId
-          tabIdRef.current = id
-
-          // Prime placement/zoom immediately
-          await syncOverlayNow(id)
-
-          // If we start already zoomed out, capture once to avoid a pop
-          if (editor.getZoomLevel() < SHOW_AT) {
-            try {
-              const cap = await api.capture({ tabId: id })
-              if (cap.ok && cap.dataUrl) setScreenshotUrl(cap.dataUrl)
-            } catch { /* ignore */ }
-          }
+          const cap = await api.capture({ tabId: id })
+          if (cap.ok && cap.dataUrl) setScreenshotUrl(cap.dataUrl)
         } catch { /* ignore */ }
-      })()
-      return () => { cancelled = true }
-    }, [api, editor, shape.props.url])
+      }
+    } catch { /* ignore */ }
+  })()
+  return () => { cancelled = true }
+}, [api, editor, shape.props.url, isFrozen])
+
+
+    // ---- Handle evictions when tabs become cold ---------------------------
+    useEffect(() => {
+      if (!api || !tabIdRef.current) return
+      
+      const checkEviction = () => {
+        const currentSession = sessionStore.get(shape.id)
+        if (currentSession?.realization === 'frozen' && tabIdRef.current) {
+          // This tab was marked for eviction, destroy the browser view
+          api.capture({ tabId: tabIdRef.current }).then(result => {
+            if (result.ok) {
+              sessionStore.setThumb(shape.id, { dataUrl: result.dataUrl })
+              setScreenshotUrl(result.dataUrl)
+            }
+            if (tabIdRef.current) {
+              api.destroy({ tabId: tabIdRef.current })
+              tabIdRef.current = null
+            }
+          }).catch(() => {
+            // Cleanup even if capture fails
+            if (tabIdRef.current) {
+              api.destroy({ tabId: tabIdRef.current })
+              tabIdRef.current = null
+            }
+          })
+        }
+      }
+      
+      // Check immediately and set up interval
+      checkEviction()
+      const interval = setInterval(checkEviction, 1000)
+      
+      return () => clearInterval(interval)
+    }, [api, shape.id])
+
+    // ---- Auto-eviction after 30min inactivity ----------------------------
+    useEffect(() => {
+      if (!api || !tabIdRef.current) return
+      
+      const evictTimer = setTimeout(() => {
+        const currentSession = sessionStore.get(shape.id)
+        if (currentSession && Date.now() - currentSession.lastActivityAt > IDLE_EVICT_MS && tabIdRef.current) {
+          // Capture final screenshot before eviction
+          api.capture({ tabId: tabIdRef.current }).then(result => {
+            if (result.ok) {
+              sessionStore.setThumb(shape.id, { dataUrl: result.dataUrl })
+            }
+            if (tabIdRef.current) {
+              api.destroy({ tabId: tabIdRef.current })
+              tabIdRef.current = null
+            }
+            sessionStore.setRealization(shape.id, 'frozen')
+          })
+        }
+      }, IDLE_EVICT_MS)
+      
+      return () => clearTimeout(evictTimer)
+    }, [api, shape.id])
+
+    // ---- Activity tracking ------------------------------------------------
+    useEffect(() => {
+      if (isFrozen) return
+
+      const trackActivity = () => {
+        sessionStore.trackActivity(shape.id, navState.currentUrl)
+        sessionStore.markHotN(3)
+      }
+      
+      const hostEl = hostRef.current
+      if (hostEl) {
+        hostEl.addEventListener('click', trackActivity)
+        hostEl.addEventListener('keydown', trackActivity)
+        return () => {
+          hostEl.removeEventListener('click', trackActivity)
+          hostEl.removeEventListener('keydown', trackActivity)
+        }
+      }
+    }, [shape.id, navState.currentUrl, isFrozen])
 
     // Navigation state polling
     useEffect(() => {
-      if (!api) return
+      if (!api || isFrozen) return
       let cancelled = false
       const tick = async () => {
         const id = tabIdRef.current
@@ -141,11 +276,17 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
       }
       const h = window.setInterval(tick, 500)
       return () => { cancelled = true; window.clearInterval(h) }
-    }, [api])
+    }, [api, isFrozen])
+useEffect(() => {
+  if (navState.currentUrl && navState.currentUrl !== 'about:blank') {
+    sessionStore.updateTabBatch(shape.id, { url: navState.currentUrl })
+  }
+}, [navState.currentUrl, shape.id])
+
 
     // Bounds + zoom follow loop (canvas → overlay), with failsafe to drop screenshot
     useEffect(() => {
-      if (!api) return
+      if (!api || isFrozen) return
 
       let raf = 0
       let shown = false
@@ -191,11 +332,11 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
 
       raf = requestAnimationFrame(loop)
       return () => cancelAnimationFrame(raf)
-    }, [api, editor, screenshotUrl])
+    }, [api, editor, screenshotUrl, isFrozen])
 
     // Imperceptible swap: keep screenshot visible until live view is reattached & synced
     useEffect(() => {
-      if (!api) return
+      if (!api || isFrozen) return
       let mounted = true
 
       const off = api.onScreenshotMode(async ({ tabId, screenshot }) => {
@@ -221,17 +362,51 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
       })
 
       return () => { mounted = false; off?.() }
-    }, [api, editor])
+    }, [api, editor, isFrozen])
 
     // Cleanup
     useEffect(() => {
       return () => {
         const id = tabIdRef.current
-        if (!api || !id) return
-        void api.destroy({ tabId: id })
-        setScreenshotUrl(null)
+        if (api && id) {
+          // Capture final state before cleanup
+          api.capture({ tabId: id }).then(result => {
+            if (result.ok) {
+              sessionStore.setThumb(shape.id, { dataUrl: result.dataUrl })
+            }
+            api.destroy({ tabId: id })
+            // Don't remove from sessionStore - keep for restoration
+          }).catch(() => {
+            // Cleanup even if capture fails
+            if (id) api.destroy({ tabId: id })
+          })
+        }
       }
-    }, [api])
+    }, [api, shape.id])
+
+    // ---- Frozen tab reactivation ------------------------------------------
+  
+  const reactivateTab = () => {
+  if (!api || !session) return
+  
+  // Use the saved URL from session, not the original shape URL
+  const urlToLoad = session.url
+  
+  api.createTab({ url: urlToLoad }).then(result => {
+    if (result.ok) {
+      tabIdRef.current = result.tabId
+      sessionStore.setRealization(shape.id, 'attached')
+      sessionStore.trackActivity(shape.id, urlToLoad) // Track with the loaded URL
+      sessionStore.markHotN(3)
+      setScreenshotUrl(null)
+    }
+  }).catch(error => {
+    console.warn('Failed to reactivate tab:', error)
+  })
+}
+
+
+
 
     // ---- Minimal fit toggle ------------------------------------------------
     const [fitMode, setFitMode] = useState<boolean>(false)
@@ -252,6 +427,11 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
       overflow: 'hidden',
       zIndex: 0,
       background: 'transparent',
+    }
+
+    // Helper function to ensure shape prefix
+    const ensureShapePrefix = (id: string): string => {
+      return id.startsWith('shape:') ? id : `shape:${id}`
     }
 
     // ---- Render ------------------------------------------------------------
@@ -280,19 +460,35 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
             isLoading={isLoading}
             onUrlChange={async (url) => {
               const id = tabIdRef.current
-              if (api && id) { setIsLoading(true); await api.navigate({ tabId: id, url }) }
+              if (api && id && !isFrozen) { 
+                setIsLoading(true) 
+                await api.navigate({ tabId: id, url })
+                sessionStore.trackActivity(shape.id, url)
+              }
             }}
             onBack={async () => {
               const id = tabIdRef.current
-              if (api && id && navState.canGoBack) { setIsLoading(true); await api.goBack({ tabId: id }) }
+              if (api && id && navState.canGoBack && !isFrozen) { 
+                setIsLoading(true) 
+                await api.goBack({ tabId: id })
+                sessionStore.trackActivity(shape.id)
+              }
             }}
             onForward={async () => {
               const id = tabIdRef.current
-              if (api && id && navState.canGoForward) { setIsLoading(true); await api.goForward({ tabId: id }) }
+              if (api && id && navState.canGoForward && !isFrozen) { 
+                setIsLoading(true) 
+                await api.goForward({ tabId: id })
+                sessionStore.trackActivity(shape.id)
+              }
             }}
             onReload={async () => {
               const id = tabIdRef.current
-              if (api && id) { setIsLoading(true); await api.reload({ tabId: id }) }
+              if (api && id && !isFrozen) { 
+                setIsLoading(true) 
+                await api.reload({ tabId: id })
+                sessionStore.trackActivity(shape.id)
+              }
             }}
             fitMode={fitMode}
             onToggleFit={onToggleFit}
@@ -300,35 +496,75 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
 
           {/* Content box (live overlay proxy + screenshot) */}
           <div style={contentStyle}>
-            {/* Proxy element: main uses this rect to place WebContentsView */}
-            <div
-              ref={hostRef}
-              style={{
-                position: 'absolute',
-                top: 0,
-                left: 0,
-                right: 0,
-                bottom: 0,
-                pointerEvents: 'none',
-              }}
-            />
+            {/* Frozen state overlay */}
+            {isFrozen && (
+              <div 
+                style={{
+                  position: 'absolute',
+                  top: 0, left: 0, right: 0, bottom: 0,
+                  zIndex: 10,
+                  cursor: 'pointer',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  backgroundColor: 'rgba(0,0,0,0.3)',
+                }}
+                onClick={reactivateTab}
+              >
+                <div style={{
+                  background: 'rgba(255,255,255,0.9)',
+                  padding: '8px 16px',
+                  borderRadius: '4px',
+                  fontSize: '14px',
+                  fontWeight: 'bold'
+                }}>
+                  INACTIVE/FROZEN - Click to activate
+                </div>
+              </div>
+            )}
 
-            {/* Screenshot layer */}
-            {screenshotUrl && (
+            {/* Frozen screenshot background */}
+            {isFrozen && frozenScreenshot && (
+              <img
+                src={frozenScreenshot}
+                alt="Frozen tab"
+                draggable={false}
+                style={{
+                  position: 'absolute',
+                  top: 0, left: 0, right: 0, bottom: 0,
+                  width: '100%', height: '100%',
+                  objectFit: 'fill',
+                  opacity: 0.7,
+                  pointerEvents: 'none',
+                  userSelect: 'none',
+                }}
+              />
+            )}
+
+            {/* Live overlay proxy (only if not frozen) */}
+            {!isFrozen && (
+              <div
+                ref={hostRef}
+                style={{
+                  position: 'absolute',
+                  top: 0, left: 0, right: 0, bottom: 0,
+                  pointerEvents: 'none',
+                }}
+              />
+            )}
+
+            {/* Regular screenshot layer (only if not frozen) */}
+            {!isFrozen && screenshotUrl && (
               <img
                 src={screenshotUrl}
                 alt=""
                 draggable={false}
                 style={{
                   position: 'absolute',
-                  top: 0,
-                  left: 0,
-                  right: 0,
-                  bottom: 0,
-                  width: '100%',
-                  height: '100%',
+                  top: 0, left: 0, right: 0, bottom: 0,
+                  width: '100%', height: '100%',
                   display: 'block',
-                  objectFit: 'fill', // change to 'contain' for letterboxing
+                  objectFit: 'fill',
                   pointerEvents: 'none',
                   userSelect: 'none',
                   transition: 'none',

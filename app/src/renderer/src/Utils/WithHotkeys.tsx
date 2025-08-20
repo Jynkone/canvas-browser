@@ -1,5 +1,6 @@
 import { useEffect, useRef } from 'react'
 import type { BrowserShape } from './BrowserShapeUtil'
+import { sessionStore } from '../state/sessionStore'
 
 export default function WithHotkeys({
   BROWSER_W,
@@ -50,10 +51,30 @@ export default function WithHotkeys({
       const y = pagePt.y - BROWSER_H / 2
 
       editor.createShape<BrowserShape>({
-        type: 'browser-shape',
-        x, y,
-        props: { w: BROWSER_W, h: BROWSER_H, url: 'https://google.com', tabId: '' },
-      })
+  type: 'browser-shape',
+  x, y,
+  props: { w: BROWSER_W, h: BROWSER_H, url: 'https://google.com', tabId: '' },
+})
+
+// Mark this new tab as hot immediately
+requestAnimationFrame(() => {
+  const newShapes = editor.getCurrentPageShapes().filter(s => s.type === 'browser-shape')
+  const newestShape = newShapes[newShapes.length - 1]
+  if (newestShape) {
+    sessionStore.upsert(newestShape.id, {
+      shapeId: newestShape.id,
+      url: 'https://google.com',
+      x, y,
+      w: BROWSER_W,
+      h: BROWSER_H,
+      lastActivityAt: Date.now(),
+      lastFocusedAt: Date.now(),
+      realization: 'attached'
+    })
+    sessionStore.markHotN(3)
+  }
+})
+
     }
 
     window.addEventListener('keydown', onKeyDown, opts)
