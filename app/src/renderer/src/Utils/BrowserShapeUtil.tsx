@@ -16,8 +16,11 @@ export type BrowserShape = TLBaseShape<
   { w: number; h: number; url: string; tabId: string }
 >
 
+const DRAG_GUTTER = 14 // px: leave this much on L/R/B as an easy grab area
+
+// World-space minimum logical size (includes navbar and gutters)
 const MIN_W = 1000
-const MIN_H = 525 + NAV_BAR_HEIGHT
+const MIN_H = 525 + NAV_BAR_HEIGHT + DRAG_GUTTER * 2
 
 type Rect = { x: number; y: number; width: number; height: number }
 type NavState = { currentUrl: string; canGoBack: boolean; canGoForward: boolean; title: string }
@@ -29,7 +32,8 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
   override hideResizeHandles = () => false
 
   override getDefaultProps(): BrowserShape['props'] {
-    return { w: 1200, h: 600 + NAV_BAR_HEIGHT, url: 'https://google.com', tabId: '' }
+    // default size includes navbar + gutters
+    return { w: 1200, h: 600 + NAV_BAR_HEIGHT + DRAG_GUTTER * 2, url: 'https://google.com', tabId: '' }
   }
 
   override onResize(shape: BrowserShape, info: TLResizeInfo<BrowserShape>) {
@@ -80,7 +84,7 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
       return () => { cancelled = true }
     }, [api, shape.props.url])
 
-    // poll navigation state (overlay emits updates but we don’t have events wired here)
+    // poll navigation state
     useEffect(() => {
       if (!api) return
       let cancelled = false
@@ -140,7 +144,7 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
           lastRect = rect
         }
 
-        // Push canvas zoom; overlay scales by its internal base (e.g. 0.8)
+        // Push canvas zoom; overlay scales by its internal base
         const factor = editor.getZoomLevel()
         if (!Number.isFinite(lastFactor) || Math.abs(factor - lastFactor) > 1e-3) {
           void api.setZoom({ tabId: id, factor })
@@ -281,6 +285,7 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
           cursor: 'default',
         }}
       >
+        {/* The whole shape is a flex column: navbar + content. */}
         <div
           style={{
             width: '100%',
@@ -312,11 +317,25 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
             fitMode={fitMode}
             onToggleFit={onToggleFit}
           />
-          {/* host for BrowserView: native input goes here, navbar remains interactive */}
+
+          {/* Drag gutters: the host is inset so L/R/B edges remain as easy grab areas */}
           <div
             ref={hostRef}
-            style={{ width: '100%', flex: 1, background: 'transparent', position: 'relative', pointerEvents: 'none' }}
+            style={{
+              position: 'absolute',
+              top: NAV_BAR_HEIGHT,             // below navbar
+              left: DRAG_GUTTER,
+              right: DRAG_GUTTER,
+              bottom: DRAG_GUTTER,
+              // This area is where the BrowserView lives; let the native view take input
+              pointerEvents: 'none',
+              background: 'transparent',
+            }}
           />
+
+          {/* Optional: visual hint for gutters when debugging
+          <div style={{ position: 'absolute', inset: 0, boxShadow: 'inset 0 0 0 1px rgba(0,0,0,.1)' }} />
+          */}
         </div>
       </HTMLContainer>
     )
