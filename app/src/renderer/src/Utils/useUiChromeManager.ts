@@ -49,6 +49,19 @@ function collectTargets(): Target[] {
 
   const topCandidates = pick(
     [
+            '.tlui-menu-zone',
+      '.tlui-buttons__horizontal',
+      
+      // Specific buttons from DOM
+      '[data-testid="main-menu.button"]',
+      '.tlui-helper-buttons',
+            '[data-testid="tlui-page-menu"]',
+      '.tlui-page-menu',
+      '[class*="tlui-toolbar-container tlui-buttons__horizontal"]',
+      '[class="tlui-button tlui-button__icon"]',
+
+
+      
       '[data-testid="tlui-top-zone"]',
       '.tlui-top-zone',
       '.tlui-toolbar',
@@ -56,12 +69,18 @@ function collectTargets(): Target[] {
       '.tlui-main-menu',
       '.tlui-actions-menu',
       '.tlui-quick-actions',
+      '[class="tlui-popover"]',
       '.tlui-top-bar',
       '.tlui-menu-bar',
       '[role="menubar"]',
       '[class*="tlui-top"]',
       '[class*="toolbar"]',
       '[class*="tlui-menu"]',
+
+      '[class*="tlui-menu"]',
+      '[class*="tlui-buttons__horizontal"]',
+      '[class*="toolbar"]',
+
 
     ].join(',')
   )

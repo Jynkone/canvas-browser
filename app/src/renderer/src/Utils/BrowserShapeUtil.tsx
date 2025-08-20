@@ -16,7 +16,7 @@ export type BrowserShape = TLBaseShape<
   { w: number; h: number; url: string; tabId: string }
 >
 
-const DRAG_GUTTER = 14 // px: leave this much on L/R/B as an easy grab area
+const DRAG_GUTTER = 8 // px: leave this much on L/R/B as an easy grab area
 
 // World-space minimum logical size (includes navbar and gutters)
 const MIN_W = 1000
@@ -318,7 +318,6 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
             onToggleFit={onToggleFit}
           />
 
-          {/* Drag gutters: the host is inset so L/R/B edges remain as easy grab areas */}
           <div
             ref={hostRef}
             style={{
@@ -327,15 +326,11 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
               left: DRAG_GUTTER,
               right: DRAG_GUTTER,
               bottom: DRAG_GUTTER,
-              // This area is where the BrowserView lives; let the native view take input
               pointerEvents: 'none',
               background: 'transparent',
             }}
           />
 
-          {/* Optional: visual hint for gutters when debugging
-          <div style={{ position: 'absolute', inset: 0, boxShadow: 'inset 0 0 0 1px rgba(0,0,0,.1)' }} />
-          */}
         </div>
       </HTMLContainer>
     )
