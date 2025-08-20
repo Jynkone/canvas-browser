@@ -66,30 +66,66 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
     })
     const [isLoading, setIsLoading] = useState<boolean>(false)
 
-    const [fitMode, setFitMode] = useState<boolean>(false)
-    const preFitCamRef = useRef<{ x: number; y: number; z: number } | null>(null)
-    const preFitSizeRef = useRef<{ w: number; h: number } | null>(null)
-    const fitStopRef = useRef<(() => void) | null>(null)
+    // When non-null, we render the static screenshot instead of live view
+    const [screenshotUrl, setScreenshotUrl] = useState<string | null>(null)
 
-    /* ── Overlay lifecycle ──────────────────────────────────────────────── */
+    // ---- helpers ----------------------------------------------------------
+    const getHostRect = (): Rect | null => {
+      const el = hostRef.current
+      if (!el) return null
+      const b = el.getBoundingClientRect()
+      return {
+        x: Math.floor(b.left),
+        y: Math.floor(b.top),
+        width: Math.ceil(b.width),
+        height: Math.ceil(b.height),
+      }
+    }
+
+    const syncOverlayNow = async (id: string): Promise<void> => {
+      const rect = getHostRect()
+      if (!api || !rect) return
+      await api.show({ tabId: id, rect })
+      await Promise.all([
+        api.setBounds({ tabId: id, rect }),
+        api.setZoom({ tabId: id, factor: editor.getZoomLevel() }),
+      ])
+    }
+
+    // ---- Overlay lifecycle ------------------------------------------------
     useEffect(() => {
       let cancelled = false
       if (!api || tabIdRef.current) return
       ;(async () => {
         try {
           const res = await api.createTab({ url: shape.props.url })
-          if (!cancelled && res.ok) tabIdRef.current = res.tabId
-        } catch { /* noop */ }
+          if (!res.ok || cancelled) return
+          const id = res.tabId
+          tabIdRef.current = id
+
+          // Prime placement/zoom immediately
+          await syncOverlayNow(id)
+
+          // Edge case: if we were already zoomed out (< 0.25),
+          // capture immediately so we have a screenshot to show at once.
+          if (editor.getZoomLevel() < 0.25) {
+            try {
+              const cap = await api.capture({ tabId: id })
+              if (cap.ok && cap.dataUrl) setScreenshotUrl(cap.dataUrl)
+            } catch { /* ignore */ }
+          }
+        } catch { /* ignore */ }
       })()
       return () => { cancelled = true }
-    }, [api, shape.props.url])
+    }, [api, editor, shape.props.url])
 
-    // poll navigation state
+    // Navigation state polling
     useEffect(() => {
       if (!api) return
       let cancelled = false
       const tick = async () => {
-        const id = tabIdRef.current; if (!id) return
+        const id = tabIdRef.current
+        if (!id) return
         try {
           const res = await api.getNavigationState({ tabId: id })
           if (!cancelled && res.ok) {
@@ -107,7 +143,7 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
       return () => { cancelled = true; window.clearInterval(h) }
     }, [api])
 
-    /* ── BrowserView follow & zoom mapping (canvas → overlay) ───────────── */
+    // Bounds + zoom follow loop (canvas → overlay)
     useEffect(() => {
       if (!api) return
 
@@ -119,16 +155,10 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
       const loop = () => {
         raf = requestAnimationFrame(loop)
 
-        const id = tabIdRef.current; if (!id) return
-        const el = hostRef.current; if (!el) return
-
-        const b = el.getBoundingClientRect()
-        const rect: Rect = {
-          x: Math.floor(b.left),
-          y: Math.floor(b.top),
-          width: Math.ceil(b.width),
-          height: Math.ceil(b.height),
-        }
+        const id = tabIdRef.current
+        if (!id) return
+        const rect = getHostRect()
+        if (!rect) return
 
         if (!shown) {
           shown = true
@@ -144,7 +174,6 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
           lastRect = rect
         }
 
-        // Push canvas zoom; overlay scales by its internal base
         const factor = editor.getZoomLevel()
         if (!Number.isFinite(lastFactor) || Math.abs(factor - lastFactor) > 1e-3) {
           void api.setZoom({ tabId: id, factor })
@@ -156,125 +185,68 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
       return () => cancelAnimationFrame(raf)
     }, [api, editor])
 
-    /* ── Fit mode (locks camera, preserves center & size) ───────────────── */
-    const getViewportPx = (): { vw: number; vh: number } => {
-      const vb = editor.getViewportScreenBounds()
-      return { vw: Math.max(1, Math.round(vb.width)), vh: Math.max(1, Math.round(vb.height)) }
-    }
+    // Imperceptible swap: keep screenshot visible until live view is reattached & synced
+    useEffect(() => {
+      if (!api) return
+      let mounted = true
 
-    const fitShapeToViewport = (s: BrowserShape, vw: number, vh: number): void => {
-      if (s.props.w === vw && s.props.h === vh) return
-      const cx = s.x + s.props.w / 2
-      const cy = s.y + s.props.h / 2
-      const x = Math.round(cx - vw / 2)
-      const y = Math.round(cy - vh / 2)
-      editor.updateShapes([{ id: s.id, type: 'browser-shape', x, y, props: { w: vw, h: vh } }])
-    }
+      const off = api.onScreenshotMode(async ({ tabId, screenshot }) => {
+        const id = tabIdRef.current
+        if (!mounted || !id || id !== tabId) return
 
-    const zoomToShapeNow = (s: BrowserShape): void => {
-      editor.zoomToBounds(new Box(s.x, s.y, s.props.w, s.props.h), { inset: 0 })
-    }
-
-    // Allow all events inside navbar; block TL camera elsewhere while in fit
-    function startInputGuards(): () => void {
-      const isInNav = (t: EventTarget | null): boolean =>
-        t instanceof Element && !!t.closest('[data-nav-root="1"]')
-
-      const onWheel = (e: WheelEvent) => { if (!isInNav(e.target)) { e.stopImmediatePropagation(); e.preventDefault() } }
-      const onPointer = (e: PointerEvent) => { if (!isInNav(e.target)) e.stopImmediatePropagation() }
-      const onKey = (e: KeyboardEvent) => {
-        const ae = document.activeElement as Element | null
-        if (isInNav(ae)) return
-        if (e.key === ' ' || e.key === '+' || e.key === '-' || e.key === '=' || e.key === '_') {
-          e.stopImmediatePropagation(); e.preventDefault()
+        // Entering screenshot mode
+        if (typeof screenshot === 'string') {
+          setScreenshotUrl(screenshot)
+          return
         }
-      }
 
-      window.addEventListener('wheel', onWheel, { capture: true, passive: false })
-      window.addEventListener('pointerdown', onPointer, { capture: true })
-      window.addEventListener('keydown', onKey, { capture: true })
-
-      return () => {
-        window.removeEventListener('wheel', onWheel, { capture: true } as AddEventListenerOptions)
-        window.removeEventListener('pointerdown', onPointer, { capture: true } as AddEventListenerOptions)
-        window.removeEventListener('keydown', onKey, { capture: true } as AddEventListenerOptions)
-      }
-    }
-
-    const runFitOnce = (): void => {
-      if (!preFitCamRef.current) preFitCamRef.current = editor.getCamera()
-      if (!preFitSizeRef.current) preFitSizeRef.current = { w: shape.props.w, h: shape.props.h }
-      const s0 = editor.getShape<BrowserShape>(shape.id); if (!s0) return
-      const { vw, vh } = getViewportPx()
-      fitShapeToViewport(s0, vw, vh)
-      const s1 = editor.getShape<BrowserShape>(shape.id); if (s1) zoomToShapeNow(s1)
-    }
-
-    const fitOn = (): void => {
-      runFitOnce()
-      let raf = 0
-      let last = { vw: -1, vh: -1, w: -1, h: -1 }
-      const step = () => {
-        raf = requestAnimationFrame(step)
-        const s = editor.getShape<BrowserShape>(shape.id); if (!s) return
-        const { vw, vh } = getViewportPx()
-        const vpChanged = vw !== last.vw || vh !== last.vh
-        const sizeChanged = s.props.w !== last.w || s.props.h !== last.h
-        if (vpChanged) fitShapeToViewport(s, vw, vh)
-        if (vpChanged || sizeChanged) {
-          const fresh = editor.getShape<BrowserShape>(shape.id)
-          if (fresh) {
-            zoomToShapeNow(fresh)
-            last = { vw, vh, w: fresh.props.w, h: fresh.props.h }
-          } else {
-            last = { vw, vh, w: s.props.w, h: s.props.h }
-          }
+        // Leaving screenshot mode: pre-sync live view under the image, then drop it
+        try {
+          await syncOverlayNow(id)
+        } finally {
+          requestAnimationFrame(() =>
+            requestAnimationFrame(() => {
+              if (mounted) setScreenshotUrl(null)
+            })
+          )
         }
-      }
-      raf = requestAnimationFrame(step)
+      })
 
-      const stopGuards = startInputGuards()
-      fitStopRef.current = () => { cancelAnimationFrame(raf); stopGuards() }
-      setFitMode(true)
-    }
+      return () => { mounted = false; off?.() }
+    }, [api, editor])
 
-    const fitOff = (): void => {
-      // stop guards / raf set during fitOn
-      fitStopRef.current?.()
-      fitStopRef.current = null
-
-      // restore shape size (preserve center)
-      const prev = preFitSizeRef.current
-      const s = editor.getShape<BrowserShape>(shape.id)
-      if (prev && s) {
-        const cx = s.x + s.props.w / 2
-        const cy = s.y + s.props.h / 2
-        const x = Math.round(cx - prev.w / 2)
-        const y = Math.round(cy - prev.h / 2)
-        editor.updateShapes([{ id: s.id, type: 'browser-shape', x, y, props: { ...s.props, w: prev.w, h: prev.h } }])
-      }
-
-      // reset camera zoom to 60% (keep previous center if saved)
-      const base = preFitCamRef.current ?? editor.getCamera()
-      editor.setCamera({ ...base, z: 0.6 })
-
-      preFitCamRef.current = null
-      preFitSizeRef.current = null
-      setFitMode(false)
-    }
-
-    const onToggleFit = (): void => { (fitMode ? fitOff : fitOn)() }
-
-    /* ── Cleanup overlay on unmount ─────────────────────────────────────── */
+    // Cleanup
     useEffect(() => {
       return () => {
         const id = tabIdRef.current
         if (!api || !id) return
         void api.destroy({ tabId: id })
+        setScreenshotUrl(null)
       }
     }, [api])
 
-    /* ── Render ─────────────────────────────────────────────────────────── */
+    // ---- Minimal fit toggle (kept simple) ---------------------------------
+    const [fitMode, setFitMode] = useState<boolean>(false)
+    const onToggleFit = (): void => {
+      const s = editor.getShape<BrowserShape>(shape.id)
+      if (!s) return
+      if (!fitMode) editor.zoomToBounds(new Box(s.x, s.y, s.props.w, s.props.h), { inset: 0 })
+      setFitMode(!fitMode)
+    }
+
+    // ---- Styles -----------------------------------------------------------
+    const contentStyle: React.CSSProperties = {
+      position: 'absolute',
+      top: NAV_BAR_HEIGHT,
+      left: DRAG_GUTTER,
+      right: DRAG_GUTTER,
+      bottom: DRAG_GUTTER,
+      overflow: 'hidden',
+      zIndex: 0,
+      background: 'transparent',
+    }
+
+    // ---- Render -----------------------------------------------------------
     return (
       <HTMLContainer
         style={{
@@ -285,7 +257,7 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
           cursor: 'default',
         }}
       >
-        {/* The whole shape is a flex column: navbar + content. */}
+        {/* Column: navbar + content */}
         <div
           style={{
             width: '100%',
@@ -318,19 +290,47 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
             onToggleFit={onToggleFit}
           />
 
-          <div
-            ref={hostRef}
-            style={{
-              position: 'absolute',
-              top: NAV_BAR_HEIGHT,             // below navbar
-              left: DRAG_GUTTER,
-              right: DRAG_GUTTER,
-              bottom: DRAG_GUTTER,
-              pointerEvents: 'none',
-              background: 'transparent',
-            }}
-          />
+          {/* Content box (live overlay proxy + screenshot) */}
+          <div style={contentStyle}>
+            {/* Proxy element: its screen rect is used by main to place WebContentsView */}
+            <div
+              ref={hostRef}
+              style={{
+                position: 'absolute',
+                top: 0,
+                left: 0,
+                right: 0,
+                bottom: 0,
+                pointerEvents: 'none',
+              }}
+            />
 
+            {/* Screenshot layer: fills the box exactly when active */}
+            {screenshotUrl && (
+              <img
+                src={screenshotUrl}
+                alt=""
+                draggable={false}
+                style={{
+                  position: 'absolute',
+                  top: 0,
+                  left: 0,
+                  right: 0,
+                  bottom: 0,
+                  width: '100%',
+                  height: '100%',
+                  display: 'block',
+                  objectFit: 'fill', // change to 'contain' for letterboxing
+                  pointerEvents: 'none',
+                  userSelect: 'none',
+                  transition: 'none',
+                  animation: 'none',
+                  backfaceVisibility: 'hidden',
+                  transform: 'translateZ(0)',
+                }}
+              />
+            )}
+          </div>
         </div>
       </HTMLContainer>
     )

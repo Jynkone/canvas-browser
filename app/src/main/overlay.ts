@@ -9,6 +9,8 @@ type ViewState = {
   attached: boolean
   lastBounds: { x: number; y: number; w: number; h: number }
   lastAppliedZoom?: number
+  screenshotCache?: string // Base64 data URL
+  isShowingScreenshot: boolean
   navState: {
     currentUrl: string
     canGoBack: boolean
@@ -28,6 +30,7 @@ const CHROME_MIN = 0.25
 const CHROME_MAX = 5
 const ZOOM_RATIO = 1
 const MAX_VIEWS = 32
+const SCREENSHOT_THRESHOLD = 0.27 // Capture slightly before switching
 const clamp = (n: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, n))
 
 let canvasZoom = 1
@@ -53,38 +56,83 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null) {
     },
     currentEff() { return clamp((canvasZoom || 1) * ZOOM_RATIO, 0.05, CHROME_MAX) },
     hasRealBounds(b?: { width: number; height: number } | null) { return !!b && b.width >= 2 && b.height >= 2 },
+    
     async clearEmuIfAny(view: WebContentsView) {
       try {
         const dbg: ElectronDebugger = view.webContents.debugger
         if (dbg.isAttached()) { await dbg.sendCommand('Emulation.clearDeviceMetricsOverride', {}); dbg.detach() }
       } catch {}
     },
-    async setEff(view: WebContentsView, eff: number) {
+
+    async captureScreenshot(state: ViewState): Promise<string | undefined> {
+  try {
+    const image = await state.view.webContents.capturePage()
+    const png = image.toPNG({ scaleFactor: 1 })
+    return `data:image/png;base64,${Buffer.from(png).toString('base64')}`
+  } catch {
+    return undefined
+  }
+},
+
+    async setEff(view: WebContentsView, eff: number, state: ViewState) {
+      const shouldShowScreenshot = eff < CHROME_MIN
+      const win = getWindow()
+
+      // If we need to show screenshot but don't have one, capture it first
+      if (shouldShowScreenshot && !state.screenshotCache) {
+        // Temporarily set to minimum zoom to capture a clean screenshot
+        try { await view.webContents.setZoomFactor(CHROME_MIN) } catch {}
+        await S.clearEmuIfAny(view)
+        state.screenshotCache = await S.captureScreenshot(state)
+      }
+
+      if (shouldShowScreenshot && state.screenshotCache) {
+        // Switch to screenshot mode
+        if (!state.isShowingScreenshot) {
+          S.detach(win!, state)
+          state.isShowingScreenshot = true
+          // Notify renderer about the screenshot
+          win?.webContents.send('overlay-screenshot-mode', {
+            tabId: Array.from(views.entries()).find(([, s]) => s === state)?.[0],
+            screenshot: state.screenshotCache,
+            bounds: state.lastBounds
+          })
+        }
+        return
+      }
+
+      // Normal zoom mode - ensure we're attached and not showing screenshot
+      if (state.isShowingScreenshot) {
+        state.isShowingScreenshot = false
+        S.attach(win!, state)
+        // Notify renderer to hide screenshot
+        win?.webContents.send('overlay-screenshot-mode', {
+          tabId: Array.from(views.entries()).find(([, s]) => s === state)?.[0],
+          screenshot: null
+        })
+      }
+
+      // Apply normal zoom
       if (eff >= CHROME_MIN) {
         try { await view.webContents.setZoomFactor(eff) } catch {}
         await S.clearEmuIfAny(view)
-        return
       }
-      try { await view.webContents.setZoomFactor(CHROME_MIN) } catch {}
-      let b: { width: number; height: number }
-      try { b = view.getBounds() } catch { return }
-      if (!S.hasRealBounds(b)) return
-      try {
-        const dbg: ElectronDebugger = view.webContents.debugger
-        if (!dbg.isAttached()) dbg.attach('1.3')
-        const scale = Math.max(0.05, Math.min(1, eff / CHROME_MIN))
-        const emuW = Math.max(1, Math.floor(b.width / scale))
-        const emuH = Math.max(1, Math.floor(b.height / scale))
-        await dbg.sendCommand('Emulation.setDeviceMetricsOverride', {
-          width: emuW, height: emuH, deviceScaleFactor: 0, scale,
-          mobile: false, screenWidth: emuW, screenHeight: emuH,
-          positionX: 0, positionY: 0, dontSetVisibleSize: false,
-        })
+    },
+
+    async reapply(state: ViewState) {
+      try { 
+        const eff = S.currentEff()
+        
+        // Pre-emptively capture screenshot when approaching threshold
+        if (eff <= SCREENSHOT_THRESHOLD && !state.screenshotCache && !state.isShowingScreenshot) {
+          state.screenshotCache = await S.captureScreenshot(state)
+        }
+        
+        await S.setEff(state.view, eff, state)
+        state.lastAppliedZoom = eff 
       } catch {}
     },
-    async reapply(state: ViewState) {
-      try { const eff = S.currentEff(); await S.setEff(state.view, eff); state.lastAppliedZoom = eff } catch {}
-    },
+
     updateNav(state: ViewState) {
       try {
         const wc = state.view.webContents
@@ -96,16 +144,28 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null) {
         }
       } catch {}
     },
+
     safeDestroy(state: ViewState) {
       try { void S.clearEmuIfAny(state.view) } catch {}
       try { state.view.webContents.stop() } catch {}
       try { state.view.webContents.setAudioMuted(true) } catch {}
       try {
         const win = getWindow()
-        if (win && !win.isDestroyed()) { win.contentView.removeChildView(state.view); state.attached = false }
+        if (win && !win.isDestroyed()) { 
+          win.contentView.removeChildView(state.view)
+          state.attached = false
+          // Clean up screenshot mode
+          if (state.isShowingScreenshot) {
+            win.webContents.send('overlay-screenshot-mode', {
+              tabId: Array.from(views.entries()).find(([, s]) => s === state)?.[0],
+              screenshot: null
+            })
+          }
+        }
       } catch {}
       try { (state.view.webContents as unknown as { destroy?: () => void }).destroy?.() } catch {}
     },
+
     roundRect(rect: Rect) {
       const x = Math.floor(rect.x), y = Math.floor(rect.y)
       const w = Math.ceil(rect.width), h = Math.ceil(rect.height)
@@ -133,68 +193,82 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null) {
     })
   }
 
-  // IPC
-
+  // IPC handlers
   ipcMain.handle('overlay:create-tab', async (_e, payload?: { url?: string }): Promise<CreateTabResponse> => {
-  const win = getWindow()
-  if (!win || win.isDestroyed()) return { ok: false, error: 'No window' }
-  if (views.size >= MAX_VIEWS) return { ok: false, error: `Too many tabs (${views.size})` }
+    const win = getWindow()
+    if (!win || win.isDestroyed()) return { ok: false, error: 'No window' }
+    if (views.size >= MAX_VIEWS) return { ok: false, error: `Too many tabs (${views.size})` }
 
-  return enqueue(async () => {
-    const tabId = randomUUID()
-    let state: ViewState | undefined
+    return enqueue(async () => {
+      const tabId = randomUUID()
+      let state: ViewState | undefined
 
-    try {
-      const view = new WebContentsView({
-        webPreferences: { devTools: true, contextIsolation: true, nodeIntegration: false, backgroundThrottling: false },
-      })
-      try { view.webContents.setZoomFactor(1); view.webContents.setVisualZoomLevelLimits(1, 1) } catch {}
+      try {
+        const view = new WebContentsView({
+          webPreferences: { devTools: true, contextIsolation: true, nodeIntegration: false, backgroundThrottling: false },
+        })
+        try { view.webContents.setZoomFactor(1); view.webContents.setVisualZoomLevelLimits(1, 1) } catch {}
 
-      state = {
-        view, attached: false,
-        lastBounds: { x: 0, y: 0, w: 1, h: 1 },
-        lastAppliedZoom: 1,
-        navState: { currentUrl: payload?.url || 'https://google.com/', canGoBack: false, canGoForward: false, title: '' },
-      }
-      views.set(tabId, state)
+        state = {
+          view, attached: false,
+          lastBounds: { x: 0, y: 0, w: 1, h: 1 },
+          lastAppliedZoom: 1,
+          screenshotCache: undefined,
+          isShowingScreenshot: false,
+          navState: { currentUrl: payload?.url || 'https://google.com/', canGoBack: false, canGoForward: false, title: '' },
+        }
+        views.set(tabId, state)
 
-      const safeReapply = () => { if (!state) return; void S.reapply(state); S.updateNav(state) }
-      view.webContents.on('dom-ready', safeReapply)
-      view.webContents.on('did-navigate', safeReapply)
-      view.webContents.on('did-navigate-in-page', safeReapply)
-      view.webContents.on('page-title-updated', () => { if (state) S.updateNav(state) })
-      view.webContents.on('render-process-gone', () => { try { const w = getWindow(); if (w && !w.isDestroyed() && state) S.detach(w, state) } catch {}; views.delete(tabId) })
-
-      view.webContents.on('before-input-event', (event, input: Input) => {
-        if (!state) return
-        try {
-          const mod = input.control || input.meta
-          const key = (input.key || '').toLowerCase()
-          if ((key === 'i' && mod && input.shift) || key === 'f12') {
-            event.preventDefault()
-            if (view.webContents.isDevToolsOpened()) view.webContents.closeDevTools()
-            else view.webContents.openDevTools({ mode: 'detach' }); return
+        const safeReapply = () => { if (!state) return; void S.reapply(state); S.updateNav(state) }
+        view.webContents.on('dom-ready', safeReapply)
+        view.webContents.on('did-navigate', () => {
+          if (state) {
+            // Clear screenshot cache on navigation
+            state.screenshotCache = undefined
+            safeReapply()
           }
-          if (input.alt && key === 'arrowleft' && state.navState.canGoBack) { event.preventDefault(); view.webContents.navigationHistory.goBack(); return }
-          if (input.alt && key === 'arrowright' && state.navState.canGoForward) { event.preventDefault(); view.webContents.navigationHistory.goForward(); return }
-          if ((mod && key === 'r') || key === 'f5') { event.preventDefault(); view.webContents.reload(); return }
-          if (mod && ['=', '+', '-', '_', '0'].includes(key)) event.preventDefault()
-          if (input.type === 'mouseWheel' && mod) event.preventDefault()
-        } catch {}
-      })
+        })
+        view.webContents.on('did-navigate-in-page', safeReapply)
+        view.webContents.on('page-title-updated', () => { if (state) S.updateNav(state) })
+        view.webContents.on('render-process-gone', () => { 
+          try { 
+            const w = getWindow()
+            if (w && !w.isDestroyed() && state) S.detach(w, state)
+          } catch {}
+          views.delete(tabId)
+        })
 
-      await S.reapply(state)
-      try { await view.webContents.loadURL(state.navState.currentUrl) } catch {}
+        view.webContents.on('before-input-event', (event, input: Input) => {
+          if (!state) return
+          try {
+            const mod = input.control || input.meta
+            const key = (input.key || '').toLowerCase()
+            if ((key === 'i' && mod && input.shift) || key === 'f12') {
+              event.preventDefault()
+              if (view.webContents.isDevToolsOpened()) view.webContents.closeDevTools()
+              else view.webContents.openDevTools({ mode: 'detach' }); return
+            }
+            if (input.alt && key === 'arrowleft' && state.navState.canGoBack) { event.preventDefault(); view.webContents.navigationHistory.goBack(); return }
+            if (input.alt && key === 'arrowright' && state.navState.canGoForward) { event.preventDefault(); view.webContents.navigationHistory.goForward(); return }
+            if ((mod && key === 'r') || key === 'f5') { event.preventDefault(); view.webContents.reload(); return }
+            if (mod && ['=', '+', '-', '_', '0'].includes(key)) event.preventDefault()
+            if (input.type === 'mouseWheel' && mod) event.preventDefault()
+          } catch {}
+        })
 
-      // ✅ No cast needed — ok is a literal true, so TSuccess = { ok: true; tabId: string }
-      return { ok: true as const, tabId }
-    } catch (err) {
-      if (state) { try { const w2 = getWindow(); if (w2 && !w2.isDestroyed()) S.detach(w2, state) } catch {}; views.delete(tabId) }
-      // Let enqueue’s catch path turn this into { ok:false, error }
-      throw err ?? new Error('Create failed')
-    }
+        await S.reapply(state)
+        try { await view.webContents.loadURL(state.navState.currentUrl) } catch {}
+
+        return { ok: true as const, tabId }
+      } catch (err) {
+        if (state) { 
+          try { const w2 = getWindow(); if (w2 && !w2.isDestroyed()) S.detach(w2, state) } catch {}
+          views.delete(tabId) 
+        }
+        throw err ?? new Error('Create failed')
+      }
+    })
   })
-})
 
   ipcMain.handle('overlay:get-zoom', async (): Promise<number> => canvasZoom)
 
@@ -204,8 +278,12 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null) {
     if (!win || !state) return
     const { x, y, w, h } = S.roundRect(rect)
     state.lastBounds = { x, y, w, h }
-    S.attach(win, state)
-    try { state.view.setBounds({ x, y, width: w, height: h }) } catch {}
+    
+    if (!state.isShowingScreenshot) {
+      S.attach(win, state)
+      try { state.view.setBounds({ x, y, width: w, height: h }) } catch {}
+    }
+    
     if (S.currentEff() < CHROME_MIN) await S.reapply(state)
   })
 
@@ -216,7 +294,11 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null) {
     const b = state.lastBounds
     if (!b || x !== b.x || y !== b.y || w !== b.w || h !== b.h) {
       state.lastBounds = { x, y, w, h }
-      try { state.view.setBounds({ x, y, width: w, height: h }) } catch {}
+      
+      if (!state.isShowingScreenshot) {
+        try { state.view.setBounds({ x, y, width: w, height: h }) } catch {}
+      }
+      
       if (S.currentEff() < CHROME_MIN) await S.reapply(state)
     }
   })
@@ -227,9 +309,13 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null) {
     if (tabId) {
       const { state } = S.resolve(tabId)
       if (!state) return
-      await S.setEff(state.view, target); state.lastAppliedZoom = target
+      await S.setEff(state.view, target, state)
+      state.lastAppliedZoom = target
     } else {
-      for (const [, s] of views) { await S.setEff(s.view, target); s.lastAppliedZoom = target }
+      for (const [, s] of views) { 
+        await S.setEff(s.view, target, s)
+        s.lastAppliedZoom = target 
+      }
     }
   })
 
@@ -238,9 +324,19 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null) {
     if (!win) return
     if (p?.tabId) {
       const { state } = S.resolve(p.tabId)
-      if (state) S.detach(win, state)
+      if (state) {
+        S.detach(win, state)
+        if (state.isShowingScreenshot) {
+          win.webContents.send('overlay-screenshot-mode', { tabId: p.tabId, screenshot: null })
+        }
+      }
     } else {
-      for (const [, s] of views) S.detach(win, s)
+      for (const [tabId, s] of views) {
+        S.detach(win, s)
+        if (s.isShowingScreenshot) {
+          win.webContents.send('overlay-screenshot-mode', { tabId, screenshot: null })
+        }
+      }
     }
   })
 
@@ -253,17 +349,24 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null) {
   ipcMain.handle('overlay:capture', async (_e, { tabId }: { tabId: string }): Promise<CaptureResponse> => {
     const { state } = S.resolve(tabId)
     if (!state) return { ok: false, error: 'No view' }
-    try {
-      const image = await state.view.webContents.capturePage()
-      const png = image.toPNG({ scaleFactor: 1 })
-      const dataUrl = `data:image/png;base64,${Buffer.from(png).toString('base64')}`
+    
+    if (state.isShowingScreenshot && state.screenshotCache) {
+      return { ok: true, dataUrl: state.screenshotCache }
+    }
+    
+    const dataUrl = await S.captureScreenshot(state)
+    if (dataUrl) {
       return { ok: true, dataUrl }
-    } catch { return { ok: false, error: 'Capture failed' } }
+    } else {
+      return { ok: false, error: 'Capture failed' }
+    }
   })
 
   ipcMain.handle('overlay:focus', async (_e, p?: { tabId?: string }): Promise<void> => {
     const { state } = S.resolve(p?.tabId ?? null)
-    if (state) try { state.view.webContents.focus() } catch {}
+    if (state && !state.isShowingScreenshot) {
+      try { state.view.webContents.focus() } catch {}
+    }
   })
 
   ipcMain.handle('overlay:blur', async (): Promise<void> => {
@@ -275,6 +378,8 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null) {
     const { state } = S.resolve(tabId)
     if (!state) return { ok: false, error: 'No view' }
     try {
+      // Clear screenshot cache on navigation
+      state.screenshotCache = undefined
       const u = url.trim()
       await state.view.webContents.loadURL(u.startsWith('http') ? u : `https://${u}`)
       return { ok: true }
@@ -284,21 +389,33 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null) {
   ipcMain.handle('overlay:go-back', async (_e, { tabId }: { tabId: string }): Promise<SimpleResponse> => {
     const { state } = S.resolve(tabId)
     if (!state || !state.navState.canGoBack) return { ok: false, error: 'Cannot go back' }
-    try { state.view.webContents.navigationHistory.goBack(); return { ok: true } }
+    try { 
+      state.screenshotCache = undefined // Clear cache on navigation
+      state.view.webContents.navigationHistory.goBack()
+      return { ok: true } 
+    }
     catch { return { ok: false, error: 'Back failed' } }
   })
 
   ipcMain.handle('overlay:go-forward', async (_e, { tabId }: { tabId: string }): Promise<SimpleResponse> => {
     const { state } = S.resolve(tabId)
     if (!state || !state.navState.canGoForward) return { ok: false, error: 'Cannot go forward' }
-    try { state.view.webContents.navigationHistory.goForward(); return { ok: true } }
+    try { 
+      state.screenshotCache = undefined // Clear cache on navigation
+      state.view.webContents.navigationHistory.goForward()
+      return { ok: true } 
+    }
     catch { return { ok: false, error: 'Forward failed' } }
   })
 
   ipcMain.handle('overlay:reload', async (_e, { tabId }: { tabId: string }): Promise<SimpleResponse> => {
     const { state } = S.resolve(tabId)
     if (!state) return { ok: false, error: 'No view' }
-    try { state.view.webContents.reload(); return { ok: true } }
+    try { 
+      state.screenshotCache = undefined // Clear cache on reload
+      state.view.webContents.reload()
+      return { ok: true } 
+    }
     catch { return { ok: false, error: 'Reload failed' } }
   })
 

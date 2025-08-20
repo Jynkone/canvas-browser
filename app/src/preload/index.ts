@@ -24,6 +24,15 @@ const overlay: OverlayAPI = {
   goForward: (payload) => ipcRenderer.invoke('overlay:go-forward', payload),
   reload: (payload) => ipcRenderer.invoke('overlay:reload', payload),
   getNavigationState: (payload) => ipcRenderer.invoke('overlay:get-navigation-state', payload),
+
+  // Screenshot mode listener
+  onScreenshotMode: (callback) => {
+    const handler = (_event: any, data: { tabId: string; screenshot: string | null; bounds?: any }) => {
+      callback(data)
+    }
+    ipcRenderer.on('overlay-screenshot-mode', handler)
+    return () => ipcRenderer.removeListener('overlay-screenshot-mode', handler)
+  }
 }
 
 contextBridge.exposeInMainWorld('overlay', overlay)

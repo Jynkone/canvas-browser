@@ -26,6 +26,13 @@ export type CaptureResult =
   | { ok: true; dataUrl: string }
   | { ok: false; error: string }
 
+// --- Screenshot mode data
+export interface ScreenshotModeData {
+  tabId: string
+  screenshot: string | null // Base64 data URL or null to disable
+  bounds?: { x: number; y: number; w: number; h: number }
+}
+
 // --- Payloads
 export interface CreateTabPayload {
   url?: string
@@ -73,4 +80,7 @@ export interface OverlayAPI {
   goForward(payload: TabIdPayload): Promise<SimpleResult>
   reload(payload: TabIdPayload): Promise<SimpleResult>
   getNavigationState(payload: TabIdPayload): Promise<NavigationStateResult>
+
+  // screenshot mode
+  onScreenshotMode(callback: (data: ScreenshotModeData) => void): () => void
 }
