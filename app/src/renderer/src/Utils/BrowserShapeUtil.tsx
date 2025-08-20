@@ -405,13 +405,116 @@ return () => {
 
 
     // ---- Minimal fit toggle ------------------------------------------------
-    const [fitMode, setFitMode] = useState<boolean>(false)
-    const onToggleFit = (): void => {
-      const s = editor.getShape<BrowserShape>(shape.id)
-      if (!s) return
-      if (!fitMode) editor.zoomToBounds(new Box(s.x, s.y, s.props.w, s.props.h), { inset: 0 })
-      setFitMode(!fitMode)
+const [fitMode, setFitMode] = useState<boolean>(false)
+const preFitCamRef = useRef<{ x: number; y: number; z: number } | null>(null)
+const preFitSizeRef = useRef<{ w: number; h: number } | null>(null)
+const fitStopRef = useRef<(() => void) | null>(null)
+
+const getViewportPx = (): { vw: number; vh: number } => {
+  const vb = editor.getViewportScreenBounds()
+  return { vw: Math.max(1, Math.round(vb.width)), vh: Math.max(1, Math.round(vb.height)) }
+}
+
+const fitShapeToViewport = (s: BrowserShape, vw: number, vh: number): void => {
+  if (s.props.w === vw && s.props.h === vh) return
+  const cx = s.x + s.props.w / 2
+  const cy = s.y + s.props.h / 2
+  const x = Math.round(cx - vw / 2)
+  const y = Math.round(cy - vh / 2)
+  editor.updateShapes([{ id: s.id, type: 'browser-shape', x, y, props: { w: vw, h: vh } }])
+}
+
+const zoomToShapeNow = (s: BrowserShape): void => {
+  editor.zoomToBounds(new Box(s.x, s.y, s.props.w, s.props.h), { inset: 0 })
+}
+
+function startInputGuards(): () => void {
+  const isInNav = (t: EventTarget | null): boolean =>
+    t instanceof Element && !!t.closest('[data-nav-root="1"]')
+
+  const onWheel = (e: WheelEvent) => { if (!isInNav(e.target)) { e.stopImmediatePropagation(); e.preventDefault() } }
+  const onPointer = (e: PointerEvent) => { if (!isInNav(e.target)) e.stopImmediatePropagation() }
+  const onKey = (e: KeyboardEvent) => {
+    const ae = document.activeElement as Element | null
+    if (isInNav(ae)) return
+    if (e.key === ' ' || e.key === '+' || e.key === '-' || e.key === '=' || e.key === '_') {
+      e.stopImmediatePropagation(); e.preventDefault()
     }
+  }
+
+  window.addEventListener('wheel', onWheel, { capture: true, passive: false })
+  window.addEventListener('pointerdown', onPointer, { capture: true })
+  window.addEventListener('keydown', onKey, { capture: true })
+
+  return () => {
+    window.removeEventListener('wheel', onWheel, { capture: true } as AddEventListenerOptions)
+    window.removeEventListener('pointerdown', onPointer, { capture: true } as AddEventListenerOptions)
+    window.removeEventListener('keydown', onKey, { capture: true } as AddEventListenerOptions)
+  }
+}
+const runFitOnce = (): void => {
+  if (!preFitCamRef.current) preFitCamRef.current = editor.getCamera()
+  if (!preFitSizeRef.current) preFitSizeRef.current = { w: shape.props.w, h: shape.props.h }
+  const s0 = editor.getShape<BrowserShape>(shape.id); if (!s0) return
+  const { vw, vh } = getViewportPx()
+  fitShapeToViewport(s0, vw, vh)
+  const s1 = editor.getShape<BrowserShape>(shape.id); if (s1) zoomToShapeNow(s1)
+}
+
+const fitOn = (): void => {
+  runFitOnce()
+  let raf = 0
+  let last = { vw: -1, vh: -1, w: -1, h: -1 }
+  const step = () => {
+    raf = requestAnimationFrame(step)
+    const s = editor.getShape<BrowserShape>(shape.id); if (!s) return
+    const { vw, vh } = getViewportPx()
+    const vpChanged = vw !== last.vw || vh !== last.vh
+    const sizeChanged = s.props.w !== last.w || s.props.h !== last.h
+    if (vpChanged) fitShapeToViewport(s, vw, vh)
+    if (vpChanged || sizeChanged) {
+      const fresh = editor.getShape<BrowserShape>(shape.id)
+      if (fresh) {
+        zoomToShapeNow(fresh)
+        last = { vw, vh, w: fresh.props.w, h: fresh.props.h }
+      } else {
+        last = { vw, vh, w: s.props.w, h: s.props.h }
+      }
+    }
+  }
+  raf = requestAnimationFrame(step)
+
+  const stopGuards = startInputGuards()
+  fitStopRef.current = () => { cancelAnimationFrame(raf); stopGuards() }
+  setFitMode(true)
+}
+
+const fitOff = (): void => {
+  // stop guards / raf set during fitOn
+  fitStopRef.current?.()
+  fitStopRef.current = null
+
+  // restore shape size (preserve center)
+  const prev = preFitSizeRef.current
+  const s = editor.getShape<BrowserShape>(shape.id)
+  if (prev && s) {
+    const cx = s.x + s.props.w / 2
+    const cy = s.y + s.props.h / 2
+    const x = Math.round(cx - prev.w / 2)
+    const y = Math.round(cy - prev.h / 2)
+    editor.updateShapes([{ id: s.id, type: 'browser-shape', x, y, props: { ...s.props, w: prev.w, h: prev.h } }])
+  }
+
+  // reset camera zoom to 60% (keep previous center if saved)
+  const base = preFitCamRef.current ?? editor.getCamera()
+  editor.setCamera({ ...base, z: 0.6 })
+
+  preFitCamRef.current = null
+  preFitSizeRef.current = null
+  setFitMode(false)
+}
+
+const onToggleFit = (): void => { (fitMode ? fitOff : fitOn)() }
 
     // ---- Styles ------------------------------------------------------------
     const contentStyle: React.CSSProperties = {
