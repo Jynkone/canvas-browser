@@ -62,16 +62,14 @@ requestAnimationFrame(() => {
   const newestShape = newShapes[newShapes.length - 1]
   if (newestShape) {
     sessionStore.upsert(newestShape.id, {
-      shapeId: newestShape.id,
-      url: 'https://google.com',
-      x, y,
-      w: BROWSER_W,
-      h: BROWSER_H,
-      lastActivityAt: Date.now(),
-      lastFocusedAt: Date.now(),
-      realization: 'attached'
-    })
-    sessionStore.markHotN(3)
+  shapeId: newestShape.id,
+  url: 'https://google.com',
+  lastActivityAt: Date.now(),
+  lastFocusedAt: Date.now(),
+  realization: 'attached'
+})
+
+    sessionStore.trackHotN(3)
   }
 })
 

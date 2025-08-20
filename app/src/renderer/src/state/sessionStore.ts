@@ -6,16 +6,13 @@ export type TabSession = {
   shapeId: string
   url: string
   title?: string
-  x: number
-  y: number
-  w: number
-  h: number
   lastFocusedAt: number
   lastActivityAt: number
   lastCapturedAt?: number
   realization: Realization
   thumbPath?: string
   thumbDataUrl?: string
+  isInHotRanking?: boolean // NEW: tracks if in top N without changing realization
 }
 
 export type SessionSnapshot = {
@@ -43,7 +40,6 @@ const notifyListeners = () => {
 
 // Validation helpers
 const isValidNumber = (n: any): n is number => typeof n === 'number' && Number.isFinite(n)
-const isValidPositiveNumber = (n: any): n is number => isValidNumber(n) && n > 0
 const isValidString = (s: any): s is string => typeof s === 'string'
 const isValidRealization = (r: any): r is Realization => r === 'attached' || r === 'frozen'
 
@@ -56,8 +52,6 @@ const isValidTabSession = (obj: any): obj is TabSession => (
   obj && typeof obj === 'object' &&
   isValidString(obj.shapeId) &&
   isValidString(obj.url) &&
-  isValidNumber(obj.x) && isValidNumber(obj.y) &&
-  isValidPositiveNumber(obj.w) && isValidPositiveNumber(obj.h) &&
   isValidNumber(obj.lastFocusedAt) && isValidNumber(obj.lastActivityAt) &&
   isValidRealization(obj.realization)
 )
@@ -142,21 +136,18 @@ function updateTab(shapeId: string, updates: Partial<TabSession>): TabSession {
   const existing = state.tabs[key]
   const now = Date.now()
   
-  // Create merged session with validation
+  // Create merged session with validation (NO position data)
   const merged: TabSession = {
     shapeId: key,
     url: isValidString(updates.url) ? updates.url : (existing?.url ?? 'about:blank'),
     title: updates.title !== undefined ? updates.title : existing?.title,
-    x: isValidNumber(updates.x) ? updates.x : (existing?.x ?? 0),
-    y: isValidNumber(updates.y) ? updates.y : (existing?.y ?? 0),
-    w: isValidPositiveNumber(updates.w) ? updates.w : (existing?.w ?? 1200),
-    h: isValidPositiveNumber(updates.h) ? updates.h : (existing?.h ?? 660),
     lastFocusedAt: isValidNumber(updates.lastFocusedAt) ? updates.lastFocusedAt : (existing?.lastFocusedAt ?? now),
     lastActivityAt: isValidNumber(updates.lastActivityAt) ? updates.lastActivityAt : (existing?.lastActivityAt ?? now),
     lastCapturedAt: updates.lastCapturedAt !== undefined ? updates.lastCapturedAt : existing?.lastCapturedAt,
     realization: isValidRealization(updates.realization) ? updates.realization : (existing?.realization ?? 'attached'),
     thumbPath: updates.thumbPath !== undefined ? updates.thumbPath : existing?.thumbPath,
     thumbDataUrl: updates.thumbDataUrl !== undefined ? updates.thumbDataUrl : existing?.thumbDataUrl,
+    isInHotRanking: updates.isInHotRanking !== undefined ? updates.isInHotRanking : existing?.isInHotRanking,
   }
   
   state.tabs[key] = merged
@@ -164,7 +155,7 @@ function updateTab(shapeId: string, updates: Partial<TabSession>): TabSession {
   return merged
 }
 
-// Public API - much simpler now
+// Public API - simplified without position tracking
 export const sessionStore = {
   // Read operations (no side effects)
   get: (shapeId: string): TabSession | undefined => {
@@ -179,6 +170,17 @@ export const sessionStore = {
   getTabCount: (): number => Object.keys(state.tabs).length,
   getCamera: (): CameraState => ({ ...state.camera }),
   load: (): SessionSnapshot => ({ ...state, tabs: { ...state.tabs } }),
+
+  // NEW: Get tabs in chronological order with hot/cold separation
+  getTabsChronological: (): { hot: TabSession[], cold: TabSession[] } => {
+    const all = Object.values(state.tabs)
+    all.sort((a, b) => Math.max(b.lastActivityAt, b.lastFocusedAt) - Math.max(a.lastActivityAt, a.lastFocusedAt))
+    
+    return {
+      hot: all.filter(t => t.realization === 'attached'),
+      cold: all.filter(t => t.realization === 'frozen')
+    }
+  },
 
   // Write operations (batched)
   upsert: (shapeId: string, updates: Partial<TabSession>): TabSession => 
@@ -208,12 +210,7 @@ export const sessionStore = {
   updateTabBatch: (shapeId: string, updates: Partial<TabSession>): TabSession => 
     updateTab(shapeId, updates),
 
-  // Convenience methods that use batching
-  setSizeAndPos: (shapeId: string, x: number, y: number, w: number, h: number): void => {
-    if (!isValidNumber(x) || !isValidNumber(y) || !isValidPositiveNumber(w) || !isValidPositiveNumber(h)) return
-    updateTab(shapeId, { x, y, w, h })
-  },
-
+  // Convenience methods that use batching (NO position methods)
   trackActivity: (shapeId: string, url?: string): void => {
     const updates: Partial<TabSession> = { lastActivityAt: Date.now() }
     if (url) updates.url = url
@@ -237,7 +234,29 @@ export const sessionStore = {
     })
   },
 
-  markHotN: (n: number): void => {
+  // NEW: Just tracks rankings, doesn't change realization (RUNTIME)
+  trackHotN: (n: number): void => {
+    if (!Number.isInteger(n) || n < 0) return
+    
+    const all = Object.values(state.tabs)
+    all.sort((a, b) => Math.max(b.lastActivityAt, b.lastFocusedAt) - Math.max(a.lastActivityAt, a.lastFocusedAt))
+    
+    // Just store the ranking, don't change realization
+    const hotIds = new Set(all.slice(0, n).map(t => t.shapeId))
+    
+    // Update ranking metadata without changing realization states
+    for (const tab of all) {
+      const existingTab = state.tabs[tab.shapeId]
+      if (existingTab) {
+        existingTab.isInHotRanking = hotIds.has(tab.shapeId)
+      }
+    }
+    
+    markDirty()
+  },
+
+  // NEW: Actually enforces realization states (STARTUP ONLY)
+  enforceHotN: (n: number): void => {
     if (!Number.isInteger(n) || n < 0) return
     
     const all = Object.values(state.tabs)
@@ -245,8 +264,13 @@ export const sessionStore = {
     
     const hot = new Set(all.slice(0, n).map(t => t.shapeId))
     
+    // Actually change realization states
     for (const tab of all) {
-      tab.realization = hot.has(tab.shapeId) ? 'attached' : 'frozen'
+      const existingTab = state.tabs[tab.shapeId]
+      if (existingTab) {
+        existingTab.realization = hot.has(tab.shapeId) ? 'attached' : 'frozen'
+        existingTab.isInHotRanking = hot.has(tab.shapeId)
+      }
     }
     
     markDirty()

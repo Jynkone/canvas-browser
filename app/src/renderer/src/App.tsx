@@ -51,51 +51,60 @@ export default function App() {
       <Tldraw
         shapeUtils={shapeUtils}
         assetUrls={assetUrls}
+        persistenceKey="my-app-canvas"
         hideUi={false}
-        onMount={(editor) => {
+onMount={(editor) => {
   window.__tldraw_editor = editor
   editorRef.current = editor
 
-  // Initialize hot tabs from session store
-  const hotTabs = sessionStore.getAllTabs()
-    .filter(tab => tab.realization === 'attached')
-    .slice(0, 3)
-
-  if (hotTabs.length > 0) {
-  // Recreate hot tabs from previous session with their SAVED URLs
-  hotTabs.forEach(tab => {
-    const shape = {
-      type: 'browser-shape' as const,
-      x: tab.x,
-      y: tab.y,
-      props: { 
-        w: tab.w, 
-        h: tab.h, 
-        url: tab.url, // This is the saved URL from session
-        tabId: '' 
-      },
-    }
-    editor.createShape(shape as unknown as BrowserShape)
-  })
-} else {
-  // No existing hot tabs, create default
-  const initial = {
-    type: 'browser-shape',
-    x: 100,
-    y: 100,
-    props: { w: BROWSER_W, h: BROWSER_H, url: 'https://google.com', tabId: '' },
-  } as const
-
-  editor.createShape(initial as unknown as BrowserShape)
-}
-
-  editor.focus()
-
-  // Start at 60% canvas zoom
+  // Wait for TLDraw persistence to restore shapes
   requestAnimationFrame(() => {
+    const existingBrowserShapes = editor.getCurrentPageShapes()
+      .filter(shape => shape.type === 'browser-shape')
+
+    if (existingBrowserShapes.length === 0) {
+      // No TLDraw shapes - check sessionStore for restoration
+      const allTabs = sessionStore.getAllTabs()
+      
+      if (allTabs.length > 0) {
+        // STARTUP ENFORCEMENT: Set realization states based on activity
+        sessionStore.enforceHotN(3)
+        
+        // Get updated hot/cold lists after enforcement
+        const { hot, cold } = sessionStore.getTabsChronological()
+        
+        // Create all tabs (hot + cold)
+        const allTabsToRestore = [...hot, ...cold]
+        allTabsToRestore.forEach((tab, index) => {
+          const shape = {
+            type: 'browser-shape' as const,
+            x: 100 + (index % 3) * 400, // Spread them out
+            y: 100 + Math.floor(index / 3) * 300,
+            props: { w: BROWSER_W, h: BROWSER_H, url: tab.url, tabId: '' },
+          }
+          editor.createShape(shape as unknown as BrowserShape)
+        })
+      } else {
+        // No existing tabs - create default
+        const initial = {
+          type: 'browser-shape',
+          x: 100,
+          y: 100,
+          props: { w: BROWSER_W, h: BROWSER_H, url: 'https://google.com', tabId: '' },
+        } as const
+        editor.createShape(initial as unknown as BrowserShape)
+      }
+    } else {
+      // TLDraw restored shapes - just enforce hot/cold states on existing sessionStore data
+      sessionStore.enforceHotN(3)
+    }
+    
+    // Set camera after shapes are settled
     const cam = editor.getCamera()
     editor.setCamera({ ...cam, z: 0.6 })
   })
+
+  editor.focus()
 }}
 
       >

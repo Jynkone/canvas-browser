@@ -43,8 +43,7 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
     const w = Math.max(MIN_W, r.props.w)
     const h = Math.max(MIN_H, r.props.h)
     
-    // Update session store with new dimensions
-    sessionStore.setSizeAndPos(shape.id, r.x, r.y, w, h)
+    // NO MORE sessionStore position sync - TLDraw handles this
     
     return { ...r, props: { ...r.props, w, h } }
   }
@@ -109,14 +108,10 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
       
       const isNewTab = !sessionStore.get(shape.id)
       
-      // Register this tab in session store
+      // Register this tab in session store (NO position data)
       sessionStore.upsert(shape.id, {
         shapeId: shape.id,
         url: shape.props.url,
-        x: shape.x,
-        y: shape.y,
-        w: shape.props.w,
-        h: shape.props.h,
         lastActivityAt: Date.now(),
         lastFocusedAt: Date.now(),
         realization: 'attached'
@@ -124,57 +119,60 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
 
       // NEW TABS: Always force to hot and evict coldest if needed
       if (isNewTab) {
-        const allTabs = sessionStore.getAllTabs()
-        const hotTabs = allTabs.filter(t => t.realization === 'attached')
-        
-        // If we have 3+ hot tabs, make the oldest one cold
-        if (hotTabs.length >= 3) {
-          const oldest = hotTabs
-            .sort((a, b) => Math.max(a.lastActivityAt, a.lastFocusedAt) - Math.max(b.lastActivityAt, b.lastFocusedAt))
-            .shift()
-          
-          if (oldest && oldest.shapeId !== ensureShapePrefix(shape.id)) {
-            sessionStore.setRealization(oldest.shapeId, 'frozen')
-          }
-        }
-        
-        // Ensure this new tab is hot
-        sessionStore.setRealization(shape.id, 'attached')
-        sessionStore.trackActivity(shape.id)
-      }
+  // Just ensure this new tab is registered as hot
+  sessionStore.setRealization(shape.id, 'attached')
+  sessionStore.trackActivity(shape.id)
+  
+  // Only track rankings, don't enforce (let 30-minute rule handle evictions)
+  sessionStore.trackHotN(3)
+}
+
     }, [api, shape.id])
 
     // ---- Overlay lifecycle ------------------------------------------------
     useEffect(() => {
-  let cancelled = false
-  if (!api || tabIdRef.current || isFrozen) return
-  
-  ;(async () => {
-    try {
-      // IMPORTANT: Use saved URL from session store, not shape.props.url
-      const savedSession = sessionStore.get(shape.id)
-      const urlToLoad = savedSession?.url || shape.props.url
+      let cancelled = false
+      if (!api || tabIdRef.current || isFrozen) return
       
-      const res = await api.createTab({ url: urlToLoad })
-      if (!res.ok || cancelled) return
-      const id = res.tabId
-      tabIdRef.current = id
-
-      // Prime placement/zoom immediately
-      await syncOverlayNow(id)
-
-      // If we start already zoomed out, capture once to avoid a pop
-      if (editor.getZoomLevel() < SHOW_AT) {
+      ;(async () => {
         try {
-          const cap = await api.capture({ tabId: id })
-          if (cap.ok && cap.dataUrl) setScreenshotUrl(cap.dataUrl)
-        } catch { /* ignore */ }
-      }
-    } catch { /* ignore */ }
-  })()
-  return () => { cancelled = true }
-}, [api, editor, shape.props.url, isFrozen])
+          // Use saved URL from session store, not shape.props.url
+          const savedSession = sessionStore.get(shape.id)
+          const urlToLoad = savedSession?.url || shape.props.url
+          
+          const res = await api.createTab({ url: urlToLoad })
+          if (!res.ok || cancelled) return
+          const id = res.tabId
+          tabIdRef.current = id
 
+          // Prime placement/zoom immediately
+// Prime placement/zoom immediately
+await syncOverlayNow(id)
+
+// Get initial navigation state
+try {
+  const navRes = await api.getNavigationState({ tabId: id })
+  if (navRes.ok) {
+    setNavState({
+      currentUrl: navRes.currentUrl ?? 'about:blank',
+      canGoBack: navRes.canGoBack ?? false,
+      canGoForward: navRes.canGoForward ?? false,
+      title: navRes.title ?? '',
+    })
+    setIsLoading(navRes.isLoading ?? false)
+  }
+} catch { /* ignore */ }
+
+// If we start already zoomed out, capture once to avoid a pop
+if (editor.getZoomLevel() < SHOW_AT) {
+  try {
+    const cap = await api.capture({ tabId: id })
+    if (cap.ok && cap.dataUrl) setScreenshotUrl(cap.dataUrl)
+  } catch { /* ignore */ }
+}        } catch { /* ignore */ }
+      })()
+      return () => { cancelled = true }
+    }, [api, editor, shape.props.url, isFrozen])
 
     // ---- Handle evictions when tabs become cold ---------------------------
     useEffect(() => {
@@ -240,7 +238,7 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
 
       const trackActivity = () => {
         sessionStore.trackActivity(shape.id, navState.currentUrl)
-        sessionStore.markHotN(3)
+        sessionStore.trackHotN(3) // CHANGED: trackHotN instead of markHotN
       }
       
       const hostEl = hostRef.current
@@ -253,36 +251,6 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
         }
       }
     }, [shape.id, navState.currentUrl, isFrozen])
-
-    // Navigation state polling
-    useEffect(() => {
-      if (!api || isFrozen) return
-      let cancelled = false
-      const tick = async () => {
-        const id = tabIdRef.current
-        if (!id) return
-        try {
-          const res = await api.getNavigationState({ tabId: id })
-          if (!cancelled && res.ok) {
-            setNavState({
-              currentUrl: res.currentUrl ?? 'about:blank',
-              canGoBack: res.canGoBack ?? false,
-              canGoForward: res.canGoForward ?? false,
-              title: res.title ?? '',
-            })
-            setIsLoading(res.isLoading ?? false)
-          }
-        } catch { /* noop */ }
-      }
-      const h = window.setInterval(tick, 500)
-      return () => { cancelled = true; window.clearInterval(h) }
-    }, [api, isFrozen])
-useEffect(() => {
-  if (navState.currentUrl && navState.currentUrl !== 'about:blank') {
-    sessionStore.updateTabBatch(shape.id, { url: navState.currentUrl })
-  }
-}, [navState.currentUrl, shape.id])
-
 
     // Bounds + zoom follow loop (canvas → overlay), with failsafe to drop screenshot
     useEffect(() => {
@@ -335,35 +303,66 @@ useEffect(() => {
     }, [api, editor, screenshotUrl, isFrozen])
 
     // Imperceptible swap: keep screenshot visible until live view is reattached & synced
-    useEffect(() => {
-      if (!api || isFrozen) return
-      let mounted = true
+// Event-driven URL tracking and screenshot mode
+useEffect(() => {
+  if (!api || isFrozen) return
+  let mounted = true
 
-      const off = api.onScreenshotMode(async ({ tabId, screenshot }) => {
-        const id = tabIdRef.current
-        if (!mounted || !id || id !== tabId) return
+  // Listen for URL updates from overlay
+  const handleUrlUpdate = (_event: any, data: { tabId: string; url?: string; screenshot?: string }) => {
+    const currentTabId = tabIdRef.current
+    if (!mounted || !currentTabId || data.tabId !== currentTabId) return
 
-        // Entering screenshot mode
-        if (typeof screenshot === 'string') {
-          setScreenshotUrl(screenshot)
-          return
-        }
+    // Update navigation state if URL provided
+    if (data.url) {
+      setNavState(prev => ({
+        ...prev,
+        currentUrl: data.url!
+      }))
+      // Save URL to sessionStore immediately
+      sessionStore.trackActivity(shape.id, data.url)
+    }
 
-        // Leaving screenshot mode: pre-sync live view under the image, then drop it next frame
-        try {
-          await syncOverlayNow(id)
-        } finally {
-          requestAnimationFrame(() =>
-            requestAnimationFrame(() => {
-              if (mounted) setScreenshotUrl(null)
-            })
-          )
-        }
-      })
+    // Save screenshot if provided
+    if (data.screenshot) {
+      sessionStore.setThumb(shape.id, { dataUrl: data.screenshot })
+    }
+  }
 
-      return () => { mounted = false; off?.() }
-    }, [api, editor, isFrozen])
+  // Listen for screenshot mode changes
+  const handleScreenshotMode = async (data: { tabId: string; screenshot: string | null; bounds?: any }) => {
+    const id = tabIdRef.current
+    if (!mounted || !id || id !== data.tabId) return
 
+    // Entering screenshot mode
+    if (typeof data.screenshot === 'string') {
+      setScreenshotUrl(data.screenshot)
+      return
+    }
+
+    // Leaving screenshot mode: pre-sync live view under the image, then drop it next frame
+    try {
+      await syncOverlayNow(id)
+    } finally {
+      requestAnimationFrame(() =>
+        requestAnimationFrame(() => {
+          if (mounted) setScreenshotUrl(null)
+        })
+      )
+    }
+  }
+
+  // Set up event listeners
+  const offUrlUpdate = api.onUrlUpdate(handleUrlUpdate)
+const offScreenshot = api.onScreenshotMode(handleScreenshotMode)
+
+return () => { 
+  mounted = false
+  offUrlUpdate?.()
+  offScreenshot?.()
+}
+
+}, [api, editor, isFrozen, shape.id])
     // Cleanup
     useEffect(() => {
       return () => {
@@ -385,8 +384,7 @@ useEffect(() => {
     }, [api, shape.id])
 
     // ---- Frozen tab reactivation ------------------------------------------
-  
-  const reactivateTab = () => {
+    const reactivateTab = (): void => {
   if (!api || !session) return
   
   // Use the saved URL from session, not the original shape URL
@@ -397,15 +395,13 @@ useEffect(() => {
       tabIdRef.current = result.tabId
       sessionStore.setRealization(shape.id, 'attached')
       sessionStore.trackActivity(shape.id, urlToLoad) // Track with the loaded URL
-      sessionStore.markHotN(3)
+      sessionStore.trackHotN(3) // CHANGED: trackHotN instead of markHotN
       setScreenshotUrl(null)
     }
   }).catch(error => {
     console.warn('Failed to reactivate tab:', error)
   })
 }
-
-
 
 
     // ---- Minimal fit toggle ------------------------------------------------
@@ -427,11 +423,6 @@ useEffect(() => {
       overflow: 'hidden',
       zIndex: 0,
       background: 'transparent',
-    }
-
-    // Helper function to ensure shape prefix
-    const ensureShapePrefix = (id: string): string => {
-      return id.startsWith('shape:') ? id : `shape:${id}`
     }
 
     // ---- Render ------------------------------------------------------------

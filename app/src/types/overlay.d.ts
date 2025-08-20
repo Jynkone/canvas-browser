@@ -73,6 +73,8 @@ export interface OverlayAPI {
   focus(payload?: Partial<TabIdPayload>): Promise<void>
   blur(): Promise<void>
   capture(payload: TabIdPayload): Promise<CaptureResult>
+  onUrlUpdate(callback: (data: { tabId: string; url?: string; screenshot?: string }) => void): () => void
+
 
   // navigation
   navigate(payload: NavigatePayload): Promise<SimpleResult>

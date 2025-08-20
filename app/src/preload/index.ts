@@ -32,7 +32,16 @@ const overlay: OverlayAPI = {
     }
     ipcRenderer.on('overlay-screenshot-mode', handler)
     return () => ipcRenderer.removeListener('overlay-screenshot-mode', handler)
+  },
+
+    onUrlUpdate: (callback) => {
+    const handler = (_event: any, data: { tabId: string; url?: string; screenshot?: string }) => {
+      callback(data)
+    }
+    ipcRenderer.on('overlay-url-updated', handler)
+    return () => ipcRenderer.removeListener('overlay-url-updated', handler)
   }
+
 }
 
 contextBridge.exposeInMainWorld('overlay', overlay)
