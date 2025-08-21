@@ -41,8 +41,39 @@ const WARM_RECAPTURE_DELAY_MS = 80
 const clamp = (n: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, n))
 
 let canvasZoom = 1
-let startupQueue: Array<{ shapeId: string; url: string; lastInteraction: number }> = []
 const STARTUP_DELAY_MS = 500
+let startupRestoreComplete = false
+let startupBrowserState: Record<string, { currentUrl: string; lastInteraction: number }> = {}
+let startupQueue: Array<{ shapeId: string; url: string; lastInteraction: number }> = []
+
+async function initializeStartupRestore(): Promise<void> {
+  if (startupRestoreComplete) return
+  
+  try {
+    const stateFile = join(process.cwd(), 'browser-state.json')
+    if (existsSync(stateFile)) {
+      console.log('[overlay] Reading startup state file once...')
+      const fileContent = readFileSync(stateFile, 'utf8')
+      startupBrowserState = JSON.parse(fileContent)
+      
+      // Build startup queue from saved state
+      startupQueue = Object.entries(startupBrowserState).map(([shapeId, data]) => ({
+        shapeId,
+        url: data.currentUrl,
+        lastInteraction: data.lastInteraction || 0
+      }))
+      
+      // Sort by last interaction (most recent first)
+      startupQueue.sort((a, b) => b.lastInteraction - a.lastInteraction)
+      console.log(`[overlay] Prepared startup queue for ${startupQueue.length} tabs`)
+    }
+  } catch (e) {
+    console.error('[overlay] Failed to read startup state:', e)
+  }
+  
+  startupRestoreComplete = true
+}
+
 
 async function delay(ms: number): Promise<void> {
   await new Promise<void>((r) => setTimeout(r, ms))
@@ -242,33 +273,37 @@ ipcMain.handle('overlay:create-tab', async (_e, payload?: { url?: string; shapeI
     if (!win || win.isDestroyed()) return { ok: false, error: 'No window' }
     if (views.size >= MAX_VIEWS) return { ok: false, error: `Too many tabs (${views.size})` }
 
+    // Initialize startup restore on first call
+    if (!startupRestoreComplete) {
+        await initializeStartupRestore()
+    }
+
     return enqueue(async () => {
         const tabId = payload?.shapeId!
         let savedUrl = payload?.url || 'https://google.com/'
-        
-        // Check for restored tab and queue it
         let delayMs = 0
-        try {
-            const stateFile = join(process.cwd(), 'browser-state.json')
-            if (existsSync(stateFile)) {
-                const browserState = JSON.parse(readFileSync(stateFile, 'utf8'))
-                if (browserState[tabId]) {
-                    savedUrl = browserState[tabId].currentUrl || savedUrl
-                    const lastInteraction = browserState[tabId].lastInteraction || 0
-                    
-                    if (!startupQueue.find(item => item.shapeId === tabId)) {
-                        startupQueue.push({ shapeId: tabId, url: savedUrl, lastInteraction })
-                        startupQueue.sort((a, b) => b.lastInteraction - a.lastInteraction)
-                    }
-                    
-                    const queueIndex = startupQueue.findIndex(item => item.shapeId === tabId)
-                    delayMs = queueIndex >= 0 ? queueIndex * STARTUP_DELAY_MS : 0
-                    if (queueIndex >= 0) startupQueue.splice(queueIndex, 1)
-                }
-            }
-        } catch {}
         
-        if (delayMs > 0) await new Promise(resolve => setTimeout(resolve, delayMs))
+        // Check if this is a startup restoration (only during startup)
+        const isStartupRestore = startupQueue.length > 0 && startupBrowserState[tabId]
+        
+        if (isStartupRestore) {
+            // Use saved URL from startup state
+            savedUrl = startupBrowserState[tabId].currentUrl || savedUrl
+            
+            // Find position in startup queue for delay calculation
+            const queueIndex = startupQueue.findIndex(item => item.shapeId === tabId)
+            if (queueIndex >= 0) {
+                delayMs = queueIndex * STARTUP_DELAY_MS
+                // Remove from queue so it won't be processed again
+                startupQueue.splice(queueIndex, 1)
+                console.log(`[overlay] Restoring tab ${tabId} with ${delayMs}ms delay (${startupQueue.length} remaining)`)
+            }
+        }
+        
+        // Apply startup delay if needed
+        if (delayMs > 0) {
+            await new Promise(resolve => setTimeout(resolve, delayMs))
+        }
         
         // Check if this tab already exists (restoration scenario)
         if (views.has(tabId)) {
@@ -284,9 +319,10 @@ ipcMain.handle('overlay:create-tab', async (_e, payload?: { url?: string; shapeI
                     devTools: true,
                     contextIsolation: true,
                     nodeIntegration: false,
-                    backgroundThrottling: false,
+                    backgroundThrottling: true,
                 },
             })
+            
             try {
                 view.webContents.setZoomFactor(1)
                 view.webContents.setVisualZoomLevelLimits(1, 1)
@@ -322,10 +358,9 @@ ipcMain.handle('overlay:create-tab', async (_e, payload?: { url?: string; shapeI
                     const currentUrl = view.webContents.getURL()
                     console.log(`[overlay] Tab ${tabId} navigated to:`, currentUrl)
                     
-                    // Save URL to simple JSON file
+                    // Save URL to simple JSON file (this continues to work as before)
                     try {
                         const stateFile = join(process.cwd(), 'browser-state.json')
-                        console.log('[overlay] Saving to:', stateFile)
                         let browserState = {}
                         if (existsSync(stateFile)) {
                             browserState = JSON.parse(readFileSync(stateFile, 'utf8'))
@@ -339,29 +374,27 @@ ipcMain.handle('overlay:create-tab', async (_e, payload?: { url?: string; shapeI
             })
 
             view.webContents.on('did-navigate-in-page', () => {
-    if (state) { 
-        state.screenshotCache = undefined
-        safeReapply()
-        
-        const currentUrl = view.webContents.getURL()
-        console.log(`[overlay] Tab ${tabId} navigated in-page to:`, currentUrl)
-        
-        // YOU NEED THIS SAVE LOGIC:
-        try {
-            const stateFile = join(process.cwd(), 'browser-state.json')
-            console.log('[overlay] Saving to:', stateFile)  // ← This should appear!
-            let browserState = {}
-            if (existsSync(stateFile)) {
-                browserState = JSON.parse(readFileSync(stateFile, 'utf8'))
-            }
-            browserState[tabId] = { currentUrl, lastInteraction: Date.now() }
-            writeFileSync(stateFile, JSON.stringify(browserState, null, 2))
-        } catch (e) {
-            console.error('[overlay] Failed to save browser state:', e)
-        }
-    }
-})
-
+                if (state) { 
+                    state.screenshotCache = undefined
+                    safeReapply()
+                    
+                    const currentUrl = view.webContents.getURL()
+                    console.log(`[overlay] Tab ${tabId} navigated in-page to:`, currentUrl)
+                    
+                    // Save URL to simple JSON file (this continues to work as before)
+                    try {
+                        const stateFile = join(process.cwd(), 'browser-state.json')
+                        let browserState = {}
+                        if (existsSync(stateFile)) {
+                            browserState = JSON.parse(readFileSync(stateFile, 'utf8'))
+                        }
+                        browserState[tabId] = { currentUrl, lastInteraction: Date.now() }
+                        writeFileSync(stateFile, JSON.stringify(browserState, null, 2))
+                    } catch (e) {
+                        console.error('[overlay] Failed to save browser state:', e)
+                    }
+                }
+            })
 
             view.webContents.on('page-title-updated', () => { if (state) S.updateNav(state) })
             view.webContents.on('render-process-gone', () => {
