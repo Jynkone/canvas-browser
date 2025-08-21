@@ -1,6 +1,7 @@
 import { BrowserWindow, WebContentsView, ipcMain } from 'electron'
 import type { Debugger as ElectronDebugger, Input } from 'electron'
-import { randomUUID } from 'crypto'
+import { writeFileSync, readFileSync, existsSync } from 'fs'
+import { join } from 'path'
 
 type Rect = { x: number; y: number; width: number; height: number }
 
@@ -40,6 +41,35 @@ const WARM_RECAPTURE_DELAY_MS = 80
 const clamp = (n: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, n))
 
 let canvasZoom = 1
+
+let startupQueue: Array<{ shapeId: string; url: string; lastInteraction: number }> = []
+let isProcessingStartup = false
+const STARTUP_DELAY_MS = 500
+
+async function processStartupQueue() {
+  if (isProcessingStartup || startupQueue.length === 0) return
+  isProcessingStartup = true
+  
+  startupQueue.sort((a, b) => b.lastInteraction - a.lastInteraction)
+  console.log('[overlay] Processing startup queue:', startupQueue.length, 'tabs')
+  
+  for (const item of startupQueue) {
+    try {
+      console.log(`[overlay] Creating queued tab ${item.shapeId}`)
+      await createTabDirectly(item.shapeId, item.url)
+      await new Promise(resolve => setTimeout(resolve, STARTUP_DELAY_MS))
+    } catch (e) {
+      console.error(`[overlay] Failed to create queued tab:`, e)
+    }
+  }
+  
+  startupQueue = []
+  isProcessingStartup = false
+}
+
+
+
+
 
 async function delay(ms: number): Promise<void> {
   await new Promise<void>((r) => setTimeout(r, ms))
@@ -234,14 +264,51 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null): void {
   }
 
   // -------------------- IPC handlers ---------------------------------------
-  ipcMain.handle('overlay:create-tab', async (_e, payload?: { url?: string }): Promise<CreateTabResponse> => {
+ipcMain.handle('overlay:create-tab', async (_e, payload?: { url?: string; shapeId?: string }): Promise<CreateTabResponse> => {
     const win = getWindow()
     if (!win || win.isDestroyed()) return { ok: false, error: 'No window' }
     if (views.size >= MAX_VIEWS) return { ok: false, error: `Too many tabs (${views.size})` }
 
     return enqueue(async () => {
-      const tabId = randomUUID()
-      let state: ViewState | undefined
+        const tabId = payload?.shapeId!
+        
+        // SMART DETECTION: Check if this is a restored shape
+        let isRestored = false
+        let savedUrl = payload?.url || 'https://google.com/'
+        
+        try {
+            const stateFile = join(process.cwd(), 'browser-state.json')
+            if (existsSync(stateFile)) {
+                const browserState = JSON.parse(readFileSync(stateFile, 'utf8'))
+                if (browserState[tabId]) {
+                    isRestored = true
+                    savedUrl = browserState[tabId].currentUrl
+                    const lastInteraction = browserState[tabId].lastInteraction || 0
+                    
+                    // Add to stagger queue instead of creating now
+                    startupQueue.push({ shapeId: tabId, url: savedUrl, lastInteraction })
+                    console.log(`[overlay] Queued restored tab ${tabId} for staggered loading`)
+                    
+                    // Start processing queue
+                    setTimeout(() => processStartupQueue(), 100)
+                    
+                    return { ok: true as const, tabId }
+                }
+            }
+        } catch (e) {
+            console.error('[overlay] Failed to check for restored shape:', e)
+        }
+        
+        // If we get here, it's a NEW shape - continue with normal creation
+        console.log(`[overlay] Creating new tab ${tabId} immediately`)
+        
+        // Check if this tab already exists (restoration scenario)
+        if (views.has(tabId)) {
+            console.log(`[overlay] Tab ${tabId} already exists, skipping creation`)
+            return { ok: true as const, tabId }
+        }
+        
+        let state: ViewState | undefined
 
       try {
         const view = new WebContentsView({
@@ -277,11 +344,31 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null): void {
         // refresh the image so it's not a "loading" frame.
         view.webContents.on('did-stop-loading', () => {
           if (state && state.isShowingScreenshot) void S.pushFreshScreenshot(tabId, state)
-        })
+  })
 
-        view.webContents.on('did-navigate', () => {
-          if (state) { state.screenshotCache = undefined; safeReapply() }
-        })
+view.webContents.on('did-navigate', () => {
+  if (state) { 
+    state.screenshotCache = undefined
+    safeReapply()
+    
+    const currentUrl = view.webContents.getURL()
+    console.log(`[overlay] Tab ${tabId} navigated to:`, currentUrl)
+    
+    // Save URL to simple JSON file
+    try {
+      const stateFile = join(process.cwd(), 'browser-state.json')
+      console.log('[overlay] Saving to:', stateFile)
+      let browserState = {}
+      if (existsSync(stateFile)) {
+        browserState = JSON.parse(readFileSync(stateFile, 'utf8'))
+      }
+      browserState[tabId] = { currentUrl, lastInteraction: Date.now() }
+      writeFileSync(stateFile, JSON.stringify(browserState, null, 2))
+    } catch (e) {
+      console.error('[overlay] Failed to save browser state:', e)
+    }
+  }
+})
         view.webContents.on('did-navigate-in-page', safeReapply)
         view.webContents.on('page-title-updated', () => { if (state) S.updateNav(state) })
         view.webContents.on('render-process-gone', () => {
@@ -395,10 +482,27 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null): void {
   })
 
   ipcMain.handle('overlay:destroy', async (_e, { tabId }: { tabId: string }): Promise<void> => {
-    const { state } = S.resolve(tabId)
-    if (!state) return
-    try { S.safeDestroy(state) } finally { views.delete(tabId) }
-  })
+  const { state } = S.resolve(tabId)
+  if (!state) return
+  try { 
+    S.safeDestroy(state) 
+    
+    // Clean up browser state file
+    try {
+      const stateFile = join(process.cwd(), 'browser-state.json')
+      if (existsSync(stateFile)) {
+        const browserState = JSON.parse(readFileSync(stateFile, 'utf8'))
+        delete browserState[tabId]
+        writeFileSync(stateFile, JSON.stringify(browserState, null, 2))
+        console.log(`[overlay] Cleaned up state for tab ${tabId}`)
+      }
+    } catch (e) {
+      console.error('[overlay] Failed to clean up browser state:', e)
+    }
+  } finally { 
+    views.delete(tabId) 
+  }
+})
 
   ipcMain.handle('overlay:capture', async (_e, { tabId }: { tabId: string }): Promise<CaptureResponse> => {
     const { state } = S.resolve(tabId)

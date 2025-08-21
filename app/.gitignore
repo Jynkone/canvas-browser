@@ -6,6 +6,7 @@ out/
 .DS_Store
 .eslintcache
 *.log*
+browser-state.json
 
 # --- TLDraw static assets we copied for Electron ---
 # (icons, fonts, translations, embed-icons)

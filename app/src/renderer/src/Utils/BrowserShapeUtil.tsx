@@ -99,7 +99,7 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
       if (!api || tabIdRef.current) return
       ;(async () => {
         try {
-          const res = await api.createTab({ url: shape.props.url })
+          const res = await api.createTab({ url: shape.props.url, shapeId: shape.id })
           if (!res.ok || cancelled) return
           const id = res.tabId
           tabIdRef.current = id
