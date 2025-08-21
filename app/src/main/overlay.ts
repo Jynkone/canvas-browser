@@ -41,35 +41,8 @@ const WARM_RECAPTURE_DELAY_MS = 80
 const clamp = (n: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, n))
 
 let canvasZoom = 1
-
 let startupQueue: Array<{ shapeId: string; url: string; lastInteraction: number }> = []
-let isProcessingStartup = false
 const STARTUP_DELAY_MS = 500
-
-async function processStartupQueue() {
-  if (isProcessingStartup || startupQueue.length === 0) return
-  isProcessingStartup = true
-  
-  startupQueue.sort((a, b) => b.lastInteraction - a.lastInteraction)
-  console.log('[overlay] Processing startup queue:', startupQueue.length, 'tabs')
-  
-  for (const item of startupQueue) {
-    try {
-      console.log(`[overlay] Creating queued tab ${item.shapeId}`)
-      await createTabDirectly(item.shapeId, item.url)
-      await new Promise(resolve => setTimeout(resolve, STARTUP_DELAY_MS))
-    } catch (e) {
-      console.error(`[overlay] Failed to create queued tab:`, e)
-    }
-  }
-  
-  startupQueue = []
-  isProcessingStartup = false
-}
-
-
-
-
 
 async function delay(ms: number): Promise<void> {
   await new Promise<void>((r) => setTimeout(r, ms))
@@ -271,36 +244,31 @@ ipcMain.handle('overlay:create-tab', async (_e, payload?: { url?: string; shapeI
 
     return enqueue(async () => {
         const tabId = payload?.shapeId!
-        
-        // SMART DETECTION: Check if this is a restored shape
-        let isRestored = false
         let savedUrl = payload?.url || 'https://google.com/'
         
+        // Check for restored tab and queue it
+        let delayMs = 0
         try {
             const stateFile = join(process.cwd(), 'browser-state.json')
             if (existsSync(stateFile)) {
                 const browserState = JSON.parse(readFileSync(stateFile, 'utf8'))
                 if (browserState[tabId]) {
-                    isRestored = true
-                    savedUrl = browserState[tabId].currentUrl
+                    savedUrl = browserState[tabId].currentUrl || savedUrl
                     const lastInteraction = browserState[tabId].lastInteraction || 0
                     
-                    // Add to stagger queue instead of creating now
-                    startupQueue.push({ shapeId: tabId, url: savedUrl, lastInteraction })
-                    console.log(`[overlay] Queued restored tab ${tabId} for staggered loading`)
+                    if (!startupQueue.find(item => item.shapeId === tabId)) {
+                        startupQueue.push({ shapeId: tabId, url: savedUrl, lastInteraction })
+                        startupQueue.sort((a, b) => b.lastInteraction - a.lastInteraction)
+                    }
                     
-                    // Start processing queue
-                    setTimeout(() => processStartupQueue(), 100)
-                    
-                    return { ok: true as const, tabId }
+                    const queueIndex = startupQueue.findIndex(item => item.shapeId === tabId)
+                    delayMs = queueIndex >= 0 ? queueIndex * STARTUP_DELAY_MS : 0
+                    if (queueIndex >= 0) startupQueue.splice(queueIndex, 1)
                 }
             }
-        } catch (e) {
-            console.error('[overlay] Failed to check for restored shape:', e)
-        }
+        } catch {}
         
-        // If we get here, it's a NEW shape - continue with normal creation
-        console.log(`[overlay] Creating new tab ${tabId} immediately`)
+        if (delayMs > 0) await new Promise(resolve => setTimeout(resolve, delayMs))
         
         // Check if this tab already exists (restoration scenario)
         if (views.has(tabId)) {
@@ -310,106 +278,131 @@ ipcMain.handle('overlay:create-tab', async (_e, payload?: { url?: string; shapeI
         
         let state: ViewState | undefined
 
-      try {
-        const view = new WebContentsView({
-          webPreferences: {
-            devTools: true,
-            contextIsolation: true,
-            nodeIntegration: false,
-            backgroundThrottling: false,
-          },
-        })
         try {
-          view.webContents.setZoomFactor(1)
-          view.webContents.setVisualZoomLevelLimits(1, 1)
-        } catch {}
+            const view = new WebContentsView({
+                webPreferences: {
+                    devTools: true,
+                    contextIsolation: true,
+                    nodeIntegration: false,
+                    backgroundThrottling: false,
+                },
+            })
+            try {
+                view.webContents.setZoomFactor(1)
+                view.webContents.setVisualZoomLevelLimits(1, 1)
+            } catch {}
 
-        state = {
-          view, attached: false,
-          lastBounds: { x: 0, y: 0, w: 1, h: 1 },
-          lastAppliedZoom: 1,
-          screenshotCache: undefined,
-          isShowingScreenshot: false,
-          navState: { currentUrl: payload?.url || 'https://google.com/', canGoBack: false, canGoForward: false, title: '' },
-        }
-        views.set(tabId, state)
-
-        const safeReapply = () => { if (!state) return; void S.reapply(state); S.updateNav(state) }
-        view.webContents.on('dom-ready', safeReapply)
-
-        // Invalidate cached screenshot on new load
-        view.webContents.on('did-start-loading', () => { if (state) state.screenshotCache = undefined })
-
-        // After the page truly finishes loading, if we're in screenshot mode,
-        // refresh the image so it's not a "loading" frame.
-        view.webContents.on('did-stop-loading', () => {
-          if (state && state.isShowingScreenshot) void S.pushFreshScreenshot(tabId, state)
-  })
-
-view.webContents.on('did-navigate', () => {
-  if (state) { 
-    state.screenshotCache = undefined
-    safeReapply()
-    
-    const currentUrl = view.webContents.getURL()
-    console.log(`[overlay] Tab ${tabId} navigated to:`, currentUrl)
-    
-    // Save URL to simple JSON file
-    try {
-      const stateFile = join(process.cwd(), 'browser-state.json')
-      console.log('[overlay] Saving to:', stateFile)
-      let browserState = {}
-      if (existsSync(stateFile)) {
-        browserState = JSON.parse(readFileSync(stateFile, 'utf8'))
-      }
-      browserState[tabId] = { currentUrl, lastInteraction: Date.now() }
-      writeFileSync(stateFile, JSON.stringify(browserState, null, 2))
-    } catch (e) {
-      console.error('[overlay] Failed to save browser state:', e)
-    }
-  }
-})
-        view.webContents.on('did-navigate-in-page', safeReapply)
-        view.webContents.on('page-title-updated', () => { if (state) S.updateNav(state) })
-        view.webContents.on('render-process-gone', () => {
-          try {
-            const w = getWindow()
-            if (w && !w.isDestroyed() && state) S.detach(w, state)
-          } catch {}
-          views.delete(tabId)
-        })
-
-        view.webContents.on('before-input-event', (event, input: Input) => {
-          if (!state) return
-          try {
-            const mod = input.control || input.meta
-            const key = (input.key || '').toLowerCase()
-            if ((key === 'i' && mod && input.shift) || key === 'f12') {
-              event.preventDefault()
-              if (view.webContents.isDevToolsOpened()) view.webContents.closeDevTools()
-              else view.webContents.openDevTools({ mode: 'detach' }); return
+            state = {
+                view, attached: false,
+                lastBounds: { x: 0, y: 0, w: 1, h: 1 },
+                lastAppliedZoom: 1,
+                screenshotCache: undefined,
+                isShowingScreenshot: false,
+                navState: { currentUrl: savedUrl, canGoBack: false, canGoForward: false, title: '' },
             }
-            if (input.alt && key === 'arrowleft' && state.navState.canGoBack) { event.preventDefault(); view.webContents.navigationHistory.canGoBack(); return }
-            if (input.alt && key === 'arrowright' && state.navState.canGoForward) { event.preventDefault(); view.webContents.navigationHistory.canGoForward(); return }
-            if ((mod && key === 'r') || key === 'f5') { event.preventDefault(); view.webContents.reload(); return }
-            if (mod && ['=', '+', '-', '_', '0'].includes(key)) event.preventDefault()
-            if (input.type === 'mouseWheel' && mod) event.preventDefault()
-          } catch {}
-        })
+            views.set(tabId, state)
 
-        await S.reapply(state)
-        try { await view.webContents.loadURL(state.navState.currentUrl) } catch {}
+            const safeReapply = () => { if (!state) return; void S.reapply(state); S.updateNav(state) }
+            view.webContents.on('dom-ready', safeReapply)
 
-        return { ok: true as const, tabId }
-      } catch (err) {
-        if (state) {
-          try { const w2 = getWindow(); if (w2 && !w2.isDestroyed()) S.detach(w2, state) } catch {}
-          views.delete(tabId)
+            // Invalidate cached screenshot on new load
+            view.webContents.on('did-start-loading', () => { if (state) state.screenshotCache = undefined })
+
+            // After the page truly finishes loading, if we're in screenshot mode,
+            // refresh the image so it's not a "loading" frame.
+            view.webContents.on('did-stop-loading', () => {
+                if (state && state.isShowingScreenshot) void S.pushFreshScreenshot(tabId, state)
+            })
+
+            view.webContents.on('did-navigate', () => {
+                if (state) { 
+                    state.screenshotCache = undefined
+                    safeReapply()
+                    
+                    const currentUrl = view.webContents.getURL()
+                    console.log(`[overlay] Tab ${tabId} navigated to:`, currentUrl)
+                    
+                    // Save URL to simple JSON file
+                    try {
+                        const stateFile = join(process.cwd(), 'browser-state.json')
+                        console.log('[overlay] Saving to:', stateFile)
+                        let browserState = {}
+                        if (existsSync(stateFile)) {
+                            browserState = JSON.parse(readFileSync(stateFile, 'utf8'))
+                        }
+                        browserState[tabId] = { currentUrl, lastInteraction: Date.now() }
+                        writeFileSync(stateFile, JSON.stringify(browserState, null, 2))
+                    } catch (e) {
+                        console.error('[overlay] Failed to save browser state:', e)
+                    }
+                }
+            })
+
+            view.webContents.on('did-navigate-in-page', () => {
+    if (state) { 
+        state.screenshotCache = undefined
+        safeReapply()
+        
+        const currentUrl = view.webContents.getURL()
+        console.log(`[overlay] Tab ${tabId} navigated in-page to:`, currentUrl)
+        
+        // YOU NEED THIS SAVE LOGIC:
+        try {
+            const stateFile = join(process.cwd(), 'browser-state.json')
+            console.log('[overlay] Saving to:', stateFile)  // ← This should appear!
+            let browserState = {}
+            if (existsSync(stateFile)) {
+                browserState = JSON.parse(readFileSync(stateFile, 'utf8'))
+            }
+            browserState[tabId] = { currentUrl, lastInteraction: Date.now() }
+            writeFileSync(stateFile, JSON.stringify(browserState, null, 2))
+        } catch (e) {
+            console.error('[overlay] Failed to save browser state:', e)
         }
-        throw err ?? new Error('Create failed')
-      }
+    }
+})
+
+
+            view.webContents.on('page-title-updated', () => { if (state) S.updateNav(state) })
+            view.webContents.on('render-process-gone', () => {
+                try {
+                    const w = getWindow()
+                    if (w && !w.isDestroyed() && state) S.detach(w, state)
+                } catch {}
+                views.delete(tabId)
+            })
+
+            view.webContents.on('before-input-event', (event, input: Input) => {
+                if (!state) return
+                try {
+                    const mod = input.control || input.meta
+                    const key = (input.key || '').toLowerCase()
+                    if ((key === 'i' && mod && input.shift) || key === 'f12') {
+                        event.preventDefault()
+                        if (view.webContents.isDevToolsOpened()) view.webContents.closeDevTools()
+                        else view.webContents.openDevTools({ mode: 'detach' }); return
+                    }
+                    if (input.alt && key === 'arrowleft' && state.navState.canGoBack) { event.preventDefault(); view.webContents.navigationHistory.goBack(); return }
+                    if (input.alt && key === 'arrowright' && state.navState.canGoForward) { event.preventDefault(); view.webContents.navigationHistory.goForward(); return }
+                    if ((mod && key === 'r') || key === 'f5') { event.preventDefault(); view.webContents.reload(); return }
+                    if (mod && ['=', '+', '-', '_', '0'].includes(key)) event.preventDefault()
+                    if (input.type === 'mouseWheel' && mod) event.preventDefault()
+                } catch {}
+            })
+
+            await S.reapply(state)
+            try { await view.webContents.loadURL(savedUrl) } catch {}
+
+            return { ok: true as const, tabId }
+        } catch (err) {
+            if (state) {
+                try { const w2 = getWindow(); if (w2 && !w2.isDestroyed()) S.detach(w2, state) } catch {}
+                views.delete(tabId)
+            }
+            throw err ?? new Error('Create failed')
+        }
     })
-  })
+})
 
   ipcMain.handle('overlay:get-zoom', async (): Promise<number> => canvasZoom)
 

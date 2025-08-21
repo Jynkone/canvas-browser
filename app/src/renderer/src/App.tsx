@@ -50,26 +50,38 @@ export default function App() {
         shapeUtils={shapeUtils}
         assetUrls={assetUrls}
         hideUi={false}
+        persistenceKey="paper-canvas"
         onMount={(editor) => {
-          window.__tldraw_editor = editor
-          editorRef.current = editor
+  window.__tldraw_editor = editor
+  editorRef.current = editor
 
-          const initial = {
-            type: 'browser-shape',
-            x: 100,
-            y: 100,
-            props: { w: BROWSER_W, h: BROWSER_H, url: 'https://google.com', tabId: '' },
-          } as const
+  // Only create initial tab if no browser shapes exist (fresh start)
+  const existingBrowserShapes = editor.getCurrentPageShapes().filter(
+    shape => shape.type === 'browser-shape'
+  )
 
-          editor.createShape(initial as unknown as BrowserShape) // TS generic constraint workaround
-          editor.focus()
+  if (existingBrowserShapes.length === 0) {
+    // Fresh start - create initial tab
+    const initial = {
+      type: 'browser-shape',
+      x: 100,
+      y: 100,
+      props: { w: BROWSER_W, h: BROWSER_H, url: 'https://google.com', tabId: '' },
+    } as const
 
-          // Start at 60% canvas zoom
-          requestAnimationFrame(() => {
-            const cam = editor.getCamera()
-            editor.setCamera({ ...cam, z: 0.6 })
-          })
-        }}
+    editor.createShape(initial as unknown as BrowserShape)
+  } else {
+    console.log(`[App] Restored ${existingBrowserShapes.length} browser shapes, skipping initial tab`)
+  }
+
+  editor.focus()
+
+  // Start at 60% canvas zoom
+  requestAnimationFrame(() => {
+    const cam = editor.getCamera()
+    editor.setCamera({ ...cam, z: 0.6 })
+  })
+}}
       >
         <WithHotkeys BROWSER_W={BROWSER_W} BROWSER_H={BROWSER_H} />
       </Tldraw>

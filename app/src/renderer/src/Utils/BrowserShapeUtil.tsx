@@ -143,6 +143,8 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
       return () => { cancelled = true; window.clearInterval(h) }
     }, [api])
 
+    
+
     // Bounds + zoom follow loop (canvas → overlay), with failsafe to drop screenshot
     useEffect(() => {
       if (!api) return
