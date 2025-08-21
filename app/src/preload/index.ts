@@ -14,7 +14,6 @@ const overlay: OverlayAPI = {
   destroy: (payload) => ipcRenderer.invoke('overlay:destroy', payload),
   setBounds: (payload) => ipcRenderer.invoke('overlay:set-bounds', payload),
   setZoom: (payload) => ipcRenderer.invoke('overlay:set-zoom', payload),
-  capture: (payload) => ipcRenderer.invoke('overlay:capture', payload),
   focus: (payload) => ipcRenderer.invoke('overlay:focus', payload),
   blur: () => ipcRenderer.invoke('overlay:blur'),
   
@@ -25,17 +24,9 @@ const overlay: OverlayAPI = {
   reload: (payload) => ipcRenderer.invoke('overlay:reload', payload),
   getNavigationState: (payload) => ipcRenderer.invoke('overlay:get-navigation-state', payload),
 
-  // Screenshot mode listener
-  onScreenshotMode: (callback) => {
-    const handler = (_event: any, data: { tabId: string; screenshot: string | null; bounds?: any }) => {
-      callback(data)
-    }
-    ipcRenderer.on('overlay-screenshot-mode', handler)
-    return () => ipcRenderer.removeListener('overlay-screenshot-mode', handler)
-  },
 
     onUrlUpdate: (callback) => {
-    const handler = (_event: any, data: { tabId: string; url?: string; screenshot?: string }) => {
+    const handler = (_event: any, data: { tabId: string; url?: string }) => {
       callback(data)
     }
     ipcRenderer.on('overlay-url-updated', handler)

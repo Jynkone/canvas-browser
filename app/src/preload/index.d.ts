@@ -16,6 +16,5 @@ declare global {
         }
       }
     }
-        __tldraw_editor?: Editor
   }
 }

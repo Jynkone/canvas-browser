@@ -1,16 +1,18 @@
 import { useEffect, useRef } from 'react'
 import type { BrowserShape } from './BrowserShapeUtil'
+import type { Editor } from 'tldraw'
 
-export default function WithHotkeys({
-  BROWSER_W,
-  BROWSER_H,
-}: {
+interface WithHotkeysProps {
   BROWSER_W: number
   BROWSER_H: number
-}) {
+  editorRef: React.RefObject<Editor | null>
+}
+
+export default function WithHotkeys({ BROWSER_W, BROWSER_H, editorRef }: WithHotkeysProps) {
   const cursorRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 })
   const lastTriggerAtRef = useRef(0)
 
+  // Track pointer position
   useEffect(() => {
     cursorRef.current = { x: window.innerWidth / 2, y: window.innerHeight / 2 }
     const onPointerMove = (e: PointerEvent) => { cursorRef.current = { x: e.clientX, y: e.clientY } }
@@ -24,6 +26,7 @@ export default function WithHotkeys({
     }
   }, [])
 
+  // Hotkey handling
   useEffect(() => {
     const opts: AddEventListenerOptions = { capture: true }
     const onKeyDown = (e: KeyboardEvent) => {
@@ -41,7 +44,7 @@ export default function WithHotkeys({
       e.preventDefault()
       e.stopPropagation()
 
-      const editor = window.__tldraw_editor
+      const editor = editorRef.current
       if (!editor) return
 
       const { x: sx, y: sy } = cursorRef.current
@@ -51,14 +54,15 @@ export default function WithHotkeys({
 
       editor.createShape<BrowserShape>({
         type: 'browser-shape',
-        x, y,
+        x,
+        y,
         props: { w: BROWSER_W, h: BROWSER_H, url: 'https://google.com', tabId: '' },
       })
     }
 
     window.addEventListener('keydown', onKeyDown, opts)
     return () => window.removeEventListener('keydown', onKeyDown, opts)
-  }, [BROWSER_W, BROWSER_H])
+  }, [BROWSER_W, BROWSER_H, editorRef])
 
   return null
 }

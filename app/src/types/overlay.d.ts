@@ -26,12 +26,6 @@ export type CaptureResult =
   | { ok: true; dataUrl: string }
   | { ok: false; error: string }
 
-// --- Screenshot mode data
-export interface ScreenshotModeData {
-  tabId: string
-  screenshot: string | null // Base64 data URL or null to disable
-  bounds?: { x: number; y: number; w: number; h: number }
-}
 
 // --- Payloads
 export interface CreateTabPayload {
@@ -72,8 +66,7 @@ export interface OverlayAPI {
   // focus / capture (optional)
   focus(payload?: Partial<TabIdPayload>): Promise<void>
   blur(): Promise<void>
-  capture(payload: TabIdPayload): Promise<CaptureResult>
-  onUrlUpdate(callback: (data: { tabId: string; url?: string; screenshot?: string }) => void): () => void
+  onUrlUpdate(callback: (data: { tabId: string; url?: string }) => void): () => void
 
 
   // navigation
@@ -83,6 +76,4 @@ export interface OverlayAPI {
   reload(payload: TabIdPayload): Promise<SimpleResult>
   getNavigationState(payload: TabIdPayload): Promise<NavigationStateResult>
 
-  // screenshot mode
-  onScreenshotMode(callback: (data: ScreenshotModeData) => void): () => void
 }

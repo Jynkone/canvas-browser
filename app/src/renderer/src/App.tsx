@@ -1,4 +1,4 @@
-import {  useMemo, useRef } from 'react'
+import { useMemo, useRef } from 'react'
 import { Tldraw } from 'tldraw'
 import type { Editor, TLCameraMoveOptions } from 'tldraw'
 import { getAssetUrls } from '@tldraw/assets/selfHosted'
@@ -10,7 +10,7 @@ import { useUiChromeManager } from './Utils/useUiChromeManager'
 const BROWSER_W = 1200
 const BROWSER_H = 660
 const ZOOM_HIDE = 0.65
-const ZOOM_SHOW = 0.60
+const ZOOM_SHOW = 0.6
 const DURATION_MS = 180
 const SLIDE_PX = 16
 
@@ -19,7 +19,6 @@ function isBrowserShapeLike(s: unknown): s is { type: string } {
   return typeof s === 'object' && s !== null && 'type' in s && typeof (s as { type: unknown }).type === 'string'
 }
 
-// types for the editor methods we use (feature-detected)
 type Bounds = { x: number; y: number; w: number; h: number }
 type EditorWithFit = Editor & {
   zoomToFit?: (opts?: TLCameraMoveOptions) => Editor
@@ -45,28 +44,31 @@ function isUsableBounds(b: unknown): b is Bounds {
   )
 }
 
-// Perform “Back to content” (zoom to fit). Fallback to bounds zoom, else set z=0.5.
-function backToContentOrFallback(editor: Editor): void {
+// Perform “Back to content” but clamp zoom above INITIAL_MIN_ZOOM
+function backToContentSafe(editor: Editor): void {
   const ed = editor as EditorWithFit
 
-  // Preferred API
   if (typeof ed.zoomToFit === 'function') {
     ed.zoomToFit({ animation: { duration: 200 } })
-    return
-  }
-
-  // Fallback using content bounds
-  if (typeof ed.getContentBounds === 'function' && typeof ed.zoomToBounds === 'function') {
+  } else if (
+    typeof ed.getContentBounds === 'function' &&
+    typeof ed.zoomToBounds === 'function'
+  ) {
     const b = ed.getContentBounds()
     if (isUsableBounds(b)) {
       ed.zoomToBounds(b, { inset: 64, animation: { duration: 200 } })
-      return
     }
+  } else {
+    const cam = editor.getCamera()
+    editor.setCamera({ x: cam.x, y: cam.y, z: 0.5 }, { immediate: true })
   }
 
-  // Nothing to fit yet — neutral zoom
+  // Final clamp: make sure we are *well above* the HIDE_AT threshold (0.26)
   const cam = editor.getCamera()
-  editor.setCamera({ x: cam.x, y: cam.y, z: 0.5 }, { immediate: true })
+  const SAFE_MIN = 0.4
+  if (cam.z < SAFE_MIN) {
+    editor.setCamera({ x: cam.x, y: cam.y, z: SAFE_MIN }, { immediate: true })
+  }
 }
 
 export default function App() {
@@ -78,10 +80,8 @@ export default function App() {
 
   const editorRef = useRef<Editor | null>(null)
 
-  // Keep your UI chrome behavior
+  // UI chrome behavior
   useUiChromeManager(editorRef, { DURATION_MS, SLIDE_PX, ZOOM_HIDE, ZOOM_SHOW })
-
-  // No handshake — index.html splash hides itself after its fixed duration
 
   return (
     <div style={{ width: '100vw', height: '100vh' }}>
@@ -92,8 +92,6 @@ export default function App() {
         persistenceKey="paper-canvas"
         onMount={(editor) => {
           editorRef.current = editor
-          window.__tldraw_editor = editor
-
 
           // Ensure at least one browser tab exists on fresh canvases
           const hasBrowserShape = editor
@@ -114,17 +112,17 @@ export default function App() {
                 w: BROWSER_W,
                 h: BROWSER_H,
                 url: 'https://google.com',
-                tabId: crypto.randomUUID(),
+                tabId: '',
               },
             }
             editor.createShape(initial as unknown as BrowserShape)
           }
 
-          // Run “Back to content” on the next frame so bounds are ready
-          requestAnimationFrame(() => backToContentOrFallback(editor))
+          // Run back-to-content and clamp zoom so we start live (not screenshot mode)
+          requestAnimationFrame(() => backToContentSafe(editor))
         }}
       >
-        <WithHotkeys BROWSER_W={BROWSER_W} BROWSER_H={BROWSER_H} />
+        <WithHotkeys BROWSER_W={BROWSER_W} BROWSER_H={BROWSER_H} editorRef={editorRef} />
       </Tldraw>
     </div>
   )

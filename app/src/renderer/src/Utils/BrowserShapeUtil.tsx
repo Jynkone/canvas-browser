@@ -16,13 +16,9 @@ export type BrowserShape = TLBaseShape<
   { w: number; h: number; url: string; tabId: string }
 >
 
-const DRAG_GUTTER = 8 // outside drag gutters
+const DRAG_GUTTER = 14 // outside drag gutters
 const MIN_W = 1000
 const MIN_H = 525 + NAV_BAR_HEIGHT + DRAG_GUTTER * 2
-
-// Keep thresholds in sync with main hysteresis
-const SHOW_AT = 0.24
-const HIDE_AT = 0.26
 
 type Rect = { x: number; y: number; width: number; height: number }
 type NavState = { currentUrl: string; canGoBack: boolean; canGoForward: boolean; title: string }
@@ -66,85 +62,53 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
       title: '',
     })
     const [isLoading, setIsLoading] = useState<boolean>(false)
+    
+useEffect(() => {
+  if (!api || tabIdRef.current) return
+  let cancelled = false
 
-    // When non-null, we render the static screenshot instead of live view
-    const [screenshotUrl, setScreenshotUrl] = useState<string | null>(null)
+  ;(async () => {
+    try {
+      const res = await api.createTab({ url: shape.props.url, shapeId: shape.id })
+      if (!res.ok || cancelled) return
 
-    // ---- helpers ----------------------------------------------------------
-    const getHostRect = (): Rect | null => {
-      const el = hostRef.current
-      if (!el) return null
-      const b = el.getBoundingClientRect()
-      return {
-        x: Math.floor(b.left),
-        y: Math.floor(b.top),
-        width: Math.ceil(b.width),
-        height: Math.ceil(b.height),
-      }
+      const id = res.tabId
+      tabIdRef.current = id
+
+    } catch {
+      // creation failed → cleanup happens naturally
     }
+  })()
 
-    const syncOverlayNow = async (id: string): Promise<void> => {
-      const rect = getHostRect()
-      if (!api || !rect) return
-      await api.show({ tabId: id, rect })
-      await Promise.all([
-        api.setBounds({ tabId: id, rect }),
-        api.setZoom({ tabId: id, factor: editor.getZoomLevel() }),
-      ])
-    }
+  return () => {
+    cancelled = true
+  }
+}, [api, shape.props.url, shape.id])
 
-    // ---- Overlay lifecycle ------------------------------------------------
-    useEffect(() => {
-      let cancelled = false
-      if (!api || tabIdRef.current) return
-      ;(async () => {
-        try {
-          const res = await api.createTab({ url: shape.props.url, shapeId: shape.id })
-
-          if (!res.ok || cancelled) return
-          const id = res.tabId
-          tabIdRef.current = id
-
-          // Prime placement/zoom immediately
-          await syncOverlayNow(id)
-
-          // If we start already zoomed out, capture once to avoid a pop
-          if (editor.getZoomLevel() < SHOW_AT) {
-            try {
-              const cap = await api.capture({ tabId: id })
-              if (cap.ok && cap.dataUrl) setScreenshotUrl(cap.dataUrl)
-            } catch { /* ignore */ }
-          }
-        } catch { /* ignore */ }
-      })()
-      return () => { cancelled = true }
-    }, [api, editor, shape.props.url])
-
-    // Navigation state polling
-    useEffect(() => {
-      if (!api) return
-      let cancelled = false
-      const tick = async () => {
-        const id = tabIdRef.current
-        if (!id) return
-        try {
-          const res = await api.getNavigationState({ tabId: id })
-          if (!cancelled && res.ok) {
-            setNavState({
-              currentUrl: res.currentUrl ?? 'about:blank',
-              canGoBack: res.canGoBack ?? false,
-              canGoForward: res.canGoForward ?? false,
-              title: res.title ?? '',
-            })
-            setIsLoading(res.isLoading ?? false)
-          }
-        } catch { /* noop */ }
+// 3. Navigation state polling (keep as-is)
+useEffect(() => {
+  if (!api) return
+  let cancelled = false
+  const tick = async () => {
+    const id = tabIdRef.current
+    if (!id) return
+    try {
+      const res = await api.getNavigationState({ tabId: id })
+      if (!cancelled && res.ok) {
+        setNavState({
+          currentUrl: res.currentUrl ?? 'about:blank',
+          canGoBack: res.canGoBack ?? false,
+          canGoForward: res.canGoForward ?? false,
+          title: res.title ?? '',
+        })
+        setIsLoading(res.isLoading ?? false)
       }
-      const h = window.setInterval(tick, 500)
-      return () => { cancelled = true; window.clearInterval(h) }
-    }, [api])
+    } catch { /* noop */ }
+  }
+  const h = window.setInterval(tick, 500)
+  return () => { cancelled = true; window.clearInterval(h) }
+}, [api])
 
-    // Bounds + zoom follow loop (canvas → overlay), with failsafe to drop screenshot
     useEffect(() => {
       if (!api) return
 
@@ -156,10 +120,16 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
       const loop = () => {
         raf = requestAnimationFrame(loop)
 
-        const id = tabIdRef.current
-        if (!id) return
-        const rect = getHostRect()
-        if (!rect) return
+        const id = tabIdRef.current; if (!id) return
+        const el = hostRef.current; if (!el) return
+
+        const b = el.getBoundingClientRect()
+        const rect: Rect = {
+          x: Math.floor(b.left),
+          y: Math.floor(b.top),
+          width: Math.ceil(b.width),
+          height: Math.ceil(b.height),
+        }
 
         if (!shown) {
           shown = true
@@ -175,64 +145,27 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
           lastRect = rect
         }
 
+        // Push canvas zoom; overlay scales by its internal base (e.g. 0.8)
         const factor = editor.getZoomLevel()
         if (!Number.isFinite(lastFactor) || Math.abs(factor - lastFactor) > 1e-3) {
           void api.setZoom({ tabId: id, factor })
           lastFactor = factor
-
-          // Failsafe: if the image is still up well above the hide band, pre-sync + drop it
-          if (screenshotUrl && factor > (HIDE_AT + 0.02)) {
-            void (async () => {
-              await syncOverlayNow(id)
-              setScreenshotUrl(null)
-            })()
-          }
         }
       }
 
       raf = requestAnimationFrame(loop)
       return () => cancelAnimationFrame(raf)
-    }, [api, editor, screenshotUrl])
-
-    // Imperceptible swap: keep screenshot visible until live view is reattached & synced
-    useEffect(() => {
-      if (!api) return
-      let mounted = true
-
-      const off = api.onScreenshotMode(async ({ tabId, screenshot }) => {
-        const id = tabIdRef.current
-        if (!mounted || !id || id !== tabId) return
-
-        // Entering screenshot mode
-        if (typeof screenshot === 'string') {
-          setScreenshotUrl(screenshot)
-          return
-        }
-
-        // Leaving screenshot mode: pre-sync live view under the image, then drop it next frame
-        try {
-          await syncOverlayNow(id)
-        } finally {
-          requestAnimationFrame(() =>
-            requestAnimationFrame(() => {
-              if (mounted) setScreenshotUrl(null)
-            })
-          )
-        }
-      })
-
-      return () => { mounted = false; off?.() }
     }, [api, editor])
 
-    // Cleanup
-    useEffect(() => {
-      return () => {
-        const id = tabIdRef.current
-        if (!api || !id) return
-        void api.destroy({ tabId: id })
-        setScreenshotUrl(null)
-      }
-    }, [api])
+// 5. Cleanup (keep as-is)
+useEffect(() => {
+  return () => {
+    const id = tabIdRef.current
+    if (!api || !id) return
+    void api.destroy({ tabId: id })
+    
+  }
+}, [api])
 
     // ---- Minimal fit toggle ------------------------------------------------
 const [fitMode, setFitMode] = useState<boolean>(false)
@@ -347,104 +280,76 @@ const fitOff = (): void => {
 
 const onToggleFit = (): void => { (fitMode ? fitOff : fitOn)() }
     // ---- Styles ------------------------------------------------------------
-    const contentStyle: React.CSSProperties = {
-      position: 'absolute',
-      top: NAV_BAR_HEIGHT,
-      left: DRAG_GUTTER,
-      right: DRAG_GUTTER,
-      bottom: DRAG_GUTTER,
-      overflow: 'hidden',
-      zIndex: 0,
-      background: 'transparent',
-    }
+const contentStyle: React.CSSProperties = {
+  position: 'absolute',
+  top: NAV_BAR_HEIGHT, // start below navbar
+  left: 0,
+  right: 0,
+  bottom: 0,
+  overflow: 'hidden',
+  zIndex: 0,
+  background: 'transparent',
+}
 
-    // ---- Render ------------------------------------------------------------
-    return (
-      <HTMLContainer
-        style={{
-          width: shape.props.w,
-          height: shape.props.h,
-          position: 'relative',
-          pointerEvents: 'auto',
-          cursor: 'default',
+// ---- Render ------------------------------------------------------------
+return (
+  <HTMLContainer
+    style={{
+      width: shape.props.w,
+      height: shape.props.h,
+      position: 'relative',
+      pointerEvents: 'auto',
+      cursor: 'default',
+    }}
+  >
+    {/* Column: navbar + content */}
+    <div
+      style={{
+        width: '100%',
+        height: '100%',
+        display: 'flex',
+        flexDirection: 'column',
+        position: 'relative',
+      }}
+    >
+      <NavigationBar
+        navState={navState}
+        isLoading={isLoading}
+        onUrlChange={async (url) => {
+          const id = tabIdRef.current
+          if (api && id) { setIsLoading(true); await api.navigate({ tabId: id, url }) }
         }}
-      >
-        {/* Column: navbar + content */}
+        onBack={async () => {
+          const id = tabIdRef.current
+          if (api && id && navState.canGoBack) { setIsLoading(true); await api.goBack({ tabId: id }) }
+        }}
+        onForward={async () => {
+          const id = tabIdRef.current
+          if (api && id && navState.canGoForward) { setIsLoading(true); await api.goForward({ tabId: id }) }
+        }}
+        onReload={async () => {
+          const id = tabIdRef.current
+          if (api && id) { setIsLoading(true); await api.reload({ tabId: id }) }
+        }}
+        fitMode={fitMode}
+        onToggleFit={onToggleFit}
+      />
+
+      <div style={contentStyle}>
         <div
+          ref={hostRef}
           style={{
-            width: '100%',
-            height: '100%',
-            display: 'flex',
-            flexDirection: 'column',
-            position: 'relative',
+            position: 'absolute',
+            top: 0,
+            left: 0,
+            right: 0,
+            bottom: 0,
+            pointerEvents: 'none',
           }}
-        >
-          <NavigationBar
-            navState={navState}
-            isLoading={isLoading}
-            onUrlChange={async (url) => {
-              const id = tabIdRef.current
-              if (api && id) { setIsLoading(true); await api.navigate({ tabId: id, url }) }
-            }}
-            onBack={async () => {
-              const id = tabIdRef.current
-              if (api && id && navState.canGoBack) { setIsLoading(true); await api.goBack({ tabId: id }) }
-            }}
-            onForward={async () => {
-              const id = tabIdRef.current
-              if (api && id && navState.canGoForward) { setIsLoading(true); await api.goForward({ tabId: id }) }
-            }}
-            onReload={async () => {
-              const id = tabIdRef.current
-              if (api && id) { setIsLoading(true); await api.reload({ tabId: id }) }
-            }}
-            fitMode={fitMode}
-            onToggleFit={onToggleFit}
-          />
-
-          {/* Content box (live overlay proxy + screenshot) */}
-          <div style={contentStyle}>
-            {/* Proxy element: main uses this rect to place WebContentsView */}
-            <div
-              ref={hostRef}
-              style={{
-                position: 'absolute',
-                top: 0,
-                left: 0,
-                right: 0,
-                bottom: 0,
-                pointerEvents: 'none',
-              }}
-            />
-
-            {/* Screenshot layer */}
-            {screenshotUrl && (
-              <img
-                src={screenshotUrl}
-                alt=""
-                draggable={false}
-                style={{
-                  position: 'absolute',
-                  top: 0,
-                  left: 0,
-                  right: 0,
-                  bottom: 0,
-                  width: '100%',
-                  height: '100%',
-                  display: 'block',
-                  objectFit: 'fill', // change to 'contain' for letterboxing
-                  pointerEvents: 'none',
-                  userSelect: 'none',
-                  transition: 'none',
-                  animation: 'none',
-                  backfaceVisibility: 'hidden',
-                  transform: 'translateZ(0)',
-                }}
-              />
-            )}
-          </div>
-        </div>
-      </HTMLContainer>
-    )
+        />
+      </div>
+    </div>
+  </HTMLContainer>
+)
   }
 }
