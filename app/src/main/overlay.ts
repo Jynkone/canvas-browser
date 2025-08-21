@@ -37,6 +37,7 @@ const MAX_VIEWS = 32
 
 // Fresh recapture: wait a tick after did-stop-loading before re-shot
 const WARM_RECAPTURE_DELAY_MS = 80
+const browserState: Record<string, { currentUrl: string; lastInteraction: number }> = {}
 
 const clamp = (n: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, n))
 
@@ -52,7 +53,6 @@ async function initializeStartupRestore(): Promise<void> {
   try {
     const stateFile = join(process.cwd(), 'browser-state.json')
     if (existsSync(stateFile)) {
-      console.log('[overlay] Reading startup state file once...')
       const fileContent = readFileSync(stateFile, 'utf8')
       startupBrowserState = JSON.parse(fileContent)
       
@@ -65,7 +65,6 @@ async function initializeStartupRestore(): Promise<void> {
       
       // Sort by last interaction (most recent first)
       startupQueue.sort((a, b) => b.lastInteraction - a.lastInteraction)
-      console.log(`[overlay] Prepared startup queue for ${startupQueue.length} tabs`)
     }
   } catch (e) {
     console.error('[overlay] Failed to read startup state:', e)
@@ -73,6 +72,31 @@ async function initializeStartupRestore(): Promise<void> {
   
   startupRestoreComplete = true
 }
+
+
+
+const STATE_FILE = join(process.cwd(), 'browser-state.json')
+if (existsSync(STATE_FILE)) {
+  try {
+    Object.assign(browserState, JSON.parse(readFileSync(STATE_FILE, 'utf8')))
+  } catch (e) {
+    console.error('[overlay] Failed to read browser state:', e)
+  }
+}
+
+// Safe writer with debounce
+let writeTimer: NodeJS.Timeout | null = null
+function flushBrowserState(): void {
+  if (writeTimer) clearTimeout(writeTimer)
+  writeTimer = setTimeout(() => {
+    try {
+      writeFileSync(STATE_FILE, JSON.stringify(browserState, null, 2))
+    } catch (e) {
+      console.error('[overlay] Failed to write browser state:', e)
+    }
+  }, 100) // batch writes within 100ms
+}
+
 
 
 async function delay(ms: number): Promise<void> {
@@ -296,7 +320,7 @@ ipcMain.handle('overlay:create-tab', async (_e, payload?: { url?: string; shapeI
                 delayMs = queueIndex * STARTUP_DELAY_MS
                 // Remove from queue so it won't be processed again
                 startupQueue.splice(queueIndex, 1)
-                console.log(`[overlay] Restoring tab ${tabId} with ${delayMs}ms delay (${startupQueue.length} remaining)`)
+                
             }
         }
         
@@ -307,7 +331,6 @@ ipcMain.handle('overlay:create-tab', async (_e, payload?: { url?: string; shapeI
         
         // Check if this tab already exists (restoration scenario)
         if (views.has(tabId)) {
-            console.log(`[overlay] Tab ${tabId} already exists, skipping creation`)
             return { ok: true as const, tabId }
         }
         
@@ -342,59 +365,44 @@ ipcMain.handle('overlay:create-tab', async (_e, payload?: { url?: string; shapeI
             view.webContents.on('dom-ready', safeReapply)
 
             // Invalidate cached screenshot on new load
-            view.webContents.on('did-start-loading', () => { if (state) state.screenshotCache = undefined })
+            view.webContents.on('did-start-loading', () => {
+  if (state) state.screenshotCache = undefined
+})
 
-            // After the page truly finishes loading, if we're in screenshot mode,
-            // refresh the image so it's not a "loading" frame.
-            view.webContents.on('did-stop-loading', () => {
-                if (state && state.isShowingScreenshot) void S.pushFreshScreenshot(tabId, state)
-            })
+view.webContents.on('did-stop-loading', () => {
+  if (state) {
+    // always invalidate cache
+    state.screenshotCache = undefined
 
-            view.webContents.on('did-navigate', () => {
-                if (state) { 
-                    state.screenshotCache = undefined
-                    safeReapply()
-                    
-                    const currentUrl = view.webContents.getURL()
-                    console.log(`[overlay] Tab ${tabId} navigated to:`, currentUrl)
-                    
-                    // Save URL to simple JSON file (this continues to work as before)
-                    try {
-                        const stateFile = join(process.cwd(), 'browser-state.json')
-                        let browserState = {}
-                        if (existsSync(stateFile)) {
-                            browserState = JSON.parse(readFileSync(stateFile, 'utf8'))
-                        }
-                        browserState[tabId] = { currentUrl, lastInteraction: Date.now() }
-                        writeFileSync(stateFile, JSON.stringify(browserState, null, 2))
-                    } catch (e) {
-                        console.error('[overlay] Failed to save browser state:', e)
-                    }
-                }
-            })
+    // if in screenshot mode, recapture a fresh one
+    if (state.isShowingScreenshot) {
+      void S.pushFreshScreenshot(tabId, state)
+    }
+  }
+})
 
-            view.webContents.on('did-navigate-in-page', () => {
-                if (state) { 
-                    state.screenshotCache = undefined
-                    safeReapply()
-                    
-                    const currentUrl = view.webContents.getURL()
-                    console.log(`[overlay] Tab ${tabId} navigated in-page to:`, currentUrl)
-                    
-                    // Save URL to simple JSON file (this continues to work as before)
-                    try {
-                        const stateFile = join(process.cwd(), 'browser-state.json')
-                        let browserState = {}
-                        if (existsSync(stateFile)) {
-                            browserState = JSON.parse(readFileSync(stateFile, 'utf8'))
-                        }
-                        browserState[tabId] = { currentUrl, lastInteraction: Date.now() }
-                        writeFileSync(stateFile, JSON.stringify(browserState, null, 2))
-                    } catch (e) {
-                        console.error('[overlay] Failed to save browser state:', e)
-                    }
-                }
-            })
+
+view.webContents.on('did-navigate', () => {
+  if (!state) return
+  state.screenshotCache = undefined
+  safeReapply()
+
+  const currentUrl = view.webContents.getURL()
+
+  browserState[tabId] = { currentUrl, lastInteraction: Date.now() }
+  flushBrowserState()
+})
+
+view.webContents.on('did-navigate-in-page', () => {
+  if (!state) return
+  state.screenshotCache = undefined
+  safeReapply()
+
+  const currentUrl = view.webContents.getURL()
+
+  browserState[tabId] = { currentUrl, lastInteraction: Date.now() }
+  flushBrowserState()
+})
 
             view.webContents.on('page-title-updated', () => { if (state) S.updateNav(state) })
             view.webContents.on('render-process-gone', () => {
@@ -510,25 +518,15 @@ ipcMain.handle('overlay:create-tab', async (_e, payload?: { url?: string; shapeI
   ipcMain.handle('overlay:destroy', async (_e, { tabId }: { tabId: string }): Promise<void> => {
   const { state } = S.resolve(tabId)
   if (!state) return
-  try { 
-    S.safeDestroy(state) 
-    
-    // Clean up browser state file
-    try {
-      const stateFile = join(process.cwd(), 'browser-state.json')
-      if (existsSync(stateFile)) {
-        const browserState = JSON.parse(readFileSync(stateFile, 'utf8'))
-        delete browserState[tabId]
-        writeFileSync(stateFile, JSON.stringify(browserState, null, 2))
-        console.log(`[overlay] Cleaned up state for tab ${tabId}`)
-      }
-    } catch (e) {
-      console.error('[overlay] Failed to clean up browser state:', e)
-    }
-  } finally { 
-    views.delete(tabId) 
+  try {
+    S.safeDestroy(state)
+    delete browserState[tabId]
+    flushBrowserState()
+  } finally {
+    views.delete(tabId)
   }
 })
+
 
   ipcMain.handle('overlay:capture', async (_e, { tabId }: { tabId: string }): Promise<CaptureResponse> => {
     const { state } = S.resolve(tabId)

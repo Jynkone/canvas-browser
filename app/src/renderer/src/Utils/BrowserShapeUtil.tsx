@@ -100,6 +100,7 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
       ;(async () => {
         try {
           const res = await api.createTab({ url: shape.props.url, shapeId: shape.id })
+
           if (!res.ok || cancelled) return
           const id = res.tabId
           tabIdRef.current = id
@@ -142,8 +143,6 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
       const h = window.setInterval(tick, 500)
       return () => { cancelled = true; window.clearInterval(h) }
     }, [api])
-
-    
 
     // Bounds + zoom follow loop (canvas → overlay), with failsafe to drop screenshot
     useEffect(() => {
