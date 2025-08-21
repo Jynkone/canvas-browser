@@ -49,18 +49,6 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null): void {
   const views = new Map<string, ViewState>()
 
   const S = {
-
-  notifyRenderer(tabId: string, data: { url?: string; screenshot?: string }) {
-    const win = getWindow()
-    if (win && !win.isDestroyed()) {
-      win.webContents.send('overlay-url-updated', {
-        tabId,
-        url: data.url,
-        screenshot: data.screenshot
-      })
-    }
-  },
-
     resolve(id?: string | null) {
       if (id && views.has(id)) {
         const s = views.get(id)!
@@ -86,46 +74,34 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null): void {
     },
 
     async captureScreenshot(state: ViewState): Promise<string | undefined> {
-  try {
-    const image = await state.view.webContents.capturePage()
-    const png = image.toPNG({ scaleFactor: 1 })
-    const dataUrl = `data:image/png;base64,${Buffer.from(png).toString('base64')}`
-    
-    // Notify renderer to save this screenshot
-    const tabId = Array.from(views.entries()).find(([, s]) => s === state)?.[0]
-    if (tabId) {
-      S.notifyRenderer(tabId, { screenshot: dataUrl })
-    }
-    
-    return dataUrl
-  } catch {
-    return undefined
-  }
-},
+      try {
+        const image = await state.view.webContents.capturePage()
+        const png = image.toPNG({ scaleFactor: 1 })
+        return `data:image/png;base64,${Buffer.from(png).toString('base64')}`
+      } catch {
+        return undefined
+      }
+    },
 
     async pushFreshScreenshot(tabId: string, state: ViewState): Promise<void> {
-  const win = getWindow()
-  if (!win) return
-  await delay(WARM_RECAPTURE_DELAY_MS)
-  try {
-    const fresh = await state.view.webContents.capturePage()
-    const png = fresh.toPNG({ scaleFactor: 1 })
-    const dataUrl = `data:image/png;base64,${Buffer.from(png).toString('base64')}`
-    if (!state.isShowingScreenshot) return
-    state.screenshotCache = dataUrl
-    win.webContents.send('overlay-screenshot-mode', {
-      tabId,
-      screenshot: dataUrl,
-      bounds: state.lastBounds,
-    })
-    
-    // Also notify renderer to save screenshot to sessionStore
-    S.notifyRenderer(tabId, { screenshot: dataUrl })
-  } catch {
-    // keep old screenshot on failure
-  }
-},
-
+      const win = getWindow()
+      if (!win) return
+      await delay(WARM_RECAPTURE_DELAY_MS)
+      try {
+        const fresh = await state.view.webContents.capturePage()
+        const png = fresh.toPNG({ scaleFactor: 1 })
+        const dataUrl = `data:image/png;base64,${Buffer.from(png).toString('base64')}`
+        if (!state.isShowingScreenshot) return
+        state.screenshotCache = dataUrl
+        win.webContents.send('overlay-screenshot-mode', {
+          tabId,
+          screenshot: dataUrl,
+          bounds: state.lastBounds,
+        })
+      } catch {
+        // keep old screenshot on failure
+      }
+    },
 
     async setEff(view: WebContentsView, eff: number, state: ViewState) {
       const win = getWindow()
@@ -191,28 +167,16 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null): void {
     },
 
     updateNav(state: ViewState) {
-  try {
-    const wc = state.view.webContents
-    const newUrl = wc.getURL() || 'about:blank'
-    const oldUrl = state.navState.currentUrl
-    
-    state.navState = {
-      currentUrl: newUrl,
-      canGoBack: wc.canGoBack(),
-      canGoForward: wc.canGoForward(),
-      title: wc.getTitle() || '',
-    }
-    
-    // Notify renderer if URL changed
-    if (newUrl !== oldUrl && newUrl !== 'about:blank') {
-      const tabId = Array.from(views.entries()).find(([, s]) => s === state)?.[0]
-      if (tabId) {
-        S.notifyRenderer(tabId, { url: newUrl })
-      }
-    }
-  } catch {}
-},
-
+      try {
+        const wc = state.view.webContents
+        state.navState = {
+          currentUrl: wc.getURL() || 'about:blank',
+          canGoBack: wc.navigationHistory.canGoBack(),
+          canGoForward: wc.navigationHistory.canGoForward(),
+          title: wc.getTitle() || '',
+        }
+      } catch {}
+    },
 
     safeDestroy(state: ViewState) {
       try { void S.clearEmuIfAny(state.view) } catch {}
@@ -338,8 +302,8 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null): void {
               if (view.webContents.isDevToolsOpened()) view.webContents.closeDevTools()
               else view.webContents.openDevTools({ mode: 'detach' }); return
             }
-            if (input.alt && key === 'arrowleft' && state.navState.canGoBack) { event.preventDefault(); view.webContents.goBack(); return }
-            if (input.alt && key === 'arrowright' && state.navState.canGoForward) { event.preventDefault(); view.webContents.goForward(); return }
+            if (input.alt && key === 'arrowleft' && state.navState.canGoBack) { event.preventDefault(); view.webContents.navigationHistory.canGoBack(); return }
+            if (input.alt && key === 'arrowright' && state.navState.canGoForward) { event.preventDefault(); view.webContents.navigationHistory.canGoForward(); return }
             if ((mod && key === 'r') || key === 'f5') { event.preventDefault(); view.webContents.reload(); return }
             if (mod && ['=', '+', '-', '_', '0'].includes(key)) event.preventDefault()
             if (input.type === 'mouseWheel' && mod) event.preventDefault()
@@ -359,13 +323,6 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null): void {
       }
     })
   })
-
-  ipcMain.handle('overlay:get-current-url', async (_e, { tabId }: { tabId: string }): Promise<string | null> => {
-  const { state } = S.resolve(tabId)
-  if (!state) return null
-  return state.navState.currentUrl || null
-})
-
 
   ipcMain.handle('overlay:get-zoom', async (): Promise<number> => canvasZoom)
 

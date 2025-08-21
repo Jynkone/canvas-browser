@@ -6,8 +6,6 @@ import { BrowserShapeUtil } from './Utils/BrowserShapeUtil'
 import type { BrowserShape } from './Utils/BrowserShapeUtil'
 import WithHotkeys from './Utils/WithHotkeys'
 import { useUiChromeManager } from './Utils/useUiChromeManager'
-import { sessionStore } from './state/sessionStore'
-
 
 const BROWSER_W = 1200
 const BROWSER_H = 660
@@ -51,62 +49,27 @@ export default function App() {
       <Tldraw
         shapeUtils={shapeUtils}
         assetUrls={assetUrls}
-        persistenceKey="my-app-canvas"
         hideUi={false}
-onMount={(editor) => {
-  window.__tldraw_editor = editor
-  editorRef.current = editor
+        onMount={(editor) => {
+          window.__tldraw_editor = editor
+          editorRef.current = editor
 
-  // Wait for TLDraw persistence to restore shapes
-  requestAnimationFrame(() => {
-    const existingBrowserShapes = editor.getCurrentPageShapes()
-      .filter(shape => shape.type === 'browser-shape')
+          const initial = {
+            type: 'browser-shape',
+            x: 100,
+            y: 100,
+            props: { w: BROWSER_W, h: BROWSER_H, url: 'https://google.com', tabId: '' },
+          } as const
 
-    if (existingBrowserShapes.length === 0) {
-      // No TLDraw shapes - check sessionStore for restoration
-      const allTabs = sessionStore.getAllTabs()
-      
-      if (allTabs.length > 0) {
-        // STARTUP ENFORCEMENT: Set realization states based on activity
-        sessionStore.enforceHotN(3)
-        
-        // Get updated hot/cold lists after enforcement
-        const { hot, cold } = sessionStore.getTabsChronological()
-        
-        // Create all tabs (hot + cold)
-        const allTabsToRestore = [...hot, ...cold]
-        allTabsToRestore.forEach((tab, index) => {
-          const shape = {
-            type: 'browser-shape' as const,
-            x: 100 + (index % 3) * 400, // Spread them out
-            y: 100 + Math.floor(index / 3) * 300,
-            props: { w: BROWSER_W, h: BROWSER_H, url: tab.url, tabId: '' },
-          }
-          editor.createShape(shape as unknown as BrowserShape)
-        })
-      } else {
-        // No existing tabs - create default
-        const initial = {
-          type: 'browser-shape',
-          x: 100,
-          y: 100,
-          props: { w: BROWSER_W, h: BROWSER_H, url: 'https://google.com', tabId: '' },
-        } as const
-        editor.createShape(initial as unknown as BrowserShape)
-      }
-    } else {
-      // TLDraw restored shapes - just enforce hot/cold states on existing sessionStore data
-      sessionStore.enforceHotN(3)
-    }
-    
-    // Set camera after shapes are settled
-    const cam = editor.getCamera()
-    editor.setCamera({ ...cam, z: 0.6 })
-  })
+          editor.createShape(initial as unknown as BrowserShape) // TS generic constraint workaround
+          editor.focus()
 
-  editor.focus()
-}}
-
+          // Start at 60% canvas zoom
+          requestAnimationFrame(() => {
+            const cam = editor.getCamera()
+            editor.setCamera({ ...cam, z: 0.6 })
+          })
+        }}
       >
         <WithHotkeys BROWSER_W={BROWSER_W} BROWSER_H={BROWSER_H} />
       </Tldraw>
