@@ -1,28 +1,49 @@
 <!doctype html>
-<html>
+<html class="splash-active"> <!-- 👈 keep this until splash.js removes it -->
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width,initial-scale=1" />
     <title>Paper</title>
 
-    <!-- CSP: allow tldraw icons/fonts + Vite dev server -->
-<meta http-equiv="Content-Security-Policy" content="
-  default-src 'self';
-  script-src 'self' 'unsafe-eval';
-  style-src 'self' 'unsafe-inline';
-  img-src 'self' data: blob:;
-  font-src 'self' data:;
-  connect-src 'self';
-  worker-src 'self' blob:;
-">
+    <meta http-equiv="Content-Security-Policy" content="
+      default-src 'self';
+      script-src 'self' 'unsafe-eval';
+      style-src 'self' 'unsafe-inline';
+      img-src 'self' data: blob:;
+      font-src 'self' data:;
+      connect-src 'self';
+      worker-src 'self' blob:;
+    ">
 
-    <!-- Fill window & prevent scroll -->
     <style>
       html, body, #root { height:100%; width:100%; margin:0; padding:0; overflow:hidden; }
       * { box-sizing: border-box; }
+
+      /* 🚫 Hide the app until splash is finished */
+      .splash-active #root { visibility: hidden; }
+
+      /* Fullscreen splash */
+      #splash {
+        position: fixed;
+        inset: 0;
+        display: grid;
+        place-items: center;
+        background: #ffffff; /* solid background blocks any app content */
+        z-index: 10000;
+        opacity: 1;
+        transition: opacity 500ms ease;
+      }
+      #splash.hidden { opacity: 0; pointer-events: none; }
+      #splash img { width: min(520px, 70vw); height: auto; display: block; }
     </style>
+
+    <script src="/splash.js" defer></script>
   </head>
   <body>
+    <div id="splash">
+      <img id="splash-gif" src="/splash.gif" alt="Loading..." />
+    </div>
+
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>

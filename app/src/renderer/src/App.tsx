@@ -1,6 +1,6 @@
-import { useEffect, useMemo, useRef } from 'react'
+import {  useMemo, useRef } from 'react'
 import { Tldraw } from 'tldraw'
-import type { Editor } from 'tldraw'
+import type { Editor, TLCameraMoveOptions } from 'tldraw'
 import { getAssetUrls } from '@tldraw/assets/selfHosted'
 import { BrowserShapeUtil } from './Utils/BrowserShapeUtil'
 import type { BrowserShape } from './Utils/BrowserShapeUtil'
@@ -14,6 +14,61 @@ const ZOOM_SHOW = 0.60
 const DURATION_MS = 180
 const SLIDE_PX = 16
 
+// identify browser shapes without using `any`
+function isBrowserShapeLike(s: unknown): s is { type: string } {
+  return typeof s === 'object' && s !== null && 'type' in s && typeof (s as { type: unknown }).type === 'string'
+}
+
+// types for the editor methods we use (feature-detected)
+type Bounds = { x: number; y: number; w: number; h: number }
+type EditorWithFit = Editor & {
+  zoomToFit?: (opts?: TLCameraMoveOptions) => Editor
+  getContentBounds?: () => Bounds | null
+  zoomToBounds?: (
+    b: Bounds,
+    opts?: { inset?: number; targetZoom?: number } & TLCameraMoveOptions
+  ) => Editor
+}
+
+function isUsableBounds(b: unknown): b is Bounds {
+  if (typeof b !== 'object' || b === null) return false
+  const bb = b as Partial<Bounds>
+  return (
+    typeof bb.x === 'number' &&
+    typeof bb.y === 'number' &&
+    typeof bb.w === 'number' &&
+    typeof bb.h === 'number' &&
+    Number.isFinite(bb.w) &&
+    Number.isFinite(bb.h) &&
+    bb.w > 0 &&
+    bb.h > 0
+  )
+}
+
+// Perform “Back to content” (zoom to fit). Fallback to bounds zoom, else set z=0.5.
+function backToContentOrFallback(editor: Editor): void {
+  const ed = editor as EditorWithFit
+
+  // Preferred API
+  if (typeof ed.zoomToFit === 'function') {
+    ed.zoomToFit({ animation: { duration: 200 } })
+    return
+  }
+
+  // Fallback using content bounds
+  if (typeof ed.getContentBounds === 'function' && typeof ed.zoomToBounds === 'function') {
+    const b = ed.getContentBounds()
+    if (isUsableBounds(b)) {
+      ed.zoomToBounds(b, { inset: 64, animation: { duration: 200 } })
+      return
+    }
+  }
+
+  // Nothing to fit yet — neutral zoom
+  const cam = editor.getCamera()
+  editor.setCamera({ x: cam.x, y: cam.y, z: 0.5 }, { immediate: true })
+}
+
 export default function App() {
   const shapeUtils = useMemo(() => [BrowserShapeUtil], [])
   const assetUrls = useMemo(
@@ -23,26 +78,10 @@ export default function App() {
 
   const editorRef = useRef<Editor | null>(null)
 
-  // slide-in/out manager now only needs the editor and cfg
+  // Keep your UI chrome behavior
   useUiChromeManager(editorRef, { DURATION_MS, SLIDE_PX, ZOOM_HIDE, ZOOM_SHOW })
 
-  // Delete / Backspace fallback outside inputs
-  useEffect(() => {
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key !== 'Delete' && e.key !== 'Backspace') return
-      const ed = editorRef.current; if (!ed) return
-      const ae = document.activeElement as HTMLElement | null
-      const tag = (ae?.tagName || '').toLowerCase()
-      if (tag === 'input' || tag === 'textarea' || ae?.isContentEditable) return
-      const selected = ed.getSelectedShapeIds()
-      if (selected.length === 0) return
-      e.preventDefault(); e.stopPropagation()
-      ed.deleteShapes(selected)
-      ed.focus()
-    }
-    window.addEventListener('keydown', onKeyDown, { capture: true })
-    return () => window.removeEventListener('keydown', onKeyDown, { capture: true })
-  }, [])
+  // No handshake — index.html splash hides itself after its fixed duration
 
   return (
     <div style={{ width: '100vw', height: '100vh' }}>
@@ -52,36 +91,38 @@ export default function App() {
         hideUi={false}
         persistenceKey="paper-canvas"
         onMount={(editor) => {
-  window.__tldraw_editor = editor
-  editorRef.current = editor
+          editorRef.current = editor
+          window.__tldraw_editor = editor
 
-  // Only create initial tab if no browser shapes exist (fresh start)
-  const existingBrowserShapes = editor.getCurrentPageShapes().filter(
-    shape => shape.type === 'browser-shape'
-  )
 
-  if (existingBrowserShapes.length === 0) {
-    // Fresh start - create initial tab
-    const initial = {
-      type: 'browser-shape',
-      x: 100,
-      y: 100,
-      props: { w: BROWSER_W, h: BROWSER_H, url: 'https://google.com', tabId: '' },
-    } as const
+          // Ensure at least one browser tab exists on fresh canvases
+          const hasBrowserShape = editor
+            .getCurrentPageShapes()
+            .some((s) => isBrowserShapeLike(s) && s.type === 'browser-shape')
 
-    editor.createShape(initial as unknown as BrowserShape)
-  } else {
-    console.log(`[App] Restored ${existingBrowserShapes.length} browser shapes, skipping initial tab`)
-  }
+          if (!hasBrowserShape) {
+            const initial: Omit<BrowserShape, 'id' | 'index' | 'typeName'> & { type: 'browser-shape' } = {
+              type: 'browser-shape',
+              x: 100,
+              y: 100,
+              rotation: 0,
+              isLocked: false,
+              opacity: 1,
+              parentId: editor.getCurrentPageId(),
+              meta: {},
+              props: {
+                w: BROWSER_W,
+                h: BROWSER_H,
+                url: 'https://google.com',
+                tabId: crypto.randomUUID(),
+              },
+            }
+            editor.createShape(initial as unknown as BrowserShape)
+          }
 
-  editor.focus()
-
-  // Start at 60% canvas zoom
-  requestAnimationFrame(() => {
-    const cam = editor.getCamera()
-    editor.setCamera({ ...cam, z: 0.6 })
-  })
-}}
+          // Run “Back to content” on the next frame so bounds are ready
+          requestAnimationFrame(() => backToContentOrFallback(editor))
+        }}
       >
         <WithHotkeys BROWSER_W={BROWSER_W} BROWSER_H={BROWSER_H} />
       </Tldraw>
