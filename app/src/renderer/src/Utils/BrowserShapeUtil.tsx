@@ -109,53 +109,57 @@ useEffect(() => {
   return () => { cancelled = true; window.clearInterval(h) }
 }, [api])
 
-    useEffect(() => {
-      if (!api) return
+useEffect(() => {
+  if (!api) return
 
-      let raf = 0
-      let shown = false
-      let lastRect: Rect = { x: -1, y: -1, width: -1, height: -1 }
-      let lastFactor = Number.NaN
+  let raf = 0
+  let shown = false
+  let lastRect: Rect = { x: -1, y: -1, width: -1, height: -1 }
+  let lastFactor = -1
 
-      const loop = () => {
-        raf = requestAnimationFrame(loop)
+  const loop = (): void => {
+    raf = requestAnimationFrame(loop)
 
-        const id = tabIdRef.current; if (!id) return
-        const el = hostRef.current; if (!el) return
+    const id = tabIdRef.current
+    if (!id) return
 
-        const b = el.getBoundingClientRect()
-        const rect: Rect = {
-          x: Math.floor(b.left),
-          y: Math.floor(b.top),
-          width: Math.ceil(b.width),
-          height: Math.ceil(b.height),
-        }
+    const shapeRecord = editor.getShape<BrowserShape>(shape.id)
+    if (!shapeRecord || shapeRecord.type !== 'browser-shape') return
 
-        if (!shown) {
-          shown = true
-          void api.show({ tabId: id, rect })
-          lastRect = rect
-        } else if (
-          rect.x !== lastRect.x ||
-          rect.y !== lastRect.y ||
-          rect.width !== lastRect.width ||
-          rect.height !== lastRect.height
-        ) {
-          void api.setBounds({ tabId: id, rect })
-          lastRect = rect
-        }
+    const pagePos = { x: shapeRecord.x, y: shapeRecord.y }
+    const screenPos = editor.pageToScreen(pagePos)
+    const zoom = editor.getZoomLevel()
 
-        // Push canvas zoom; overlay scales by its internal base (e.g. 0.8)
-        const factor = editor.getZoomLevel()
-        if (!Number.isFinite(lastFactor) || Math.abs(factor - lastFactor) > 1e-3) {
-          void api.setZoom({ tabId: id, factor })
-          lastFactor = factor
-        }
+    const rect: Rect = {
+      x: screenPos.x,
+      y: screenPos.y + (NAV_BAR_HEIGHT * zoom),
+      width: shapeRecord.props.w * zoom,
+      height: (shapeRecord.props.h - NAV_BAR_HEIGHT) * zoom,
+    }
+
+    const rectChanged: boolean = rect.x !== lastRect.x || rect.y !== lastRect.y || 
+                                rect.width !== lastRect.width || rect.height !== lastRect.height
+
+    if (!shown) {
+      shown = true
+      void api.show({ tabId: id, rect })
+      void api.setZoom({ tabId: id, factor: zoom })
+      lastRect = rect
+      lastFactor = zoom
+    } else if (rectChanged) {
+      void api.setBounds({ tabId: id, rect })
+      lastRect = rect
+    } else {
+      if (Math.abs(zoom - lastFactor) > 0.01) {
+        void api.setZoom({ tabId: id, factor: zoom })
+        lastFactor = zoom
       }
+    }
+  }
 
-      raf = requestAnimationFrame(loop)
-      return () => cancelAnimationFrame(raf)
-    }, [api, editor])
+  raf = requestAnimationFrame(loop)
+  return (): void => cancelAnimationFrame(raf)
+}, [api, editor, shape.id])
 
 // 5. Cleanup (keep as-is)
 useEffect(() => {
