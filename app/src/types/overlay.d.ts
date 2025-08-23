@@ -26,30 +26,22 @@ export type CaptureResult =
   | { ok: true; dataUrl: string }
   | { ok: false; error: string }
 
-
 // --- Payloads
-export interface CreateTabPayload {
-  url?: string
+export interface CreateTabPayload { url?: string }
+export interface TabIdPayload { tabId: string }
+export interface BoundsPayload { tabId: string; rect: Rect } // screen-space rect
+export interface ZoomPayload { tabId: string; factor: number } // TLDraw zoom (1 = 100%)
+export interface NavigatePayload { tabId: string; url: string }
+
+// --- Popup contracts (NEW)
+export interface PopupRequestPayload {
+  eventId: string
+  openerTabId: string
+  url: string
 }
 
-export interface TabIdPayload {
-  tabId: string
-}
-
-export interface BoundsPayload {
-  tabId: string
-  /** screen-space rect for the WebContentsView */
-  rect: Rect
-}
-
-export interface ZoomPayload {
-  tabId: string
-  /** TLDraw zoom factor (1 = 100%) */
-  factor: number
-}
-
-export interface NavigatePayload {
-  tabId: string
+export interface PopupAckPayload {
+  openerTabId: string
   url: string
 }
 
@@ -66,8 +58,15 @@ export interface OverlayAPI {
   // focus / capture (optional)
   focus(payload?: Partial<TabIdPayload>): Promise<void>
   blur(): Promise<void>
+
+  // events
   onUrlUpdate(callback: (data: { tabId: string; url?: string }) => void): () => void
 
+  /** Emits when main wants the renderer to create a BrowserShape. */
+  onPopupRequest(callback: (data: PopupRequestPayload) => void): () => void
+
+  /** Renderer ACK that it materialized the shape for {openerTabId,url}. */
+  popupAck(payload: PopupAckPayload): Promise<void>
 
   // navigation
   navigate(payload: NavigatePayload): Promise<SimpleResult>
@@ -75,5 +74,4 @@ export interface OverlayAPI {
   goForward(payload: TabIdPayload): Promise<SimpleResult>
   reload(payload: TabIdPayload): Promise<SimpleResult>
   getNavigationState(payload: TabIdPayload): Promise<NavigationStateResult>
-
 }

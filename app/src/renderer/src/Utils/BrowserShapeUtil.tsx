@@ -17,7 +17,7 @@ export type BrowserShape = TLBaseShape<
 >
 
 const DRAG_GUTTER = 14 // outside drag gutters
-const MIN_W = 1000
+const MIN_W = 300
 const MIN_H = 525 + NAV_BAR_HEIGHT + DRAG_GUTTER * 2
 
 type Rect = { x: number; y: number; width: number; height: number }

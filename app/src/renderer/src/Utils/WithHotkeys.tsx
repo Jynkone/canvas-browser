@@ -64,5 +64,46 @@ export default function WithHotkeys({ BROWSER_W, BROWSER_H, editorRef }: WithHot
     return () => window.removeEventListener('keydown', onKeyDown, opts)
   }, [BROWSER_W, BROWSER_H, editorRef])
 
+useEffect(() => {
+  if (!window.overlay?.onPopupRequest) return
+
+  const off = window.overlay.onPopupRequest(({ url }: { url: string; parentTabId: string }) => {
+    const editor = editorRef.current
+    if (!editor) return
+
+    // Try to use the currently selected browser-shape as opener
+    const selected = editor
+      .getSelectedShapes()
+      .find((s): s is BrowserShape => s.type === 'browser-shape')
+
+    const GAP = 16
+    const w = BROWSER_W
+    const h = BROWSER_H
+
+    let x: number
+    let y: number
+
+    if (selected) {
+      // place to the right of the selected shape
+      x = selected.x + selected.props.w + GAP
+      y = selected.y
+    } else {
+      // fallback: near viewport center
+      const c = editor.screenToPage({ x: window.innerWidth / 2, y: window.innerHeight / 2 })
+      x = c.x - w / 2 + 24
+      y = c.y - h / 2 + 24
+    }
+
+    editor.createShape<BrowserShape>({
+      type: 'browser-shape',
+      x,
+      y,
+      props: { w, h, url, tabId: '' },
+    })
+  })
+
+  return off
+}, [BROWSER_W, BROWSER_H, editorRef])
+
   return null
 }

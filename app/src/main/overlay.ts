@@ -1,4 +1,4 @@
-import { BrowserWindow, WebContentsView, ipcMain } from 'electron'
+import { BrowserWindow, WebContentsView, ipcMain, Menu  } from 'electron'
 import type { Debugger as ElectronDebugger, Input } from 'electron'
 import { writeFileSync, readFileSync, existsSync } from 'fs'
 import { join } from 'path'
@@ -29,6 +29,7 @@ const CHROME_MIN = 0.25
 const CHROME_MAX = 5
 const ZOOM_RATIO = 1
 const MAX_VIEWS = 32
+
 
 const clamp = (n: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, n))
 
@@ -67,6 +68,9 @@ if (existsSync(STATE_FILE)) {
     console.error('[overlay] Failed to read browser state:', e)
   }
 }
+
+
+
 
 // Safe writer with debounce
 let writeTimer: NodeJS.Timeout | null = null
@@ -159,19 +163,6 @@ async reapply(state: ViewState) {
       } catch {}
     },
 
-    safeDestroy(state: ViewState) {
-      try { void S.clearEmuIfAny(state.view) } catch {}
-      try { state.view.webContents.stop() } catch {}
-      try { state.view.webContents.setAudioMuted(true) } catch {}
-      try {
-        const win = getWindow()
-        if (win && !win.isDestroyed()) {
-          win.contentView.removeChildView(state.view)
-          state.attached = false
-        }
-      } catch {}
-      try { (state.view.webContents as { destroy?: () => void }).destroy?.() } catch {}
-    },
 
     roundRect(rect: Rect) {
       const x = Math.floor(rect.x), y = Math.floor(rect.y)
@@ -205,6 +196,161 @@ async reapply(state: ViewState) {
       runQ()
     })
   }
+  
+
+function hasPopupFeatures(features: string): boolean {
+  if (!features || typeof features !== 'string') return false
+  
+  const f = features.toLowerCase()
+  return f.includes('width=') || 
+         f.includes('height=') ||
+         f.includes('menubar=no') ||
+         f.includes('toolbar=no') ||
+         f.includes('location=no') ||
+         f.includes('status=no') ||
+         f.includes('scrollbars=no') ||
+         f.includes('resizable=no')
+}
+
+function shouldStayAsPopup(url: string, features: string): boolean {
+  if (!url || typeof url !== 'string') return true // Safe fallback
+  
+  try {
+    const urlLower = url.toLowerCase()
+    
+    // Auth/OAuth/Payment domains - comprehensive list
+    const authDomains = [
+      'accounts.google.com',
+      'login.microsoftonline.com',
+      'github.com/login',
+      'api.github.com',
+      'facebook.com/dialog',
+      'www.facebook.com/dialog',
+      'twitter.com/oauth',
+      'api.twitter.com/oauth',
+      'linkedin.com/oauth',
+      'discord.com/oauth2',
+      'slack.com/oauth',
+      'paypal.com',
+      'www.paypal.com',
+      'checkout.stripe.com',
+      'js.stripe.com',
+      'checkout.com',
+      'square.com',
+      'braintreepayments.com'
+    ]
+    
+    // Auth URL patterns
+    const authPatterns = [
+      '/oauth/',
+      '/oauth2/',
+      '/auth/',
+      '/login/oauth/',
+      '/api/auth/',
+      '/sso/',
+      '/saml/',
+      'oauth2/authorize',
+      'oauth/authorize',
+      '/signin-',
+      '/login?',
+      '/authenticate'
+    ]
+    
+    // Check exact domain matches
+    const parsedUrl = new URL(url)
+    if (authDomains.includes(parsedUrl.hostname)) return true
+    
+    // Check auth patterns in URL
+    if (authPatterns.some(pattern => urlLower.includes(pattern))) return true
+    
+    // Check query parameters that indicate auth
+    if (parsedUrl.searchParams.has('client_id') || 
+        parsedUrl.searchParams.has('oauth') ||
+        parsedUrl.searchParams.has('auth') ||
+        parsedUrl.searchParams.has('response_type') ||
+        parsedUrl.searchParams.has('scope')) return true
+    
+    // Small window size suggests legitimate popup
+    if (features && typeof features === 'string') {
+      const widthMatch = features.match(/width=(\d+)/)
+      const heightMatch = features.match(/height=(\d+)/)
+      
+      if (widthMatch && heightMatch) {
+        const width = parseInt(widthMatch[1])
+        const height = parseInt(heightMatch[1])
+        
+        // Very small windows are likely auth popups
+        if (width < 600 && height < 600) return true
+        
+        // Tiny windows are definitely popups
+        if (width < 400 || height < 400) return true
+      }
+    }
+    
+    return false
+  } catch (error) {
+    console.warn('[popup-detection] Error parsing URL:', url, error)
+    return true // Safe fallback - keep as popup if we can't parse
+  }
+}
+
+
+type PopupKey = `${string}|${string}`; // `${openerTabId}|${url}`
+
+enum PopupState {
+  None = 0,
+  Requested = 1,     // main sent event to renderer
+  Materialized = 2,  // renderer confirmed it created a shape
+}
+
+const popupStates = new Map<PopupKey, PopupState>();
+
+function pk(openerTabId: string, url: string): PopupKey {
+  return `${openerTabId}|${url}`;
+}
+
+/** First time? lock & return true; already seen? return false. */
+function tryRequest(openerTabId: string, url: string): boolean {
+  const k = pk(openerTabId, url);
+  const st = popupStates.get(k) ?? PopupState.None;
+  if (st !== PopupState.None) return false;
+  popupStates.set(k, PopupState.Requested);
+  return true;
+}
+
+/** Renderer says the BrowserShape now exists for this pair. */
+function markMaterialized(openerTabId: string, url: string): void {
+  popupStates.set(pk(openerTabId, url), PopupState.Materialized);
+}
+
+/** Forget all locks for a given opener tab (call on destroy). */
+function clearForOpener(openerTabId: string): void {
+  for (const k of popupStates.keys()) {
+    if (k.startsWith(`${openerTabId}|`)) popupStates.delete(k);
+  }
+}
+
+/** Emit one popup event to the renderer. */
+function emitCanvasPopup(openerTabId: string, url: string): void {
+  const win = getWindow();
+  const eventId = `${openerTabId}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
+  win?.webContents.send('overlay-popup-request', {
+    eventId,
+    url,
+    parentTabId: openerTabId, // ← match preload contract
+  } as { eventId: string; url: string; parentTabId: string })
+;
+}
+
+function openFromContextMenu(openerTabId: string, url: string): void {
+  if (!tryRequest(openerTabId, url)) {
+    console.log('[context-open] 🔁 Suppressed duplicate (sticky)')
+    return
+  }
+  console.log('[context-open] 🎯 Emitting canvas popup (sticky)')
+  emitCanvasPopup(openerTabId, url)
+}
+
 
   // -------------------- IPC handlers ---------------------------------------
   ipcMain.handle('overlay:create-tab', async (_e, payload?: { url?: string; shapeId?: string }): Promise<CreateTabResponse> => {
@@ -242,6 +388,8 @@ async reapply(state: ViewState) {
             devTools: true,
             contextIsolation: true,
             nodeIntegration: false,
+            webSecurity: true,
+            allowRunningInsecureContent: false,
             backgroundThrottling: true,
           },
         })
@@ -270,6 +418,7 @@ async reapply(state: ViewState) {
           browserState[tabId] = { currentUrl, lastInteraction: Date.now() }
           flushBrowserState()
         })
+        view.webContents.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
 
         view.webContents.on('did-navigate-in-page', () => {
           if (!state) return
@@ -313,6 +462,189 @@ async reapply(state: ViewState) {
           } catch {}
         })
 
+        // ADD THIS AFTER THE EXISTING EVENT LISTENERS
+view.webContents.setWindowOpenHandler((details) => {
+  const { url, features, disposition, referrer } = details
+
+  console.log('[popup-detection]', {
+    url,
+    features,
+    disposition,
+    referrer: referrer?.url ?? 'none',
+    timestamp: new Date().toISOString(),
+  })
+
+  try {
+    const isNewWindow = disposition === 'new-window' || disposition === 'foreground-tab'
+    const hasFeatures = hasPopupFeatures(features)
+
+    if (isNewWindow || hasFeatures) {
+      const shouldStay = shouldStayAsPopup(url, features)
+      if (shouldStay) {
+        console.log('[popup-detection] ✅ Allowing OS popup')
+        return { action: 'allow' }
+      }
+
+      const openerTabId = tabId // must be the current tab's id in this scope
+      if (!tryRequest(openerTabId, url)) {
+        console.log('[popup-detection] 🔁 Suppressed duplicate (sticky)')
+        return { action: 'deny' }
+      }
+
+      console.log('[popup-detection] 🎯 Emitting canvas popup (sticky)')
+      emitCanvasPopup(openerTabId, url)
+      return { action: 'deny' }
+    }
+
+    console.log('[popup-detection] ➡️ Normal navigation')
+    return { action: 'allow' }
+  } catch (error) {
+    console.error('[popup-detection] Handler error:', error)
+    return { action: 'allow' }
+  }
+})
+
+view.webContents.on('context-menu', (_event, params) => {
+  const { linkURL, hasImageContents, isEditable, selectionText, pageURL } = params
+
+  const menuItems: Array<
+    | { label: string; click: () => void; enabled?: boolean }
+    | { type: 'separator' }
+  > = []
+
+  // Link context menu
+  if (linkURL) {
+    menuItems.push(
+      {
+        label: 'Open Link in New Canvas Shape',
+        click: () => {
+          console.log('[context-menu] Opening link in canvas shape:', linkURL)
+          openFromContextMenu(tabId, linkURL)
+        },
+      },
+      {
+        label: 'Open Link in New Popup',
+        click: () => {
+          console.log('[context-menu] Opening link in popup:', linkURL)
+          require('electron').shell.openExternal(linkURL)
+        },
+      },
+      {
+        label: 'Copy Link Address',
+        click: () => {
+          require('electron').clipboard.writeText(linkURL)
+        },
+      },
+      { type: 'separator' },
+    )
+  }
+
+  // Image context menu
+  if (hasImageContents) {
+    menuItems.push(
+      {
+        label: 'Copy Image',
+        click: () => {
+          view.webContents.copyImageAt(params.x, params.y)
+        },
+      },
+      {
+        label: 'Save Image As...',
+        click: () => {
+          view.webContents.downloadURL(params.srcURL)
+        },
+      },
+      { type: 'separator' },
+    )
+  }
+
+  // Text selection context menu
+  if (selectionText) {
+    const shortText =
+      selectionText.length > 20 ? `${selectionText.substring(0, 20)}...` : selectionText
+
+    menuItems.push(
+      {
+        label: 'Copy',
+        click: () => {
+          view.webContents.copy()
+        },
+      },
+      {
+        label: `Search "${shortText}"`,
+        click: () => {
+          const url = `https://www.google.com/search?q=${encodeURIComponent(selectionText)}`
+          openFromContextMenu(tabId, url) // <- define & use inside handler
+        },
+      },
+      { type: 'separator' },
+    )
+  }
+
+  // Editable context menu
+  if (isEditable) {
+    menuItems.push(
+      {
+        label: 'Cut',
+        click: () => view.webContents.cut(),
+        enabled: !!selectionText,
+      },
+      {
+        label: 'Copy',
+        click: () => view.webContents.copy(),
+        enabled: !!selectionText,
+      },
+      {
+        label: 'Paste',
+        click: () => view.webContents.paste(),
+      },
+      { type: 'separator' },
+    )
+  }
+
+  // Page context menu
+  menuItems.push(
+    {
+      label: 'Back',
+      click: () => {
+        if (view.webContents.navigationHistory.canGoBack()) {
+          view.webContents.navigationHistory.goBack()
+        }
+      },
+      enabled: view.webContents.navigationHistory.canGoBack(),
+    },
+    {
+      label: 'Forward',
+      click: () => {
+        if (view.webContents.navigationHistory.canGoForward()) {
+          view.webContents.navigationHistory.goForward()
+        }
+      },
+      enabled: view.webContents.navigationHistory.canGoForward(),
+    },
+    {
+      label: 'Reload',
+      click: () => view.webContents.reload(),
+    },
+    { type: 'separator' },
+    {
+      label: 'Inspect Element',
+      click: () => {
+        view.webContents.inspectElement(params.x, params.y)
+      },
+    },
+    { type: 'separator' },
+    {
+      label: 'Copy Page URL',
+      click: () => {
+        require('electron').clipboard.writeText(pageURL)
+      },
+    },
+  )
+
+  Menu.buildFromTemplate(menuItems as any).popup({ window: getWindow()! })
+})
+
         await S.reapply(state)
         try { await view.webContents.loadURL(savedUrl) } catch {}
 
@@ -326,6 +658,15 @@ async reapply(state: ViewState) {
       }
     })
   })
+
+ipcMain.handle(
+  'overlay:popup-ack',
+  (_e, { openerTabId, url }: { openerTabId: string; url: string }): void => {
+    markMaterialized(openerTabId, url)
+  }
+)
+
+
 
   ipcMain.handle('overlay:get-zoom', async (): Promise<number> => canvasZoom)
 
@@ -377,48 +718,153 @@ async reapply(state: ViewState) {
     }
   })
 
-  ipcMain.handle('overlay:destroy', async (_e, { tabId }: { tabId: string }): Promise<void> => {
-    const entry = S.resolve(tabId)
-    const state = entry.state
-    try {
-      if (state) {
-        try { S.safeDestroy(state) } catch (err) {
-          console.warn(`[overlay] SafeDestroy failed for ${tabId}:`, err)
-        }
-      }
-      views.delete(tabId)
-      delete browserState[tabId]
-      flushBrowserState()
-    } catch (err) {
-      console.error(`[overlay] Destroy handler error for ${tabId}:`, err)
-      try {
-        views.delete(tabId)
-        delete browserState[tabId]
-      } catch {}
-    }
-  })
-
-  ipcMain.handle('overlay:focus', async (_e, p?: { tabId?: string }): Promise<void> => {
-    const { state } = S.resolve(p?.tabId ?? null)
-    if (state) {
-      try { state.view.webContents.focus() } catch {}
-    }
-  })
-
-  ipcMain.handle('overlay:blur', async (): Promise<void> => {
-    const win = getWindow()
-    if (win) try { win.webContents.focus() } catch {}
-  })
-
-  ipcMain.handle('overlay:navigate', async (_e, { tabId, url }: { tabId: string; url: string }): Promise<SimpleResponse> => {
+  ipcMain.handle(
+  'overlay:navigate',
+  async (_e, { tabId, url }: { tabId: string; url: string }): Promise<SimpleResponse> => {
     const { state } = S.resolve(tabId)
     if (!state) return { ok: false, error: 'No view' }
+
+    // Normalize input (accepts bare hostnames)
+    const raw = url.trim()
+    const target =
+      raw.startsWith('http://') || raw.startsWith('https://') ? raw : `https://${raw}`
+
     try {
-      const u = url.trim()
-      await state.view.webContents.loadURL(u.startsWith('http') ? u : `https://${u}`)
+      await state.view.webContents.loadURL(target)
+
+      // Refresh nav state & persist (uses your existing helpers/structures)
+      S.updateNav(state)
+      browserState[tabId] = {
+        ...(browserState[tabId] ?? {}),
+        currentUrl: state.view.webContents.getURL(),
+        lastInteraction: Date.now(),
+      }
+      flushBrowserState()
+
       return { ok: true }
-    } catch { return { ok: false, error: 'Navigate failed' } }
-  })
+    } catch {
+      return { ok: false, error: 'Navigate failed' }
+    }
+  }
+)
+
+
+
+ipcMain.handle('overlay:destroy', async (_e, { tabId }: { tabId: string }): Promise<void> => {
+  const { state } = S.resolve(tabId)
+  if (!state) return
+
+  console.log(`[overlay] Starting destroy for tabId: ${tabId}`)
+
+  const win = getWindow()
+  const view = state.view
+  const wc = view.webContents
+
+  // Step 1: Remove from our tracking immediately to prevent further operations
+  views.delete(tabId)
+  delete browserState[tabId]
+  clearForOpener?.(tabId)
+
+  // Step 2: Stop all web activity immediately
+  try {
+    if (!wc.isDestroyed()) {
+      wc.stop()
+      wc.setAudioMuted(true)
+    }
+  } catch (e) {
+    console.warn(`[overlay] Error stopping webcontents for ${tabId}:`, e)
+  }
+
+  // Step 3: Detach from parent window first (critical)
+  try {
+    if (win && !win.isDestroyed() && state.attached) {
+      S.detach(win, state)
+    }
+  } catch (e) {
+    console.warn(`[overlay] Error detaching view for ${tabId}:`, e)
+  }
+
+  // Step 4: Clean up debugger and dev tools
+  try {
+    if (!wc.isDestroyed()) {
+      if (wc.isDevToolsOpened()) {
+        wc.closeDevTools()
+      }
+      if (wc.debugger.isAttached()) {
+        wc.debugger.detach()
+      }
+    }
+  } catch (e) {
+    console.warn(`[overlay] Error cleaning up debugger for ${tabId}:`, e)
+  }
+
+  // Step 5: Remove all event listeners to prevent memory leaks
+  try {
+    if (!wc.isDestroyed()) {
+      wc.removeAllListeners()
+    }
+  } catch (e) {
+    console.warn(`[overlay] Error removing listeners for ${tabId}:`, e)
+  }
+
+  // Step 6: Proper WebContents cleanup sequence
+  if (!wc.isDestroyed()) {
+    try {
+      // First try the documented close() method
+      await new Promise<void>((resolve) => {
+        let isResolved = false
+
+        const cleanup = () => {
+          if (isResolved) return
+          isResolved = true
+          
+          try {
+            wc.off('destroyed', onDestroyed)
+          } catch {}
+          
+          resolve()
+        }
+
+        // Listen for the destroyed event
+        const onDestroyed = () => {
+          console.log(`[overlay] WebContents destroyed for ${tabId}`)
+          cleanup()
+        }
+        
+        wc.once('destroyed', onDestroyed)
+
+        // Try close first (recommended approach)
+        try {
+          wc.close()
+          console.log(`[overlay] Called close() for ${tabId}`)
+        } catch (closeError) {
+          console.warn(`[overlay] Close failed for ${tabId}, trying destroy:`, closeError)
+          // Fallback to destroy if close fails
+          try {
+            (wc as any).destroy()
+            console.log(`[overlay] Called destroy() for ${tabId}`)
+          } catch (destroyError) {
+            console.error(`[overlay] Both close() and destroy() failed for ${tabId}:`, destroyError)
+            cleanup()
+          }
+        }
+      })
+    } catch (e) {
+      console.error(`[overlay] Error in cleanup sequence for ${tabId}:`, e)
+    }
+  }
+
+  // Step 7: Flush state to disk
+  try {
+    flushBrowserState()
+  } catch (e) {
+    console.warn(`[overlay] Error flushing browser state:`, e)
+  }
+
+  console.log(`[overlay] Destroy completed for tabId: ${tabId}`)
+})
+
+
 
   ipcMain.handle('overlay:go-back', async (_e, { tabId }: { tabId: string }): Promise<SimpleResponse> => {
     const { state } = S.resolve(tabId)
