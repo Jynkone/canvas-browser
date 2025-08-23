@@ -129,6 +129,7 @@ useEffect(() => {
     const pagePos = { x: shapeRecord.x, y: shapeRecord.y }
     const screenPos = editor.pageToScreen(pagePos)
     const zoom = editor.getZoomLevel()
+    const shapeSize = { w: shapeRecord.props.w, h: shapeRecord.props.h }
 
     const rect: Rect = {
       x: screenPos.x,
@@ -137,22 +138,34 @@ useEffect(() => {
       height: (shapeRecord.props.h - NAV_BAR_HEIGHT) * zoom,
     }
 
-    const rectChanged: boolean = rect.x !== lastRect.x || rect.y !== lastRect.y || 
-                                rect.width !== lastRect.width || rect.height !== lastRect.height
-
     if (!shown) {
       shown = true
-      void api.show({ tabId: id, rect })
-      void api.setZoom({ tabId: id, factor: zoom })
+      void api.show({ tabId: id, rect, shapeSize })
+
+      // CHANGE #1: bounds first, then zoom (so emu uses these bounds)
+void api.setBounds({ tabId: id, rect, shapeSize })
+void api.setZoom({ tabId: id, factor: zoom })
+
       lastRect = rect
       lastFactor = zoom
-    } else if (rectChanged) {
-      void api.setBounds({ tabId: id, rect })
-      lastRect = rect
     } else {
-      if (Math.abs(zoom - lastFactor) > 0.01) {
-        void api.setZoom({ tabId: id, factor: zoom })
+      const positionChanged = rect.x !== lastRect.x || rect.y !== lastRect.y
+      const sizeChanged = rect.width !== lastRect.width || rect.height !== lastRect.height
+      const zoomChanged = Math.abs(zoom - lastFactor) > 0.01
+
+      // Handle bounds changes (move/resize that are not zoom-caused)
+      if (positionChanged || (sizeChanged && !zoomChanged)) {
+        void api.setBounds({ tabId: id, rect, shapeSize })
+        lastRect = rect
+      }
+
+      // CHANGE #2: on zoom change, send bounds first, then zoom
+      if (zoomChanged) {
+void api.setBounds({ tabId: id, rect, shapeSize })
+void api.setZoom({ tabId: id, factor: zoom })
+
         lastFactor = zoom
+        lastRect = rect
       }
     }
   }

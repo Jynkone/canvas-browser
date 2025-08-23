@@ -85,6 +85,7 @@ function createWindow(): void {
       contextIsolation: true,
     },
   })
+    //mainWindow.webContents.openDevTools({ mode: 'detach' })
 
   setupOverlayIPC(() => mainWindow)
   ipcMain.on('request-high-performance', (_evt, enable: boolean) => {

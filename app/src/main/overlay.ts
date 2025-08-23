@@ -10,6 +10,10 @@ type ViewState = {
   attached: boolean
   lastBounds: { x: number; y: number; w: number; h: number }
   lastAppliedZoom?: number
+  lastAppliedZoomKey?: ZoomBucket
+  lastAppliedEmu?: { w: number; h: number }
+  pendingBucket?: ZoomBucket | null
+  emuTimer?: ReturnType<typeof setTimeout> | null
   navState: {
     currentUrl: string
     canGoBack: boolean
@@ -24,12 +28,10 @@ type CreateTabResponse = Ok<{ tabId: string }> | Err
 type SimpleResponse = Ok | Err
 type GetNavStateResponse = (Ok & ViewState['navState'] & { isLoading: boolean }) | Err
 
-// ---- Zoom config -----------------------------------------------------------
 const CHROME_MIN = 0.25
 const CHROME_MAX = 5
 const ZOOM_RATIO = 1
 const MAX_VIEWS = 32
-
 
 const clamp = (n: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, n))
 
@@ -71,8 +73,6 @@ if (existsSync(STATE_FILE)) {
 
 
 
-
-// Safe writer with debounce
 let writeTimer: NodeJS.Timeout | null = null
 function flushBrowserState(): void {
   if (writeTimer) clearTimeout(writeTimer)
@@ -84,6 +84,19 @@ function flushBrowserState(): void {
     }
   }, 100)
 }
+
+type ZoomBucket = 5 | 10 | 15 | 20
+const EPS = 1e-6
+
+function effToBucketKey(eff: number): ZoomBucket {
+  const pct = eff * 100
+  const floor5 = Math.floor((pct + EPS) / 5) * 5   // [5,10) => 5, [10,15) => 10, etc.
+  const clamped = Math.max(5, Math.min(20, floor5)) // 5..20 only; 25 handled by native
+  return clamped as ZoomBucket
+}
+
+
+
 
 export function setupOverlayIPC(getWindow: () => BrowserWindow | null): void {
   const views = new Map<string, ViewState>()
@@ -117,35 +130,95 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null): void {
       } catch {}
     },
 
-    async setEff(view: WebContentsView, eff: number) {
-      if (eff >= CHROME_MIN) {
-        try { await view.webContents.setZoomFactor(eff) } catch {}
-        await S.clearEmuIfAny(view)
-        return
-      }
-      try { await view.webContents.setZoomFactor(CHROME_MIN) } catch {}
-      let b: { width: number; height: number }
-      try { b = view.getBounds() } catch { return }
-      if (!S.hasRealBounds(b)) return
-      try {
-        const dbg: ElectronDebugger = view.webContents.debugger
-        if (!dbg.isAttached()) dbg.attach('1.3')
-        const scale = Math.max(0.05, Math.min(1, eff / CHROME_MIN))
-        const emuW = Math.max(1, Math.floor(b.width / scale))
-        const emuH = Math.max(1, Math.floor(b.height / scale))
-        await dbg.sendCommand('Emulation.setDeviceMetricsOverride', {
-          width: emuW, height: emuH, deviceScaleFactor: 0, scale,
-          mobile: false, screenWidth: emuW, screenHeight: emuH,
-          positionX: 0, positionY: 0, dontSetVisibleSize: false,
-        })
-      } catch {}
-    },
+scheduleEmu(state: ViewState) {
+  if (state.emuTimer) return
+  state.emuTimer = setTimeout(() => {
+    state.emuTimer = null
+    const bucket = state.pendingBucket
+    if (bucket == null) return
+    state.pendingBucket = null
+    // One single apply for this step, using the latest bounds
+    S.setEff(state.view, bucket / 100, state)
+    state.lastAppliedZoom = bucket / 100
+  }, 0)
+},
 
 
-async reapply(state: ViewState) {
+// add force?: boolean
+setEff(view: WebContentsView, eff: number, state?: ViewState) {
+  // Native (>= 25%): clear emulation once and use Chrome zoom
+  if (eff >= CHROME_MIN) {
+    if (state?.lastAppliedZoomKey !== undefined) {
+      try { S.clearEmuIfAny(view) } catch {}
+      state.lastAppliedZoomKey = undefined
+      if (state) state.lastAppliedEmu = undefined
+    }
+    try { view.webContents.setZoomFactor(eff) } catch {}
+    return
+  }
+
+  // ---- Emulation path (< 25%): exact 5 / 15 / 20 only ----
+  const bucket = effToBucketKey(eff) // 5 | 15 | 20
+
+  // Current view bounds
+  let b: { width: number; height: number }
+  try { b = view.getBounds() } catch { return }
+  if (b.width <= 0 || b.height <= 0) return
+
+  // Compute emu dims using the *bottom of the bucket* so it still fits at 5/15/20
+  const bucketEff = bucket / 100                // 0.05, 0.15, 0.20
+  const currentEff = Math.max(0.001, Math.min(eff, CHROME_MIN)) // defensive clamp
+  const shrinkToBottom = Math.min(1, bucketEff / currentEff)    // <= 1
+
+  // Future minimal bounds at the bottom of this bucket
+  const targetW = Math.max(1, Math.floor(b.width  * shrinkToBottom))
+  const targetH = Math.max(1, Math.floor(b.height * shrinkToBottom))
+
+  // Emulation scale to achieve bucketEff while Chrome is held at CHROME_MIN
+  const scale = bucketEff / CHROME_MIN          // e.g. 0.05 / 0.25 = 0.20 at 5%
+
+  // FLOOR so rendered content never exceeds (future) bounds — 5% always fits
+  const emuW = Math.max(1, Math.floor(targetW / scale))
+  const emuH = Math.max(1, Math.floor(targetH / scale))
+
+  // Skip if nothing changes (same bucket AND same emu dims)
+  const sameBucket = state?.lastAppliedZoomKey === bucket
+  const sameDims = state?.lastAppliedEmu?.w === emuW && state?.lastAppliedEmu?.h === emuH
+  if (sameBucket && sameDims) return
+
+  // Hold Chrome at its minimum native zoom while emulating below it
+  try { view.webContents.setZoomFactor(CHROME_MIN) } catch {}
+
+  try {
+    const dbg: ElectronDebugger = view.webContents.debugger
+    if (!dbg.isAttached()) dbg.attach('1.3')
+
+    void dbg.sendCommand('Emulation.setDeviceMetricsOverride', {
+      width: emuW,
+      height: emuH,
+      // Use 1 for determinism (0 = auto DPR, can cause “shifts” on HiDPI)
+      deviceScaleFactor: 1,
+      scale,
+      mobile: false,
+      screenWidth:  emuW,
+      screenHeight: emuH,
+      positionX: 0,
+      positionY: 0,
+      dontSetVisibleSize: false,
+    })
+
+    if (state) {
+      state.lastAppliedZoomKey = bucket
+      state.lastAppliedEmu = { w: emuW, h: emuH }
+    }
+  } catch {}
+},
+
+
+reapply(state: ViewState) {
   try {
     const eff = S.currentEff()
-    void S.setEff(state.view, eff)
+    void S.setEff(state.view, eff, state)
     state.lastAppliedZoom = eff
   } catch {}
 },
@@ -362,7 +435,7 @@ function openFromContextMenu(openerTabId: string, url: string): void {
       await initializeStartupRestore()
     }
 
-    return enqueue(async () => {
+    return enqueue<Ok<{ tabId: string }>>(async () => {
       const tabId = payload?.shapeId!
       let savedUrl = payload?.url || 'https://google.com/'
       let delayMs = 0
@@ -386,6 +459,7 @@ function openFromContextMenu(openerTabId: string, url: string): void {
         const view = new WebContentsView({
           webPreferences: {
             devTools: true,
+            spellcheck: true,
             contextIsolation: true,
             nodeIntegration: false,
             webSecurity: true,
@@ -511,6 +585,26 @@ view.webContents.on('context-menu', (_event, params) => {
     | { label: string; click: () => void; enabled?: boolean }
     | { type: 'separator' }
   > = []
+
+    if (params.dictionarySuggestions && params.dictionarySuggestions.length > 0) {
+    for (const suggestion of params.dictionarySuggestions) {
+      menuItems.push({
+        label: suggestion,
+        click: () => view.webContents.replaceMisspelling(suggestion),
+      })
+    }
+    menuItems.push({ type: 'separator' })
+  }
+
+  // Add "Add to Dictionary" if word is misspelled
+  if (params.misspelledWord) {
+    menuItems.push({
+      label: 'Add to Dictionary',
+      click: () => view.webContents.session.addWordToSpellCheckerDictionary(params.misspelledWord),
+    })
+    menuItems.push({ type: 'separator' })
+  }
+
 
   // Link context menu
   if (linkURL) {
@@ -642,7 +736,9 @@ view.webContents.on('context-menu', (_event, params) => {
     },
   )
 
-  Menu.buildFromTemplate(menuItems as any).popup({ window: getWindow()! })
+  const typedMenu: Electron.MenuItemConstructorOptions[] = menuItems
+Menu.buildFromTemplate(typedMenu).popup({ window: getWindow()! })
+
 })
 
         await S.reapply(state)
@@ -680,30 +776,57 @@ ipcMain.handle(
     try { state.view.setBounds({ x, y, width: w, height: h }) } catch {}
   })
 
-  ipcMain.handle('overlay:set-bounds', async (_e, { tabId, rect }: { tabId: string; rect: Rect }): Promise<void> => {
+ipcMain.handle(
+  'overlay:set-bounds',
+  async (_e, { tabId, rect }: { tabId: string; rect: Rect }) => {
     const { state } = S.resolve(tabId)
     if (!state) return
+
     const { x, y, w, h } = S.roundRect(rect)
     const b = state.lastBounds
     if (!b || x !== b.x || y !== b.y || w !== b.w || h !== b.h) {
       state.lastBounds = { x, y, w, h }
       try { state.view.setBounds({ x, y, width: w, height: h }) } catch {}
-      if (S.currentEff() < CHROME_MIN) await S.reapply(state)
     }
-  })
+
+    // If we’re under 25% and a bucket is pending, (re)schedule the single apply
+    if (S.currentEff() < CHROME_MIN && state.pendingBucket != null) {
+      S.scheduleEmu(state)
+    }
+  }
+)
 
 
-  ipcMain.handle('overlay:set-zoom', async (_e, { tabId, factor }: { tabId?: string; factor: number }): Promise<void> => {
+ipcMain.handle(
+  'overlay:set-zoom',
+  async (_e, { tabId, factor }: { tabId?: string; factor: number }): Promise<void> => {
     canvasZoom = factor || 1
-    const target = S.currentEff()
+    const eff = S.currentEff()
+
+    const apply = (state: ViewState) => {
+      if (eff >= CHROME_MIN) {
+        // Native zoom: clear any pending emu and apply once
+        state.pendingBucket = null
+        if (state.emuTimer) { clearTimeout(state.emuTimer); state.emuTimer = null }
+        S.setEff(state.view, eff, state)
+        return
+      }
+      // Emulation path: compute bucket and coalesce
+      const bucket = effToBucketKey(eff)
+      if (state.lastAppliedZoomKey === bucket || state.pendingBucket === bucket) return
+      state.pendingBucket = bucket
+      S.scheduleEmu(state) // ← will apply once, using latest bounds
+    }
+
     if (tabId) {
       const { state } = S.resolve(tabId)
       if (!state) return
-      await S.setEff(state.view, target); state.lastAppliedZoom = target
+      apply(state)
     } else {
-      for (const [, s] of views) { await S.setEff(s.view, target); s.lastAppliedZoom = target }
+      for (const [, s] of views) apply(s)
     }
-  })
+  }
+)
 
   ipcMain.handle('overlay:hide', async (_e, p?: { tabId?: string }): Promise<void> => {
     const win = getWindow()
