@@ -1,4 +1,4 @@
-import { BrowserWindow, WebContentsView, ipcMain, Menu  } from 'electron'
+import { BrowserWindow, WebContentsView, ipcMain, Menu, desktopCapturer,dialog } from 'electron'
 import type { Debugger as ElectronDebugger, Input } from 'electron'
 import { writeFileSync, readFileSync, existsSync } from 'fs'
 import { join } from 'path'
@@ -467,6 +467,90 @@ function openFromContextMenu(openerTabId: string, url: string): void {
             backgroundThrottling: true,
           },
         })
+view.webContents.session.setPermissionRequestHandler(
+  async (_wc, permission, callback, details) => {
+    try {
+      if (permission === 'media'|| permission === 'clipboard-read') {
+        // Extend type locally to include mediaTypes
+        const mediaDetails = details as Electron.MediaAccessPermissionRequest & { mediaTypes?: string[] }
+        const which = mediaDetails.mediaTypes?.join(' & ') || 'media devices'
+
+        const res = await dialog.showMessageBox({
+          type: 'question',
+          buttons: ['Allow', 'Deny'],
+          defaultId: 1,
+          cancelId: 1,
+          message: `This site wants to access your ${which}.`,
+        })
+
+        callback(res.response === 0)
+        return
+      }
+
+      callback(false)
+    } catch (err) {
+      console.error('[overlay] Permission handler error:', err)
+      callback(false)
+    }
+  }
+)
+
+// DisplayMedia handler: only Paper + Desktop
+view.webContents.session.setDisplayMediaRequestHandler(async (_request, callback) => {
+  try {
+    const sources = await desktopCapturer.getSources({
+      types: ['screen', 'window'],
+      thumbnailSize: { width: 300, height: 200 }
+    })
+
+    // Always pick desktop source (first full screen)
+    const desktopSource = sources.find(s => s.id.startsWith('screen:'))
+
+    // Try to match your main app window (must have title = "Paper")
+    const paperSource = sources.find(s => s.name.toLowerCase().includes('paper'))
+
+    const choices: Electron.DesktopCapturerSource[] = []
+    if (desktopSource) choices.push(desktopSource)
+    if (paperSource) choices.push(paperSource)
+
+    if (choices.length === 0) {
+      callback({})
+      return
+    }
+
+    // Let user pick only between Desktop and Paper
+    const chosen = await dialog.showMessageBox({
+      type: 'info',
+      buttons: choices.map((s, i) => `${i + 1}: ${s.name}`),
+      message: 'Share your screen or the Paper app',
+      cancelId: -1,
+      noLink: true
+    })
+
+    if (chosen.response < 0) {
+      callback({})
+      return
+    }
+
+    const source = choices[chosen.response]
+
+    const payload: { video: Electron.DesktopCapturerSource; audio?: 'loopback' | 'loopbackWithMute' } = {
+      video: source
+    }
+
+    // Only allow audio for full screens on Windows
+    if (process.platform === 'win32' && source.id.startsWith('screen:')) {
+      payload.audio = 'loopback'
+    }
+
+    callback(payload)
+  } catch (err) {
+    console.error('[overlay] Screen sharing error:', err)
+    callback({})
+  }
+})
+
+
 
         try {
           view.webContents.setZoomFactor(1)

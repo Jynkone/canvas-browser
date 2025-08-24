@@ -11,6 +11,7 @@ const __dirname = dirname(__filename)
 app.commandLine.appendSwitch('force_high_performance_gpu')
 app.commandLine.appendSwitch('disable-renderer-backgrounding')
 
+
 // Single instance lock
 if (!app.requestSingleInstanceLock()) {
   app.quit()
