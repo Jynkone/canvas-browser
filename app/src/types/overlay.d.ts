@@ -27,17 +27,39 @@ export type CaptureResult =
   | { ok: false; error: string }
 
 // --- Payloads
-export interface CreateTabPayload { url?: string }
+/** Creating a tab is keyed to the TLDraw shape.id you pass in. */
+export interface CreateTabPayload {
+  /** Optional initial URL to load. */
+  url?: string
+  /** REQUIRED: the TLDraw BrowserShape's id (tldraw-style, e.g. "shape:..."). */
+  shapeId: string
+}
+
 export interface TabIdPayload { tabId: string }
-export interface BoundsPayload { tabId: string; rect: Rect } // screen-space rect
-export interface ZoomPayload { tabId: string; factor: number } // TLDraw zoom (1 = 100%)
+
+/** Screen-space rect for the WebContentsView; optional shapeSize for main’s heuristics. */
+export interface BoundsPayload {
+  tabId: string
+  rect: Rect
+  /** Optional logical size of the TL shape (helps main with zoom/fit choices). */
+  shapeSize?: { w: number; h: number }
+}
+
+/** TLDraw zoom (1 = 100%). If omitted, applies globally (supported by main). */
+export interface ZoomPayload {
+  tabId?: string
+  factor: number
+}
+
 export interface NavigatePayload { tabId: string; url: string }
 
-// --- Popup contracts (NEW)
+// --- Popup contracts
 export interface PopupRequestPayload {
   eventId: string
-  openerTabId: string
   url: string
+  /** Some code paths emit openerTabId; others emit parentTabId. Support both. */
+  openerTabId?: string
+  parentTabId?: string
 }
 
 export type OverlayNotice =
@@ -48,16 +70,17 @@ export type OverlayNotice =
   | { kind: 'screen-share-error'; message: string }
   | { kind: 'media-denied'; which: string }
 
-
 export interface PopupAckPayload {
   openerTabId: string
   url: string
+  /** The newly created BrowserShape id (TLShapeId) in the renderer, if available. */
+  childTabId?: string
 }
 
 // --- API surface
 export interface OverlayAPI {
   // lifecycle / placement
-  createTab(payload?: CreateTabPayload): Promise<TabResult>
+  createTab(payload: CreateTabPayload): Promise<TabResult>
   show(payload: BoundsPayload | TabIdPayload): Promise<void>
   hide(payload: TabIdPayload): Promise<void>
   destroy(payload: TabIdPayload): Promise<void>
@@ -75,7 +98,7 @@ export interface OverlayAPI {
   onPopupRequest(callback: (data: PopupRequestPayload) => void): () => void
 
   /** Renderer ACK that it materialized the shape for {openerTabId,url}. */
-  popupAck(payload: { openerTabId: string; url: string; childTabId?: string }): void
+  popupAck(payload: PopupAckPayload): void
 
   // navigation
   navigate(payload: NavigatePayload): Promise<SimpleResult>
