@@ -1,4 +1,4 @@
-import { useMemo, useRef } from 'react'
+import { useMemo, useRef, useEffect } from 'react'
 import { Tldraw } from 'tldraw'
 import type { Editor, TLCameraMoveOptions } from 'tldraw'
 import { getAssetUrls } from '@tldraw/assets/selfHosted'
@@ -6,6 +6,8 @@ import { BrowserShapeUtil } from './Utils/BrowserShapeUtil'
 import type { BrowserShape } from './Utils/BrowserShapeUtil'
 import WithHotkeys from './Utils/WithHotkeys'
 import { useUiChromeManager } from './Utils/useUiChromeManager'
+import { Toaster, toast } from 'react-hot-toast'
+import type { OverlayNotice } from '../../types/overlay'
 
 const BROWSER_W = 1200
 const BROWSER_H = 660
@@ -83,8 +85,40 @@ export default function App() {
   // UI chrome behavior
   useUiChromeManager(editorRef, { DURATION_MS, SLIDE_PX, ZOOM_HIDE, ZOOM_SHOW })
 
+  useEffect(() => {
+  const api = window.overlay
+  if (!api?.onNotice) return
+
+  const off = api.onNotice((n: OverlayNotice) => {
+    switch (n.kind) {
+      case 'tab-limit':
+        toast.error(`Tab limit reached (${n.max}).`)
+        break
+      case 'popup-suppressed':
+        toast('Max browser windows from links reached.')
+        break
+      case 'tab-crashed':
+        toast.error('This tab crashed and was closed.')
+        break
+      case 'nav-error':
+        toast.error(`Navigation failed (${n.code}): ${n.description}`)
+        break
+      case 'screen-share-error':
+        toast.error(`Screen share error: ${n.message}`)
+        break
+      case 'media-denied':
+        toast('Permission denied.')
+        break
+    }
+  })
+
+  return off
+}, [])
+
+
   return (
     <div style={{ width: '100vw', height: '100vh' }}>
+      <Toaster position="bottom-center" />
       <Tldraw
         shapeUtils={shapeUtils}
         assetUrls={assetUrls}

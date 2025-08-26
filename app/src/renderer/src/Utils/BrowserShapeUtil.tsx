@@ -1,10 +1,12 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState  } from 'react'
+import type { Editor, TLShapeId, TLParentId } from 'tldraw'
 import {
   HTMLContainer,
   Rectangle2d,
   ShapeUtil,
   TLBaseShape,
   TLResizeInfo,
+  
   resizeBox,
   useEditor,
   Box,
@@ -16,37 +18,79 @@ export type BrowserShape = TLBaseShape<
   { w: number; h: number; url: string; tabId: string }
 >
 
-const DRAG_GUTTER = 14 // outside drag gutters
+const DRAG_GUTTER = 40 // outside drag gutters
 const MIN_W = 300
 const MIN_H = 525 + NAV_BAR_HEIGHT + DRAG_GUTTER * 2
 
 type Rect = { x: number; y: number; width: number; height: number }
 type NavState = { currentUrl: string; canGoBack: boolean; canGoForward: boolean; title: string }
 
+
+function isAncestorSelected(editor: Editor, shapeId: TLShapeId): boolean {
+  // editor.getSelectedShapeIds() already returns TLShapeId[]
+  const selected = new Set<TLShapeId>(editor.getSelectedShapeIds())
+
+  if (selected.has(shapeId)) return false
+
+  // parentId is TLParentId | null
+  let parentId: TLParentId | null = editor.getShape(shapeId)?.parentId ?? null
+
+  while (parentId) {
+    // TLParentId and TLShapeId are both branded strings; at runtime they're strings.
+    // We narrow once here to compare with the selected TLShapeIds.
+    const parentShapeId = parentId as unknown as TLShapeId
+
+    if (selected.has(parentShapeId)) return true
+
+    const parent = editor.getShape(parentShapeId)
+    parentId = parent?.parentId ?? null
+  }
+  return false
+}
+
+
 export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
   static override type = 'browser-shape' as const
   override isAspectRatioLocked = () => false
   override canResize = () => true
-  override hideResizeHandles = () => false
+override hideResizeHandles = (shape: BrowserShape): boolean => {
+  return isAncestorSelected(this.editor, shape.id as TLShapeId)
+}
+
+override indicator(shape: BrowserShape) {
+  if (isAncestorSelected(this.editor, shape.id as TLShapeId)) return null
+  return <rect x={0} y={0} width={shape.props.w} height={shape.props.h} />
+}
+
+
 
   override getDefaultProps(): BrowserShape['props'] {
     return { w: 1200, h: 600 + NAV_BAR_HEIGHT + DRAG_GUTTER * 2, url: 'https://google.com', tabId: '' }
   }
 
+
+  
   override onResize(shape: BrowserShape, info: TLResizeInfo<BrowserShape>) {
     const r = resizeBox(shape, info)
     const w = Math.max(MIN_W, r.props.w)
     const h = Math.max(MIN_H, r.props.h)
     return { ...r, props: { ...r.props, w, h } }
   }
+override getGeometry(shape: BrowserShape) {
+  const g = DRAG_GUTTER; // e.g. 80
+  const { w, h } = shape.props;
 
-  override getGeometry(shape: BrowserShape) {
-    return new Rectangle2d({ width: shape.props.w, height: shape.props.h, isFilled: false })
-  }
+  // Big hit area on ALL sides so top/left grab feels easy.
+  // This does NOT move the shape; it only enlarges the clickable region.
+  return new Rectangle2d({
+    x: -g,
+    y: -g,
+    width: w + 2 * g,
+    height: h + 2 * g,
+    isFilled: true,
+  });
+}
 
-  override indicator(shape: BrowserShape) {
-    return <rect x={0} y={0} width={shape.props.w} height={shape.props.h} />
-  }
 
   override component(shape: BrowserShape) {
     const editor = useEditor()
@@ -85,28 +129,42 @@ useEffect(() => {
   }
 }, [api, shape.props.url, shape.id])
 
-// 3. Navigation state polling (keep as-is)
+// 3. Navigation state (push-based, no polling)
 useEffect(() => {
   if (!api) return
-  let cancelled = false
-  const tick = async () => {
+
+  let alive = true
+
+  const sync = async () => {
     const id = tabIdRef.current
     if (!id) return
     try {
       const res = await api.getNavigationState({ tabId: id })
-      if (!cancelled && res.ok) {
-        setNavState({
-          currentUrl: res.currentUrl ?? 'about:blank',
-          canGoBack: res.canGoBack ?? false,
-          canGoForward: res.canGoForward ?? false,
-          title: res.title ?? '',
-        })
-        setIsLoading(res.isLoading ?? false)
-      }
-    } catch { /* noop */ }
+      if (!alive || !res.ok) return
+      setNavState({
+        currentUrl: res.currentUrl ?? 'about:blank',
+        canGoBack: res.canGoBack ?? false,
+        canGoForward: res.canGoForward ?? false,
+        title: res.title ?? '',
+      })
+      setIsLoading(res.isLoading ?? false)
+    } catch {
+      /* noop */
+    }
   }
-  const h = window.setInterval(tick, 500)
-  return () => { cancelled = true; window.clearInterval(h) }
+
+  // initial load
+  void sync()
+
+  // live updates from main
+  const off = api.onUrlUpdate(({ tabId }: { tabId: string; url?: string }) => {
+    if (tabId === tabIdRef.current) void sync()
+  })
+
+  return () => {
+    alive = false
+    if (off) off()
+  }
 }, [api])
 
 useEffect(() => {
@@ -116,6 +174,7 @@ useEffect(() => {
   let shown = false
   let lastRect: Rect = { x: -1, y: -1, width: -1, height: -1 }
   let lastFactor = -1
+  const ZOOM_EPS = 0.0125 // ~1.25%
 
   const loop = (): void => {
     raf = requestAnimationFrame(loop)
@@ -126,52 +185,56 @@ useEffect(() => {
     const shapeRecord = editor.getShape<BrowserShape>(shape.id)
     if (!shapeRecord || shapeRecord.type !== 'browser-shape') return
 
-    const pagePos = { x: shapeRecord.x, y: shapeRecord.y }
-    const screenPos = editor.pageToScreen(pagePos)
+    const pb = editor.getShapePageBounds(shapeRecord.id)
+    if (!pb) return
+
     const zoom = editor.getZoomLevel()
+    const g = typeof DRAG_GUTTER === 'number' ? DRAG_GUTTER : 0
+
+    const screenPos = editor.pageToScreen({ x: pb.x + g, y: pb.y + g })
     const shapeSize = { w: shapeRecord.props.w, h: shapeRecord.props.h }
 
     const rect: Rect = {
-      x: screenPos.x,
-      y: screenPos.y + (NAV_BAR_HEIGHT * zoom),
-      width: shapeRecord.props.w * zoom,
-      height: (shapeRecord.props.h - NAV_BAR_HEIGHT) * zoom,
+      x: Math.round(screenPos.x),
+      y: Math.round(screenPos.y + NAV_BAR_HEIGHT * zoom),
+      width: Math.round(shapeSize.w * zoom),
+      height: Math.round((shapeSize.h - NAV_BAR_HEIGHT) * zoom),
     }
+
+    const positionChanged = rect.x !== lastRect.x || rect.y !== lastRect.y
+    const sizeChanged = rect.width !== lastRect.width || rect.height !== lastRect.height
+    const zoomChanged = Math.abs(zoom - lastFactor) > ZOOM_EPS
 
     if (!shown) {
       shown = true
       void api.show({ tabId: id, rect, shapeSize })
-
-      // CHANGE #1: bounds first, then zoom (so emu uses these bounds)
-void api.setBounds({ tabId: id, rect, shapeSize })
-void api.setZoom({ tabId: id, factor: zoom })
-
+      void api.setBounds({ tabId: id, rect, shapeSize })
+      void api.setZoom({ tabId: id, factor: zoom })
       lastRect = rect
       lastFactor = zoom
-    } else {
-      const positionChanged = rect.x !== lastRect.x || rect.y !== lastRect.y
-      const sizeChanged = rect.width !== lastRect.width || rect.height !== lastRect.height
-      const zoomChanged = Math.abs(zoom - lastFactor) > 0.01
-
-      // Handle bounds changes (move/resize that are not zoom-caused)
-      if (positionChanged || (sizeChanged && !zoomChanged)) {
-        void api.setBounds({ tabId: id, rect, shapeSize })
-        lastRect = rect
-      }
-
-      // CHANGE #2: on zoom change, send bounds first, then zoom
-      if (zoomChanged) {
-void api.setBounds({ tabId: id, rect, shapeSize })
-void api.setZoom({ tabId: id, factor: zoom })
-
-        lastFactor = zoom
-        lastRect = rect
-      }
+      return
     }
+
+    if (!positionChanged && !sizeChanged && !zoomChanged) return
+
+    if (zoomChanged) {
+      // update bounds if also moved/resized
+      if (positionChanged || sizeChanged) {
+        void api.setBounds({ tabId: id, rect, shapeSize })
+      }
+      void api.setZoom({ tabId: id, factor: zoom })
+      lastFactor = zoom
+      lastRect = rect
+      return
+    }
+
+    // only move/resize
+    void api.setBounds({ tabId: id, rect, shapeSize })
+    lastRect = rect
   }
 
   raf = requestAnimationFrame(loop)
-  return (): void => cancelAnimationFrame(raf)
+  return () => cancelAnimationFrame(raf)
 }, [api, editor, shape.id])
 
 // 5. Cleanup (keep as-is)
@@ -185,34 +248,65 @@ useEffect(() => {
 }, [api])
 
     // ---- Minimal fit toggle ------------------------------------------------
-const [fitMode, setFitMode] = useState<boolean>(false)
+// --- Fit state ---
+const [fitMode, setFitMode] = useState(false)
 const preFitCamRef = useRef<{ x: number; y: number; z: number } | null>(null)
-const preFitSizeRef = useRef<{ w: number; h: number } | null>(null)
+type PreFitState = { parentId: string; x: number; y: number; w: number; h: number }
+const preFitStateRef = useRef<PreFitState | null>(null)
 const fitStopRef = useRef<(() => void) | null>(null)
+
+const BLEED = 2 // expand a bit so neighbors don’t peek
 
 const getViewportPx = (): { vw: number; vh: number } => {
   const vb = editor.getViewportScreenBounds()
   return { vw: Math.max(1, Math.round(vb.width)), vh: Math.max(1, Math.round(vb.height)) }
 }
 
+/** Use page bounds (so group/parent transforms are respected) but
+ *  deflate them by DRAG_GUTTER so expanded getGeometry doesn't skew fit. */
 const fitShapeToViewport = (s: BrowserShape, vw: number, vh: number): void => {
-  if (s.props.w === vw && s.props.h === vh) return
-  const cx = s.x + s.props.w / 2
-  const cy = s.y + s.props.h / 2
-  const x = Math.round(cx - vw / 2)
-  const y = Math.round(cy - vh / 2)
-  editor.updateShapes([{ id: s.id, type: 'browser-shape', x, y, props: { w: vw, h: vh } }])
+  const pb = editor.getShapePageBounds(s.id)
+  if (!pb) return
+
+  const g = (typeof DRAG_GUTTER === 'number' ? DRAG_GUTTER : 0)
+  const ax = pb.x + g
+  const ay = pb.y + g
+  const aw = Math.max(1, pb.w - 2 * g)
+  const ah = Math.max(1, pb.h - 2 * g)
+
+  const targetW = vw + BLEED
+  const targetH = vh + BLEED
+  const cx = ax + aw / 2
+  const cy = ay + ah / 2
+  const x = Math.round(cx - targetW / 2)
+  const y = Math.round(cy - targetH / 2)
+
+  editor.updateShapes([
+    { id: s.id, type: 'browser-shape', x, y, props: { ...s.props, w: targetW, h: targetH } },
+  ])
 }
 
+/** Zoom to *visual* box by deflating page bounds by DRAG_GUTTER. */
 const zoomToShapeNow = (s: BrowserShape): void => {
-  editor.zoomToBounds(new Box(s.x, s.y, s.props.w, s.props.h), { inset: 0 })
+  const pb = editor.getShapePageBounds(s.id)
+  if (!pb) return
+
+  const g = (typeof DRAG_GUTTER === 'number' ? DRAG_GUTTER : 0)
+  const ax = pb.x + g
+  const ay = pb.y + g
+  const aw = Math.max(1, pb.w - 2 * g)
+  const ah = Math.max(1, pb.h - 2 * g)
+
+  editor.zoomToBounds(new Box(ax, ay, aw, ah), { inset: 0 })
 }
 
 function startInputGuards(): () => void {
   const isInNav = (t: EventTarget | null): boolean =>
     t instanceof Element && !!t.closest('[data-nav-root="1"]')
 
-  const onWheel = (e: WheelEvent) => { if (!isInNav(e.target)) { e.stopImmediatePropagation(); e.preventDefault() } }
+  const onWheel = (e: WheelEvent) => {
+    if (!isInNav(e.target)) { e.stopImmediatePropagation(); e.preventDefault() }
+  }
   const onPointer = (e: PointerEvent) => { if (!isInNav(e.target)) e.stopImmediatePropagation() }
   const onKey = (e: KeyboardEvent) => {
     const ae = document.activeElement as Element | null
@@ -235,80 +329,102 @@ function startInputGuards(): () => void {
 
 const runFitOnce = (): void => {
   if (!preFitCamRef.current) preFitCamRef.current = editor.getCamera()
-  if (!preFitSizeRef.current) preFitSizeRef.current = { w: shape.props.w, h: shape.props.h }
-  const s0 = editor.getShape<BrowserShape>(shape.id); if (!s0) return
+
+  const s0 = editor.getShape<BrowserShape>(shape.id)
+  if (!s0) return
+
+  // snapshot local placement
+  if (!preFitStateRef.current) {
+    preFitStateRef.current = {
+      parentId: (s0.parentId as string) ?? '',
+      x: s0.x,
+      y: s0.y,
+      w: s0.props.w,
+      h: s0.props.h,
+    }
+  }
+
+  editor.bringToFront([s0.id])
+
   const { vw, vh } = getViewportPx()
   fitShapeToViewport(s0, vw, vh)
-  const s1 = editor.getShape<BrowserShape>(shape.id); if (s1) zoomToShapeNow(s1)
+  zoomToShapeNow(s0)
 }
 
 const fitOn = (): void => {
   runFitOnce()
+
   let raf = 0
-  let last = { vw: -1, vh: -1, w: -1, h: -1 }
+  let last = { vw: -1, vh: -1 }
+
   const step = () => {
     raf = requestAnimationFrame(step)
     const s = editor.getShape<BrowserShape>(shape.id); if (!s) return
     const { vw, vh } = getViewportPx()
-    const vpChanged = vw !== last.vw || vh !== last.vh
-    const sizeChanged = s.props.w !== last.w || s.props.h !== last.h
-    if (vpChanged) fitShapeToViewport(s, vw, vh)
-    if (vpChanged || sizeChanged) {
-      const fresh = editor.getShape<BrowserShape>(shape.id)
-      if (fresh) {
-        zoomToShapeNow(fresh)
-        last = { vw, vh, w: fresh.props.w, h: fresh.props.h }
-      } else {
-        last = { vw, vh, w: s.props.w, h: s.props.h }
-      }
+    if (vw !== last.vw || vh !== last.vh) {
+      fitShapeToViewport(s, vw, vh)
+      zoomToShapeNow(s)
+      last = { vw, vh }
     }
   }
-  raf = requestAnimationFrame(step)
 
+  raf = requestAnimationFrame(step)
   const stopGuards = startInputGuards()
   fitStopRef.current = () => { cancelAnimationFrame(raf); stopGuards() }
   setFitMode(true)
 }
 
 const fitOff = (): void => {
-  // stop guards / raf set during fitOn
   fitStopRef.current?.()
   fitStopRef.current = null
 
-  // restore shape size (preserve center)
-  const prev = preFitSizeRef.current
+  const saved = preFitStateRef.current
   const s = editor.getShape<BrowserShape>(shape.id)
-  if (prev && s) {
-    const cx = s.x + s.props.w / 2
-    const cy = s.y + s.props.h / 2
-    const x = Math.round(cx - prev.w / 2)
-    const y = Math.round(cy - prev.h / 2)
-    editor.updateShapes([{ id: s.id, type: 'browser-shape', x, y, props: { ...s.props, w: prev.w, h: prev.h } }])
+
+  if (saved && s) {
+    if ((s.parentId as string) === saved.parentId) {
+      // restore exact local placement
+      editor.updateShapes([
+        { id: s.id, type: 'browser-shape', x: saved.x, y: saved.y, props: { ...s.props, w: saved.w, h: saved.h } },
+      ])
+    } else {
+      // fallback: restore around page center (deflate page bounds first)
+      const pb = editor.getShapePageBounds(s.id)
+      if (pb) {
+        const g = (typeof DRAG_GUTTER === 'number' ? DRAG_GUTTER : 0)
+        const ax = pb.x + g
+        const ay = pb.y + g
+        const aw = Math.max(1, pb.w - 2 * g)
+        const ah = Math.max(1, pb.h - 2 * g)
+
+        const cx = ax + aw / 2
+        const cy = ay + ah / 2
+        const x = Math.round(cx - saved.w / 2)
+        const y = Math.round(cy - saved.h / 2)
+
+        editor.updateShapes([
+          { id: s.id, type: 'browser-shape', x, y, props: { ...s.props, w: saved.w, h: saved.h } },
+        ])
+      }
+    }
   }
 
-  // reset camera zoom to 60% (keep previous center if saved)
+  // reset camera zoom to 60% (keep last center)
   const base = preFitCamRef.current ?? editor.getCamera()
   editor.setCamera({ ...base, z: 0.6 })
 
   preFitCamRef.current = null
-  preFitSizeRef.current = null
+  preFitStateRef.current = null
   setFitMode(false)
 }
 
 const onToggleFit = (): void => { (fitMode ? fitOff : fitOn)() }
-    // ---- Styles ------------------------------------------------------------
-const contentStyle: React.CSSProperties = {
-  position: 'absolute',
-  top: NAV_BAR_HEIGHT, // start below navbar
-  left: 0,
-  right: 0,
-  bottom: 0,
-  overflow: 'hidden',
-  zIndex: 0,
-  background: 'transparent',
-}
+
+
 
 // ---- Render ------------------------------------------------------------
+const BORDER = 3 // keep tldraw blue outline visible without shrinking content
+
 return (
   <HTMLContainer
     style={{
@@ -329,44 +445,145 @@ return (
         position: 'relative',
       }}
     >
-      <NavigationBar
-        navState={navState}
-        isLoading={isLoading}
-        onUrlChange={async (url) => {
-          const id = tabIdRef.current
-          if (api && id) { setIsLoading(true); await api.navigate({ tabId: id, url }) }
+      {/* Navbar gets priority: raise this shape on hover/press so it beats neighbors */}
+      <div
+        data-nav-root="1"
+        onPointerEnter={() => {
+          // bring to front, but only select if not inside a selected group
+          if (!isAncestorSelected(editor, shape.id as TLShapeId)) {
+            editor.bringToFront([shape.id])
+            editor.select(shape.id)
+          }
         }}
-        onBack={async () => {
-          const id = tabIdRef.current
-          if (api && id && navState.canGoBack) { setIsLoading(true); await api.goBack({ tabId: id }) }
+        onPointerDown={(e) => {
+          if (isAncestorSelected(editor, shape.id as TLShapeId)) {
+            e.stopPropagation()
+            return
+          }
+          editor.bringToFront([shape.id])
+          editor.select(shape.id)
         }}
-        onForward={async () => {
-          const id = tabIdRef.current
-          if (api && id && navState.canGoForward) { setIsLoading(true); await api.goForward({ tabId: id }) }
-        }}
-        onReload={async () => {
-          const id = tabIdRef.current
-          if (api && id) { setIsLoading(true); await api.reload({ tabId: id }) }
-        }}
-        fitMode={fitMode}
-        onToggleFit={onToggleFit}
-      />
+        style={{ position: 'relative', zIndex: 2, pointerEvents: 'auto' }}
+      >
+        <NavigationBar
+          navState={navState}
+          isLoading={isLoading}
+          onUrlChange={async (url) => {
+            const id = tabIdRef.current
+            if (api && id) {
+              setIsLoading(true)
+              await api.navigate({ tabId: id, url })
+            }
+          }}
+          onBack={async () => {
+            const id = tabIdRef.current
+            if (api && id && navState.canGoBack) {
+              setIsLoading(true)
+              await api.goBack({ tabId: id })
+            }
+          }}
+          onForward={async () => {
+            const id = tabIdRef.current
+            if (api && id && navState.canGoForward) {
+              setIsLoading(true)
+              await api.goForward({ tabId: id })
+            }
+          }}
+          onReload={async () => {
+            const id = tabIdRef.current
+            if (api && id) {
+              setIsLoading(true)
+              await api.reload({ tabId: id })
+            }
+          }}
+          fitMode={fitMode}
+          onToggleFit={onToggleFit}
+        />
+      </div>
 
-      <div style={contentStyle}>
+      {/* Content area (below navbar) */}
+      <div
+        style={{
+          position: 'absolute',
+          top: NAV_BAR_HEIGHT,
+          left: 0,
+          right: 0,
+          bottom: 0,
+          overflow: 'visible', // allow outside gutters to spill out
+          background: 'transparent',
+        }}
+      >
+        {/* Live web content: inset by BORDER so the blue outline is never covered */}
         <div
           ref={hostRef}
           style={{
             position: 'absolute',
-            top: 0,
-            left: 0,
-            right: 0,
-            bottom: 0,
-            pointerEvents: 'none',
+            top: BORDER,
+            left: BORDER,
+            right: BORDER,
+            bottom: BORDER,
+            pointerEvents: 'none', // OS plane below; we never rely on DOM here
           }}
         />
       </div>
     </div>
+
+    {/* -------- Massive OUTER drag gutters (effortless grabbing) -------- */}
+    {/* Place gutters under the navbar (zIndex: 1) so the nav always wins */}
+    <div
+      style={{
+        position: 'absolute',
+        top: -DRAG_GUTTER,
+        left: -DRAG_GUTTER,
+        right: -DRAG_GUTTER,
+        height: DRAG_GUTTER,
+        cursor: 'move',
+        pointerEvents: 'auto',
+        background: 'transparent',
+        zIndex: 1,
+      }}
+    />
+    <div
+      style={{
+        position: 'absolute',
+        bottom: -DRAG_GUTTER,
+        left: -DRAG_GUTTER,
+        right: -DRAG_GUTTER,
+        height: DRAG_GUTTER,
+        cursor: 'move',
+        pointerEvents: 'auto',
+        background: 'transparent',
+        zIndex: 1,
+      }}
+    />
+    <div
+      style={{
+        position: 'absolute',
+        top: -DRAG_GUTTER,
+        bottom: -DRAG_GUTTER,
+        left: -DRAG_GUTTER,
+        width: DRAG_GUTTER,
+        cursor: 'move',
+        pointerEvents: 'auto',
+        background: 'transparent',
+        zIndex: 1,
+      }}
+    />
+    <div
+      style={{
+        position: 'absolute',
+        top: -DRAG_GUTTER,
+        bottom: -DRAG_GUTTER,
+        right: -DRAG_GUTTER,
+        width: DRAG_GUTTER,
+        cursor: 'move',
+        pointerEvents: 'auto',
+        background: 'transparent',
+        zIndex: 1,
+      }}
+    />
   </HTMLContainer>
 )
+
   }
 }

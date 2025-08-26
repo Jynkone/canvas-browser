@@ -40,6 +40,15 @@ export interface PopupRequestPayload {
   url: string
 }
 
+export type OverlayNotice =
+  | { kind: 'tab-limit'; max: number }
+  | { kind: 'popup-suppressed'; url: string }
+  | { kind: 'tab-crashed'; tabId: string }
+  | { kind: 'nav-error'; tabId: string; code: number; description: string; url?: string }
+  | { kind: 'screen-share-error'; message: string }
+  | { kind: 'media-denied'; which: string }
+
+
 export interface PopupAckPayload {
   openerTabId: string
   url: string
@@ -66,10 +75,11 @@ export interface OverlayAPI {
   onPopupRequest(callback: (data: PopupRequestPayload) => void): () => void
 
   /** Renderer ACK that it materialized the shape for {openerTabId,url}. */
-  popupAck(payload: PopupAckPayload): Promise<void>
+  popupAck(payload: { openerTabId: string; url: string; childTabId?: string }): void
 
   // navigation
   navigate(payload: NavigatePayload): Promise<SimpleResult>
+  onNotice(cb: (n: OverlayNotice) => void): () => void
   goBack(payload: TabIdPayload): Promise<SimpleResult>
   goForward(payload: TabIdPayload): Promise<SimpleResult>
   reload(payload: TabIdPayload): Promise<SimpleResult>

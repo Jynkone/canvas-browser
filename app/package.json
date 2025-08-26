@@ -2,14 +2,14 @@
   "name": "canvas-browser",
   "version": "1.0.0",
   "description": "Paper",
-  "main": "out/main/index.js",            
+  "main": "out/main/index.js",
   "author": "Ajinkya",
   "homepage": "https://electron-vite.org",
   "scripts": {
     "dev": "electron-vite dev",
-    "build": "npm run typecheck && electron-vite build",   
-    "preview": "electron-vite preview",                    
-    "dist": "npm run build && electron-builder",           
+    "build": "npm run typecheck && electron-vite build",
+    "preview": "electron-vite preview",
+    "dist": "npm run build && electron-builder",
     "dist:win": "npm run build && electron-builder --win",
     "dist:mac": "npm run build && electron-builder --mac",
     "dist:linux": "npm run build && electron-builder --linux",
@@ -25,6 +25,7 @@
     "@electron-toolkit/utils": "^4.0.0",
     "@tldraw/assets": "^3.15.1",
     "electron-updater": "^6.3.9",
+    "react-hot-toast": "^2.6.0",
     "tldraw": "^3.15.1"
   },
   "devDependencies": {
@@ -48,46 +49,52 @@
     "typescript": "^5.8.3",
     "vite": "^7.0.5"
   },
-"build": {
-  "appId": "com.example.Paper",
-  "productName": "Paper",
-
-  "directories": {
-    "output": "release",
-    "buildResources": "build"           
-  },
-
-  "files": [
-    "out/**/*",
-    "package.json",
-    "build/icon.png"                     
-  ],
-  "asar": true,
-
-  "mac": {
-    "target": ["dmg", "zip"],
-    "category": "public.app-category.developer-tools",
-    "hardenedRuntime": true,
-    "entitlements": "build/entitlements.mac.plist",
-    "entitlementsInherit": "build/entitlements.mac.plist",
-    "icon": "build/icon.icns"            
-  },
-
-  "win": {
-    "target": [{ "target": "nsis", "arch": ["x64"] }],
-    "icon": "build/icon.ico"             
-  },
-
-  "linux": {
-    "target": ["AppImage", "deb"],
-    "category": "Utility",
-    "icon": "build/icon.png"             
-  },
-
-  "nsis": {
-    "oneClick": false,
-    "allowToChangeInstallationDirectory": true
+  "build": {
+    "appId": "com.example.Paper",
+    "productName": "Paper",
+    "directories": {
+      "output": "release",
+      "buildResources": "build"
+    },
+    "files": [
+      "out/**/*",
+      "package.json",
+      "build/icon.png"
+    ],
+    "asar": true,
+    "mac": {
+      "target": [
+        "dmg",
+        "zip"
+      ],
+      "category": "public.app-category.developer-tools",
+      "hardenedRuntime": true,
+      "entitlements": "build/entitlements.mac.plist",
+      "entitlementsInherit": "build/entitlements.mac.plist",
+      "icon": "build/icon.icns"
+    },
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "build/icon.ico"
+    },
+    "linux": {
+      "target": [
+        "AppImage",
+        "deb"
+      ],
+      "category": "Utility",
+      "icon": "build/icon.png"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    }
   }
-}
-
 }

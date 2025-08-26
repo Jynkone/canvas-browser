@@ -2,6 +2,7 @@ import { BrowserWindow, WebContentsView, ipcMain, Menu, desktopCapturer,dialog }
 import type { Debugger as ElectronDebugger, Input } from 'electron'
 import { writeFileSync, readFileSync, existsSync } from 'fs'
 import { join } from 'path'
+import type { OverlayNotice } from '../../src/types/overlay'
 
 type Rect = { x: number; y: number; width: number; height: number }
 
@@ -32,6 +33,7 @@ const CHROME_MIN = 0.25
 const CHROME_MAX = 5
 const ZOOM_RATIO = 1
 const MAX_VIEWS = 32
+const BORDER = 2
 
 const clamp = (n: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, n))
 
@@ -372,28 +374,58 @@ type PopupKey = `${string}|${string}`; // `${openerTabId}|${url}`
 
 enum PopupState {
   None = 0,
-  Requested = 1,     // main sent event to renderer
-  Materialized = 2,  // renderer confirmed it created a shape
+  Requested = 3,   // was 1
+  Materialized = 4 // was 2 (bump to keep ordering)
 }
 
 const popupStates = new Map<PopupKey, PopupState>();
 
-function pk(openerTabId: string, url: string): PopupKey {
-  return `${openerTabId}|${url}`;
+
+const MAX_POPUPS_PER_KEY = 3
+
+type PopupBucket = {
+  requested: number          // times we allowed a request to go out
+  materialized: number       // renderer ACKs received
+  childIds: Set<string>      // live child tabIds for this key
 }
+
+const popupBuckets = new Map<PopupKey, PopupBucket>()
+
+const pk = (openerTabId: string, url: string): PopupKey => `${openerTabId}|${url}`
+
+const activeCount = (b: PopupBucket): number =>
+  b.childIds.size + Math.max(0, b.requested - b.materialized) // live + pending
 
 /** First time? lock & return true; already seen? return false. */
 function tryRequest(openerTabId: string, url: string): boolean {
-  const k = pk(openerTabId, url);
-  const st = popupStates.get(k) ?? PopupState.None;
-  if (st !== PopupState.None) return false;
-  popupStates.set(k, PopupState.Requested);
-  return true;
+  const k = pk(openerTabId, url)
+
+  // sweep stale children for this key (child tab destroyed)
+  for (const [childId, key] of keyByChild) {
+    if (key === k && !views.has(childId)) {
+      keyByChild.delete(childId)
+      const b0 = popupBuckets.get(k)
+      if (b0) b0.childIds.delete(childId)
+    }
+  }
+
+  const b = popupBuckets.get(k) ?? { requested: 0, materialized: 0, childIds: new Set() }
+  if (activeCount(b) >= MAX_POPUPS_PER_KEY) return false
+
+  b.requested += 1
+  popupBuckets.set(k, b)
+  return true
 }
 
-/** Renderer says the BrowserShape now exists for this pair. */
-function markMaterialized(openerTabId: string, url: string): void {
-  popupStates.set(pk(openerTabId, url), PopupState.Materialized);
+function markMaterialized(openerTabId: string, url: string, childTabId?: string): void {
+  const key = pk(openerTabId, url)
+  const bucket = popupBuckets.get(key) ?? { requested: 0, materialized: 0, childIds: new Set<string>() }
+  bucket.materialized += 1
+  if (childTabId) {
+    bucket.childIds.add(childTabId)
+    keyByChild.set(childTabId, key)
+  }
+  popupBuckets.set(key, bucket)
 }
 
 /** Forget all locks for a given opener tab (call on destroy). */
@@ -415,6 +447,13 @@ function emitCanvasPopup(openerTabId: string, url: string): void {
 ;
 }
 
+const sendNotice = (n: OverlayNotice): void => {
+  const win = getWindow()
+  if (!win || win.isDestroyed()) return
+  try { win.webContents.send('overlay-notice', n) } catch {}
+}
+
+
 function openFromContextMenu(openerTabId: string, url: string): void {
   if (!tryRequest(openerTabId, url)) {
     console.log('[context-open] 🔁 Suppressed duplicate (sticky)')
@@ -424,12 +463,34 @@ function openFromContextMenu(openerTabId: string, url: string): void {
   emitCanvasPopup(openerTabId, url)
 }
 
+const keyByChild = new Map<string, PopupKey>() // childTabId -> popup key
+
+function clearForChild(childTabId: string): void {
+  const key = keyByChild.get(childTabId)
+  if (!key) return
+  keyByChild.delete(childTabId)
+
+  const b = popupBuckets.get(key)
+  if (!b) return
+  b.childIds.delete(childTabId)
+
+  if (activeCount(b) === 0) popupBuckets.delete(key)
+  else popupBuckets.set(key, b)
+}
+
+
+
+
 
   // -------------------- IPC handlers ---------------------------------------
   ipcMain.handle('overlay:create-tab', async (_e, payload?: { url?: string; shapeId?: string }): Promise<CreateTabResponse> => {
     const win = getWindow()
     if (!win || win.isDestroyed()) return { ok: false, error: 'No window' }
-    if (views.size >= MAX_VIEWS) return { ok: false, error: `Too many tabs (${views.size})` }
+    if (views.size >= MAX_VIEWS) {
+  sendNotice({ kind: 'tab-limit', max: MAX_VIEWS })
+  return { ok: false, error: `Too many tabs (${views.size}/${MAX_VIEWS})` }
+}
+
 
     if (!startupRestoreComplete) {
       await initializeStartupRestore()
@@ -462,18 +523,27 @@ function openFromContextMenu(openerTabId: string, url: string): void {
             spellcheck: true,
             contextIsolation: true,
             nodeIntegration: false,
+            sandbox: true,
             webSecurity: true,
             allowRunningInsecureContent: false,
             backgroundThrottling: true,
           },
         })
+// Auto-allow clipboard read & write for every tab, prompt only for media
 view.webContents.session.setPermissionRequestHandler(
   async (_wc, permission, callback, details) => {
     try {
-      if (permission === 'media'|| permission === 'clipboard-read') {
-        // Extend type locally to include mediaTypes
-        const mediaDetails = details as Electron.MediaAccessPermissionRequest & { mediaTypes?: string[] }
-        const which = mediaDetails.mediaTypes?.join(' & ') || 'media devices'
+      if (permission === 'clipboard-read' || permission === 'clipboard-sanitized-write') {
+        callback(true) // always allow clipboard
+        return
+      }
+
+      if (permission === 'media') {
+        // Only in media requests: safely check for mediaTypes
+        const which =
+          (typeof (details as any).mediaTypes !== 'undefined' && Array.isArray((details as any).mediaTypes))
+            ? (details as any).mediaTypes.join(' & ')
+            : 'media devices'
 
         const res = await dialog.showMessageBox({
           type: 'question',
@@ -487,6 +557,7 @@ view.webContents.session.setPermissionRequestHandler(
         return
       }
 
+      // deny everything else
       callback(false)
     } catch (err) {
       console.error('[overlay] Permission handler error:', err)
@@ -495,18 +566,21 @@ view.webContents.session.setPermissionRequestHandler(
   }
 )
 
+// Chromium’s pre-check: say "yes" for clipboard
+view.webContents.session.setPermissionCheckHandler((_wc, permission) => {
+  return permission === 'clipboard-read' || permission === 'clipboard-sanitized-write'
+})
 // DisplayMedia handler: only Paper + Desktop
 view.webContents.session.setDisplayMediaRequestHandler(async (_request, callback) => {
   try {
     const sources = await desktopCapturer.getSources({
       types: ['screen', 'window'],
-      thumbnailSize: { width: 300, height: 200 }
+      thumbnailSize: { width: 300, height: 200 },
+      fetchWindowIcons: false,
     })
 
-    // Always pick desktop source (first full screen)
+    // Prefer a full desktop screen, also allow your app window ("Paper")
     const desktopSource = sources.find(s => s.id.startsWith('screen:'))
-
-    // Try to match your main app window (must have title = "Paper")
     const paperSource = sources.find(s => s.name.toLowerCase().includes('paper'))
 
     const choices: Electron.DesktopCapturerSource[] = []
@@ -514,38 +588,64 @@ view.webContents.session.setDisplayMediaRequestHandler(async (_request, callback
     if (paperSource) choices.push(paperSource)
 
     if (choices.length === 0) {
+      // optional: notify renderer
+      try {
+        getWindow()?.webContents.send('overlay-notice', {
+          kind: 'screen-share-error',
+          message: 'No Desktop or Paper sources found',
+        } as const)
+      } catch {}
       callback({})
       return
     }
 
-    // Let user pick only between Desktop and Paper
-    const chosen = await dialog.showMessageBox({
+    // Add a Cancel button so we can signal denial clearly
+    const buttons = [...choices.map((s, i) => `${i + 1}: ${s.name}`), 'Cancel']
+    const res = await dialog.showMessageBox({
       type: 'info',
-      buttons: choices.map((s, i) => `${i + 1}: ${s.name}`),
+      buttons,
+      defaultId: 0,
+      cancelId: buttons.length - 1,
       message: 'Share your screen or the Paper app',
-      cancelId: -1,
-      noLink: true
+      noLink: true,
     })
 
-    if (chosen.response < 0) {
+    // User cancelled
+    if (res.response === buttons.length - 1) {
+      try {
+        getWindow()?.webContents.send('overlay-notice', {
+          kind: 'media-denied',
+          which: 'screen share',
+        } as const)
+      } catch {}
       callback({})
       return
     }
 
-    const source = choices[chosen.response]
+    // Safe index & chosen source
+    const idx = Math.max(0, Math.min(res.response, choices.length - 1))
+    const source = choices[idx]
 
-    const payload: { video: Electron.DesktopCapturerSource; audio?: 'loopback' | 'loopbackWithMute' } = {
-      video: source
-    }
+    const payload: {
+      video: Electron.DesktopCapturerSource
+      audio?: 'loopback' | 'loopbackWithMute'
+    } = { video: source }
 
-    // Only allow audio for full screens on Windows
+    // Only allow audio loopback for full screens on Windows
     if (process.platform === 'win32' && source.id.startsWith('screen:')) {
       payload.audio = 'loopback'
     }
 
     callback(payload)
   } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
     console.error('[overlay] Screen sharing error:', err)
+    try {
+      getWindow()?.webContents.send('overlay-notice', {
+        kind: 'screen-share-error',
+        message: msg,
+      } as const)
+    } catch {}
     callback({})
   }
 })
@@ -567,6 +667,18 @@ view.webContents.session.setDisplayMediaRequestHandler(async (_request, callback
         views.set(tabId, state)
 
         const safeReapply = () => { if (!state) return; void S.reapply(state); S.updateNav(state) }
+
+            const emitNavHint = (tabId: string, url?: string): void => {
+  const win = getWindow()
+  if (!win || win.isDestroyed()) return
+  try {
+    win.webContents.send(
+      'overlay-url-updated',
+      { tabId, url } satisfies { tabId: string; url?: string }
+    )
+  } catch {}
+}
+
         view.webContents.on('dom-ready', safeReapply)
 
         view.webContents.on('did-navigate', () => {
@@ -575,6 +687,7 @@ view.webContents.session.setDisplayMediaRequestHandler(async (_request, callback
           const currentUrl = view.webContents.getURL()
           browserState[tabId] = { currentUrl, lastInteraction: Date.now() }
           flushBrowserState()
+          emitNavHint(tabId)
         })
         view.webContents.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
 
@@ -584,16 +697,40 @@ view.webContents.session.setDisplayMediaRequestHandler(async (_request, callback
           const currentUrl = view.webContents.getURL()
           browserState[tabId] = { currentUrl, lastInteraction: Date.now() }
           flushBrowserState()
+          emitNavHint(tabId)
         })
 
-        view.webContents.on('page-title-updated', () => { if (state) S.updateNav(state) })
+        view.webContents.on(
+  'will-redirect',
+  (_e, url: string, _isInPlace: boolean, isMainFrame: boolean) => {
+    if (!state || !isMainFrame || view.webContents.isDestroyed()) return
+    emitNavHint(tabId, url) // push hint so renderer refreshes via getNavigationState()
+  }
+)
+
+        view.webContents.on('page-title-updated', () => {
+  if (state) S.updateNav(state)
+  emitNavHint(tabId)              // ← add
+})
+
+view.webContents.on(
+  'did-start-navigation',
+  (_e, _url: string, _isInPlace: boolean, isMainFrame: boolean) => {
+    if (!state || !isMainFrame || view.webContents.isDestroyed()) return
+    emitNavHint(tabId) // tells renderer to pull; isLoading will be true
+  }
+)
+
         view.webContents.on('render-process-gone', () => {
-          try {
-            const w = getWindow()
-            if (w && !w.isDestroyed() && state) S.detach(w, state)
-          } catch {}
-          views.delete(tabId)
-        })
+  try {
+    const w = getWindow()
+    if (w && !w.isDestroyed() && state) S.detach(w, state)
+  } catch {}
+sendNotice({ kind: 'tab-crashed', tabId })
+  views.delete(tabId)
+  clearForChild(tabId) // ← add
+})
+
 
         view.webContents.on('before-input-event', (event, input: Input) => {
           if (!state) return
@@ -646,6 +783,7 @@ view.webContents.setWindowOpenHandler((details) => {
       const openerTabId = tabId // must be the current tab's id in this scope
       if (!tryRequest(openerTabId, url)) {
         console.log('[popup-detection] 🔁 Suppressed duplicate (sticky)')
+        sendNotice({ kind: 'popup-suppressed', url })
         return { action: 'deny' }
       }
 
@@ -661,6 +799,54 @@ view.webContents.setWindowOpenHandler((details) => {
     return { action: 'allow' }
   }
 })
+
+view.webContents.on('did-create-window', (child, details) => {
+  const childWc = child.webContents
+  const openerWc = view.webContents
+  const openerId = tabId // current tab id in this scope
+
+  if (!shouldStayAsPopup(details.url, '')) return
+
+  const maybeFinish = (nextUrl: string): void => {
+    // When it no longer looks like an auth/login URL, we're done.
+    if (!shouldStayAsPopup(nextUrl, '')) {
+      try { child.close() } catch {}
+      try {
+        // Bounce focus and refresh opener so cookies/session apply immediately.
+        openerWc.focus()
+        openerWc.reload()
+        markMaterialized(openerId, nextUrl)
+      } catch {}
+    }
+  }
+
+  // Then attach the popup lifecycle listeners that feed into maybeFinish
+  childWc.on('will-redirect',        (_e, url) => { try { maybeFinish(url) } catch {} })
+  childWc.on('did-navigate',         (_e, url) => { try { maybeFinish(url) } catch {} })
+  childWc.on('did-navigate-in-page', (_e, url) => { try { maybeFinish(url) } catch {} })
+})
+
+view.webContents.on('did-start-navigation', (_e, _url, _inPlace, isMainFrame) => {
+  if (!state || !isMainFrame || view.webContents.isDestroyed()) return
+  emitNavHint(tabId)               // renderer will set isLoading(true) then sync
+})
+
+view.webContents.on('did-finish-load', () => {
+  if (!state || view.webContents.isDestroyed()) return
+  emitNavHint(tabId)               // drop spinner ASAP
+})
+
+view.webContents.on('did-stop-loading', () => {
+  if (!state || view.webContents.isDestroyed()) return
+  emitNavHint(tabId)               // also covers subresources finishing
+})
+
+view.webContents.on('did-fail-load', (_e, code, description, failingUrl, isMainFrame) => {
+  if (!state || !isMainFrame || view.webContents.isDestroyed()) return
+  emitNavHint(tabId)
+  sendNotice({ kind: 'nav-error', tabId, code, description, url: failingUrl })
+})
+
 
 view.webContents.on('context-menu', (_event, params) => {
   const { linkURL, hasImageContents, isEditable, selectionText, pageURL } = params
@@ -841,8 +1027,8 @@ Menu.buildFromTemplate(typedMenu).popup({ window: getWindow()! })
 
 ipcMain.handle(
   'overlay:popup-ack',
-  (_e, { openerTabId, url }: { openerTabId: string; url: string }): void => {
-    markMaterialized(openerTabId, url)
+  (_e, { openerTabId, url, childTabId }: { openerTabId: string; url: string; childTabId?: string }) => {
+    markMaterialized(openerTabId, url, childTabId)
   }
 )
 
@@ -868,9 +1054,17 @@ ipcMain.handle(
 
     const { x, y, w, h } = S.roundRect(rect)
     const b = state.lastBounds
+
     if (!b || x !== b.x || y !== b.y || w !== b.w || h !== b.h) {
       state.lastBounds = { x, y, w, h }
-      try { state.view.setBounds({ x, y, width: w, height: h }) } catch {}
+      try {
+        state.view.setBounds({
+          x: x + BORDER,
+          y: y + BORDER,
+          width: Math.max(1, w - BORDER * 2),
+          height: Math.max(1, h - BORDER * 2),
+        })
+      } catch {}
     }
 
     // If we’re under 25% and a bucket is pending, (re)schedule the single apply
@@ -879,6 +1073,7 @@ ipcMain.handle(
     }
   }
 )
+
 
 
 ipcMain.handle(
@@ -969,6 +1164,7 @@ ipcMain.handle('overlay:destroy', async (_e, { tabId }: { tabId: string }): Prom
 
   // Step 1: Remove from our tracking immediately to prevent further operations
   views.delete(tabId)
+  clearForChild(tabId)
   delete browserState[tabId]
   clearForOpener?.(tabId)
 
@@ -1094,13 +1290,36 @@ ipcMain.handle('overlay:destroy', async (_e, { tabId }: { tabId: string }): Prom
     catch { return { ok: false, error: 'Reload failed' } }
   })
 
-  ipcMain.handle('overlay:get-navigation-state', async (_e, { tabId }: { tabId: string }): Promise<GetNavStateResponse> => {
-    const { state } = S.resolve(tabId)
-    if (!state) return { ok: false, error: 'No view' }
+ipcMain.handle(
+  'overlay:get-navigation-state',
+  async (
+    _e,
+    payload: { tabId: string }
+  ): Promise<GetNavStateResponse | Err> => {
+    const tabId = payload?.tabId
+    const state = tabId ? views.get(tabId) : undefined
+    if (!state) return { ok: false, error: 'No such tab' }
+
+    const wc = state.view.webContents
+
+    const safe = <T>(fn: () => T, fallback: T): T => {
+      try { return fn() } catch { return fallback }
+    }
+
+    const currentUrl = safe(() => wc.getURL(), state.navState.currentUrl)
+    const title = safe(() => wc.getTitle(), state.navState.title)
+    const canGoBack = safe(() => wc.navigationHistory.canGoBack(), state.navState.canGoBack)
+    const canGoForward = safe(() => wc.navigationHistory.canGoForward(), state.navState.canGoForward)
+    const isLoading = safe(() => wc.isLoading(), false)
+
     return {
       ok: true,
-      ...state.navState,
-      isLoading: (() => { try { return state.view.webContents.isLoading() } catch { return false } })(),
+      currentUrl,
+      title,
+      canGoBack,
+      canGoForward,
+      isLoading,
     }
-  })
+  }
+)
 }

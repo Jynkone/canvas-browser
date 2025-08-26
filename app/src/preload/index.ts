@@ -3,6 +3,7 @@ import type {
   OverlayAPI,
   PopupAckPayload,
   PopupRequestPayload,
+  OverlayNotice,
 } from '../types/overlay'
 
 // 1) Versions bridge
@@ -49,8 +50,16 @@ const overlay: OverlayAPI = {
     return () => ipcRenderer.removeListener('overlay-popup-request', handler)
   },
 
-  // NEW: renderer ACK → main ('overlay:popup-ack')
   popupAck: (payload: PopupAckPayload) => ipcRenderer.invoke('overlay:popup-ack', payload),
-}
+
+    onNotice: (cb: (n: OverlayNotice) => void) => {
+    const ch = 'overlay-notice'
+    const h = (_e: Electron.IpcRendererEvent, n: OverlayNotice) => cb(n)
+    ipcRenderer.on(ch, h)
+    return () => ipcRenderer.removeListener(ch, h)
+  },
+
+
+} satisfies OverlayAPI
 
 contextBridge.exposeInMainWorld('overlay', overlay)
