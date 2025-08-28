@@ -78,6 +78,7 @@ function createWindow(): void {
     title: 'Paper',
     backgroundColor: '#111111',
     icon: getWindowIconPath(),
+    fullscreenable: false,
     autoHideMenuBar: true,
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),

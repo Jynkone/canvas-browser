@@ -18,9 +18,10 @@ export type BrowserShape = TLBaseShape<
   { w: number; h: number; url: string; tabId: string }
 >
 
-const DRAG_GUTTER = 40 // outside drag gutters
+const DRAG_GUTTER = 60 // invisible move hit area (no longer affects visuals/geometry)
 const MIN_W = 300
-const MIN_H = 525 + NAV_BAR_HEIGHT + DRAG_GUTTER * 2
+// Geometry is tight now; don't bake gutters into visual min height.
+const MIN_H = 525 + NAV_BAR_HEIGHT
 
 type Rect = { x: number; y: number; width: number; height: number }
 type NavState = { currentUrl: string; canGoBack: boolean; canGoForward: boolean; title: string }
@@ -65,7 +66,7 @@ override indicator(shape: BrowserShape) {
 
 
   override getDefaultProps(): BrowserShape['props'] {
-    return { w: 1200, h: 600 + NAV_BAR_HEIGHT + DRAG_GUTTER * 2, url: 'https://google.com', tabId: '' }
+    return { w: 1200, h: 600 + NAV_BAR_HEIGHT, url: 'https://google.com', tabId: '' }
   }
 
 
@@ -77,18 +78,15 @@ override indicator(shape: BrowserShape) {
     return { ...r, props: { ...r.props, w, h } }
   }
 override getGeometry(shape: BrowserShape) {
-  const g = DRAG_GUTTER; // e.g. 80
-  const { w, h } = shape.props;
-
-  // Big hit area on ALL sides so top/left grab feels easy.
-  // This does NOT move the shape; it only enlarges the clickable region.
+  // Tight geometry == real box; keeps resize handles at true corners.
+  const { w, h } = shape.props
   return new Rectangle2d({
-    x: -g,
-    y: -g,
-    width: w + 2 * g,
-    height: h + 2 * g,
+    x: 0,
+    y: 0,
+    width: w,
+    height: h,
     isFilled: true,
-  });
+  })
 }
 
 
@@ -107,7 +105,7 @@ override getGeometry(shape: BrowserShape) {
     })
     const [isLoading, setIsLoading] = useState<boolean>(false)
     
-useEffect(() => {
+  useEffect(() => {
   if (!api || tabIdRef.current) return
   let cancelled = false
 
@@ -189,9 +187,8 @@ useEffect(() => {
     if (!pb) return
 
     const zoom = editor.getZoomLevel()
-    const g = typeof DRAG_GUTTER === 'number' ? DRAG_GUTTER : 0
-
-    const screenPos = editor.pageToScreen({ x: pb.x + g, y: pb.y + g })
+  // Geometry is tight; no gutter offset in page->screen mapping.
+  const screenPos = editor.pageToScreen({ x: pb.x, y: pb.y })
     const shapeSize = { w: shapeRecord.props.w, h: shapeRecord.props.h }
 
     const rect: Rect = {
@@ -262,17 +259,15 @@ const getViewportPx = (): { vw: number; vh: number } => {
   return { vw: Math.max(1, Math.round(vb.width)), vh: Math.max(1, Math.round(vb.height)) }
 }
 
-/** Use page bounds (so group/parent transforms are respected) but
- *  deflate them by DRAG_GUTTER so expanded getGeometry doesn't skew fit. */
+/** Use page bounds directly (geometry is tight; no gutter deflation). */
 const fitShapeToViewport = (s: BrowserShape, vw: number, vh: number): void => {
   const pb = editor.getShapePageBounds(s.id)
   if (!pb) return
 
-  const g = (typeof DRAG_GUTTER === 'number' ? DRAG_GUTTER : 0)
-  const ax = pb.x + g
-  const ay = pb.y + g
-  const aw = Math.max(1, pb.w - 2 * g)
-  const ah = Math.max(1, pb.h - 2 * g)
+  const ax = pb.x
+  const ay = pb.y
+  const aw = Math.max(1, pb.w)
+  const ah = Math.max(1, pb.h)
 
   const targetW = vw + BLEED
   const targetH = vh + BLEED
@@ -286,18 +281,11 @@ const fitShapeToViewport = (s: BrowserShape, vw: number, vh: number): void => {
   ])
 }
 
-/** Zoom to *visual* box by deflating page bounds by DRAG_GUTTER. */
+/** Zoom to the true box (no gutter deflation). */
 const zoomToShapeNow = (s: BrowserShape): void => {
   const pb = editor.getShapePageBounds(s.id)
   if (!pb) return
-
-  const g = (typeof DRAG_GUTTER === 'number' ? DRAG_GUTTER : 0)
-  const ax = pb.x + g
-  const ay = pb.y + g
-  const aw = Math.max(1, pb.w - 2 * g)
-  const ah = Math.max(1, pb.h - 2 * g)
-
-  editor.zoomToBounds(new Box(ax, ay, aw, ah), { inset: 0 })
+  editor.zoomToBounds(new Box(pb.x, pb.y, pb.w, pb.h), { inset: 0 })
 }
 
 function startInputGuards(): () => void {
@@ -354,11 +342,20 @@ const runFitOnce = (): void => {
 const fitOn = (): void => {
   runFitOnce()
 
+  // ⬇️ NEW: clear selection as we enter fit mode
+editor.selectNone()
+
   let raf = 0
   let last = { vw: -1, vh: -1 }
 
   const step = () => {
     raf = requestAnimationFrame(step)
+
+    // ⬇️ NEW: keep clearing if anything re-selects during fit
+    if (editor.getSelectedShapeIds().length > 0) {
+      editor.selectNone()
+    }
+
     const s = editor.getShape<BrowserShape>(shape.id); if (!s) return
     const { vw, vh } = getViewportPx()
     if (vw !== last.vw || vh !== last.vh) {
@@ -388,17 +385,11 @@ const fitOff = (): void => {
         { id: s.id, type: 'browser-shape', x: saved.x, y: saved.y, props: { ...s.props, w: saved.w, h: saved.h } },
       ])
     } else {
-      // fallback: restore around page center (deflate page bounds first)
+      // fallback: restore around page center (tight bounds)
       const pb = editor.getShapePageBounds(s.id)
       if (pb) {
-        const g = (typeof DRAG_GUTTER === 'number' ? DRAG_GUTTER : 0)
-        const ax = pb.x + g
-        const ay = pb.y + g
-        const aw = Math.max(1, pb.w - 2 * g)
-        const ah = Math.max(1, pb.h - 2 * g)
-
-        const cx = ax + aw / 2
-        const cy = ay + ah / 2
+        const cx = pb.x + pb.w / 2
+        const cy = pb.y + pb.h / 2
         const x = Math.round(cx - saved.w / 2)
         const y = Math.round(cy - saved.h / 2)
 
@@ -424,6 +415,63 @@ const onToggleFit = (): void => { (fitMode ? fitOff : fitOn)() }
 
 // ---- Render ------------------------------------------------------------
 const BORDER = 3 // keep tldraw blue outline visible without shrinking content
+
+
+type DragState = {
+  pointerId: number
+  startPage: { x: number; y: number }
+  origin: { x: number; y: number }
+}
+const dragRef = useRef<DragState | null>(null)
+
+const gutterDown = (e: React.PointerEvent<HTMLDivElement>): void => {
+  e.preventDefault()
+  e.stopPropagation()
+
+  const s = editor.getShape<BrowserShape>(shape.id)
+  if (!s) return
+
+  editor.select(shape.id as TLShapeId)
+  editor.bringToFront([shape.id as TLShapeId])
+
+  const start = editor.screenToPage({ x: e.clientX, y: e.clientY })
+  dragRef.current = {
+    pointerId: e.pointerId,
+    startPage: start,
+    origin: { x: s.x, y: s.y },
+  }
+  e.currentTarget.setPointerCapture(e.pointerId)
+}
+
+const gutterMove = (e: React.PointerEvent<HTMLDivElement>): void => {
+  const st = dragRef.current
+  if (!st) return
+  e.preventDefault()
+  e.stopPropagation()
+
+  const now = editor.screenToPage({ x: e.clientX, y: e.clientY })
+  const dx = now.x - st.startPage.x
+  const dy = now.y - st.startPage.y
+
+  editor.updateShapes([
+    {
+      id: shape.id,
+      type: 'browser-shape',
+      x: st.origin.x + dx,
+      y: st.origin.y + dy,
+      props: { ...shape.props },
+    },
+  ])
+}
+
+const gutterEnd = (e: React.PointerEvent<HTMLDivElement>): void => {
+  const st = dragRef.current
+  if (st) {
+    try { e.currentTarget.releasePointerCapture(st.pointerId) } catch {}
+  }
+  dragRef.current = null
+}
+
 
 return (
   <HTMLContainer
@@ -528,60 +576,82 @@ return (
       </div>
     </div>
 
-    {/* -------- Massive OUTER drag gutters (effortless grabbing) -------- */}
+    {/* -------- Invisible OUTER drag gutters (effortless grabbing; no visuals) -------- */}
     {/* Place gutters under the navbar (zIndex: 1) so the nav always wins */}
-    <div
-      style={{
-        position: 'absolute',
-        top: -DRAG_GUTTER,
-        left: -DRAG_GUTTER,
-        right: -DRAG_GUTTER,
-        height: DRAG_GUTTER,
-        cursor: 'move',
-        pointerEvents: 'auto',
-        background: 'transparent',
-        zIndex: 1,
-      }}
-    />
-    <div
-      style={{
-        position: 'absolute',
-        bottom: -DRAG_GUTTER,
-        left: -DRAG_GUTTER,
-        right: -DRAG_GUTTER,
-        height: DRAG_GUTTER,
-        cursor: 'move',
-        pointerEvents: 'auto',
-        background: 'transparent',
-        zIndex: 1,
-      }}
-    />
-    <div
-      style={{
-        position: 'absolute',
-        top: -DRAG_GUTTER,
-        bottom: -DRAG_GUTTER,
-        left: -DRAG_GUTTER,
-        width: DRAG_GUTTER,
-        cursor: 'move',
-        pointerEvents: 'auto',
-        background: 'transparent',
-        zIndex: 1,
-      }}
-    />
-    <div
-      style={{
-        position: 'absolute',
-        top: -DRAG_GUTTER,
-        bottom: -DRAG_GUTTER,
-        right: -DRAG_GUTTER,
-        width: DRAG_GUTTER,
-        cursor: 'move',
-        pointerEvents: 'auto',
-        background: 'transparent',
-        zIndex: 1,
-      }}
-    />
+<div
+  onPointerDown={gutterDown}
+  onPointerMove={gutterMove}
+  onPointerUp={gutterEnd}
+  onPointerCancel={gutterEnd}
+  style={{
+    position: 'absolute',
+    top: -DRAG_GUTTER,
+    left: -DRAG_GUTTER,
+    right: -DRAG_GUTTER,
+    height: DRAG_GUTTER,
+    cursor: 'move',
+    pointerEvents: 'auto',
+    background: 'transparent',
+    zIndex: 1,
+  }}
+/>
+
+{/* Bottom gutter */}
+<div
+  onPointerDown={gutterDown}
+  onPointerMove={gutterMove}
+  onPointerUp={gutterEnd}
+  onPointerCancel={gutterEnd}
+  style={{
+    position: 'absolute',
+    bottom: -DRAG_GUTTER,
+    left: -DRAG_GUTTER,
+    right: -DRAG_GUTTER,
+    height: DRAG_GUTTER,
+    cursor: 'move',
+    pointerEvents: 'auto',
+    background: 'transparent',
+    zIndex: 1,
+  }}
+/>
+
+{/* Left gutter */}
+<div
+  onPointerDown={gutterDown}
+  onPointerMove={gutterMove}
+  onPointerUp={gutterEnd}
+  onPointerCancel={gutterEnd}
+  style={{
+    position: 'absolute',
+    top: -DRAG_GUTTER,
+    bottom: -DRAG_GUTTER,
+    left: -DRAG_GUTTER,
+    width: DRAG_GUTTER,
+    cursor: 'move',
+    pointerEvents: 'auto',
+    background: 'transparent',
+    zIndex: 1,
+  }}
+/>
+
+{/* Right gutter */}
+<div
+  onPointerDown={gutterDown}
+  onPointerMove={gutterMove}
+  onPointerUp={gutterEnd}
+  onPointerCancel={gutterEnd}
+  style={{
+    position: 'absolute',
+    top: -DRAG_GUTTER,
+    bottom: -DRAG_GUTTER,
+    right: -DRAG_GUTTER,
+    width: DRAG_GUTTER,
+    cursor: 'move',
+    pointerEvents: 'auto',
+    background: 'transparent',
+    zIndex: 1,
+  }}
+/>
   </HTMLContainer>
 )
 

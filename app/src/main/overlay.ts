@@ -538,6 +538,11 @@ view.webContents.session.setPermissionRequestHandler(
         return
       }
 
+      if (permission === 'fullscreen') {
+        callback(true) // always allow fullscreen
+        return
+      }
+
       if (permission === 'media') {
         // Only in media requests: safely check for mediaTypes
         const which =
@@ -566,9 +571,11 @@ view.webContents.session.setPermissionRequestHandler(
   }
 )
 
-// Chromium’s pre-check: say "yes" for clipboard
+// Chromium's pre-check: say "yes" for clipboard AND fullscreen
 view.webContents.session.setPermissionCheckHandler((_wc, permission) => {
-  return permission === 'clipboard-read' || permission === 'clipboard-sanitized-write'
+  return permission === 'clipboard-read' || 
+         permission === 'clipboard-sanitized-write' ||
+         permission === 'fullscreen'
 })
 // DisplayMedia handler: only Paper + Desktop
 view.webContents.session.setDisplayMediaRequestHandler(async (_request, callback) => {
