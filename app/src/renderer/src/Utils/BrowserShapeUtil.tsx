@@ -416,52 +416,101 @@ const onToggleFit = (): void => { (fitMode ? fitOff : fitOn)() }
 // ---- Render ------------------------------------------------------------
 const BORDER = 3 // keep tldraw blue outline visible without shrinking content
 
-
 type DragState = {
   pointerId: number
   startPage: { x: number; y: number }
-  origin: { x: number; y: number }
+  targetId: TLShapeId
 }
 const dragRef = useRef<DragState | null>(null)
 
+/** Topmost group ancestor id (or null if none). */
+const getTopGroupAncestorId = (ed: Editor, id: TLShapeId): TLShapeId | null => {
+  let parentId: TLParentId | null = ed.getShape(id)?.parentId ?? null
+  let topGroupId: TLShapeId | null = null
+  while (parentId) {
+    const parentShapeId = parentId as unknown as TLShapeId
+    const parent = ed.getShape(parentShapeId)
+    if (parent?.type === 'group') topGroupId = parentShapeId
+    parentId = parent?.parentId ?? null
+  }
+  return topGroupId
+}
+
+/** Runtime guard for shapes that expose x/y (groups & normal shapes). */
+const hasXY = (s: unknown): s is { x: number; y: number } => {
+  return !!s &&
+    typeof (s as { x?: unknown }).x === 'number' &&
+    typeof (s as { y?: unknown }).y === 'number'
+}
+
 const gutterDown = (e: React.PointerEvent<HTMLDivElement>): void => {
-  e.preventDefault()
-  e.stopPropagation()
+  const selectedIds = editor.getSelectedShapeIds()
+  const isMultiSelect = selectedIds.length > 1
+  if (isMultiSelect) {
+    // Let tldraw handle multi-selection movement
+    return
+  }
 
-  const s = editor.getShape<BrowserShape>(shape.id)
-  if (!s) return
+  // Prefer moving the topmost group if this shape lives in one
+  const selfId = shape.id as TLShapeId
+  const groupId = getTopGroupAncestorId(editor, selfId)
+  const targetId = groupId ?? selfId
 
-  editor.select(shape.id as TLShapeId)
-  editor.bringToFront([shape.id as TLShapeId])
+  const target = editor.getShape(targetId)
+  if (!hasXY(target)) return
+
+  // Select the movement target and bring it to front
+  editor.select(targetId)
+  editor.bringToFront([targetId])
 
   const start = editor.screenToPage({ x: e.clientX, y: e.clientY })
   dragRef.current = {
     pointerId: e.pointerId,
     startPage: start,
-    origin: { x: s.x, y: s.y },
+    targetId,
   }
+
   e.currentTarget.setPointerCapture(e.pointerId)
+  e.preventDefault()
+  e.stopPropagation()
 }
 
 const gutterMove = (e: React.PointerEvent<HTMLDivElement>): void => {
   const st = dragRef.current
   if (!st) return
-  e.preventDefault()
-  e.stopPropagation()
 
   const now = editor.screenToPage({ x: e.clientX, y: e.clientY })
   const dx = now.x - st.startPage.x
   const dy = now.y - st.startPage.y
+  if (dx === 0 && dy === 0) return
 
-  editor.updateShapes([
-    {
-      id: shape.id,
-      type: 'browser-shape',
-      x: st.origin.x + dx,
-      y: st.origin.y + dy,
-      props: { ...shape.props },
-    },
-  ])
+  const target = editor.getShape(st.targetId)
+  if (!target || !hasXY(target)) return
+
+  // Move the correct thing:
+  // - if target is a group → move the group (children follow)
+  // - else                → move the single browser-shape
+  if (target.type === 'group') {
+    editor.updateShapes([
+      { id: st.targetId, type: 'group', x: target.x + dx, y: target.y + dy },
+    ])
+  } else {
+    editor.updateShapes([
+      {
+        id: st.targetId,
+        type: 'browser-shape',
+        x: target.x + dx,
+        y: target.y + dy,
+        props: { ...shape.props },
+      },
+    ])
+  }
+
+  // Advance baseline so we apply incremental deltas (smooth drag)
+  st.startPage = now
+
+  e.preventDefault()
+  e.stopPropagation()
 }
 
 const gutterEnd = (e: React.PointerEvent<HTMLDivElement>): void => {
