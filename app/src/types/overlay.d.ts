@@ -18,6 +18,16 @@ export interface NavigationState {
   title: string
 }
 
+export type Flags = {
+  audible: boolean
+  capturing: boolean
+  devtools: boolean
+  downloads: boolean
+  pinned: boolean
+}
+
+export type LifecycleState = 'hot' | 'warm' | 'frozen' | 'discarded'
+
 export type NavigationStateResult =
   | ({ ok: true } & NavigationState & { /** surfaced from main via isLoading() */ isLoading: boolean })
   | { ok: false; error: string }
@@ -62,6 +72,14 @@ export interface PopupRequestPayload {
   parentTabId?: string
 }
 
+export interface FreezePayload { tabId: string }
+export interface ThawPayload { tabId: string }
+
+export interface SnapshotRequest { tabId: string; maxWidth?: number }
+export type SnapshotResult =
+  | { ok: true; dataUrl: string; width: number; height: number }
+  | { ok: false; error: string }
+
 export type OverlayNotice =
   | { kind: 'tab-limit'; max: number }
   | { kind: 'popup-suppressed'; url: string }
@@ -69,6 +87,8 @@ export type OverlayNotice =
   | { kind: 'nav-error'; tabId: string; code: number; description: string; url?: string }
   | { kind: 'screen-share-error'; message: string }
   | { kind: 'media-denied'; which: string }
+  | { kind: 'pressure'; level: 'normal' | 'elevated' | 'critical'; availableMB: number }
+  | { kind: 'flags'; tabId: string; flags: Flags }
 
 export interface PopupAckPayload {
   openerTabId: string
@@ -100,11 +120,68 @@ export interface OverlayAPI {
   /** Renderer ACK that it materialized the shape for {openerTabId,url}. */
   popupAck(payload: PopupAckPayload): void
 
-  // navigation
+  freeze(payload: FreezePayload): Promise<void>
+  thaw(payload: ThawPayload): Promise<void>
+  snapshot(request: SnapshotRequest): Promise<SnapshotResult>
+
   navigate(payload: NavigatePayload): Promise<SimpleResult>
   onNotice(cb: (n: OverlayNotice) => void): () => void
   goBack(payload: TabIdPayload): Promise<SimpleResult>
   goForward(payload: TabIdPayload): Promise<SimpleResult>
   reload(payload: TabIdPayload): Promise<SimpleResult>
   getNavigationState(payload: TabIdPayload): Promise<NavigationStateResult>
+}
+
+/* =========================================================================================
+   Electron typings augmentation
+   Reason: your Electron .d.ts may not declare these WebContents/Session event overloads.
+   This adds them so calls like wc.on('media-started-playing', ...) type-check cleanly.
+   Purely type-level; no runtime impact.
+   ========================================================================================= */
+
+import 'electron'
+
+declare module 'electron' {
+  interface WebContents {
+    on(event: 'media-started-playing', listener: (event: Electron.Event) => void): this
+    on(event: 'media-paused', listener: (event: Electron.Event) => void): this
+    on(event: 'devtools-opened', listener: (event: Electron.Event) => void): this
+    on(event: 'devtools-closed', listener: (event: Electron.Event) => void): this
+
+    on(
+      event: 'did-navigate-in-page',
+      listener: (
+        event: Electron.Event,
+        url: string,
+        isMainFrame: boolean,
+        frameProcessId: number,
+        frameRoutingId: number
+      ) => void
+    ): this
+
+    on(
+      event: 'did-navigate',
+      listener: (
+        event: Electron.Event,
+        url: string,
+        httpResponseCode: number,
+        httpStatusText: string
+      ) => void
+    ): this
+  }
+
+  interface Session {
+    on(
+      event: 'will-download',
+      listener: (
+        event: Electron.Event,
+        item: Electron.DownloadItem,
+        webContents: Electron.WebContents
+      ) => void
+    ): this
+
+    /** Present in Node's EventEmitter; declare to keep TS happy when you use it. */
+    listenerCount(eventName: string): number
+    setMaxListeners(n: number): this
+  }
 }

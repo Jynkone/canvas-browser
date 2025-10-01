@@ -5,6 +5,10 @@ import type {
   PopupAckPayload,
   PopupRequestPayload,
   OverlayNotice,
+  FreezePayload,
+  ThawPayload,
+  SnapshotRequest,
+  SnapshotResult,
 } from '../types/overlay'
 
 // 1) Versions bridge
@@ -14,7 +18,6 @@ contextBridge.exposeInMainWorld('electron', {
 
 // 2) Overlay bridge (typed via OverlayAPI)
 const overlay: OverlayAPI = {
-  // lifecycle / placement
   createTab: (payload) => ipcRenderer.invoke('overlay:create-tab', payload),
   show:      (payload) => ipcRenderer.invoke('overlay:show', payload),
   hide:      (payload) => ipcRenderer.invoke('overlay:hide', payload),
@@ -33,13 +36,18 @@ const overlay: OverlayAPI = {
   reload:            (payload) => ipcRenderer.invoke('overlay:reload', payload),
   getNavigationState:(payload) => ipcRenderer.invoke('overlay:get-navigation-state', payload),
 
-  // events
+  freeze:   (payload: FreezePayload)                 => ipcRenderer.invoke('overlay:freeze', payload),
+  thaw:     (payload: ThawPayload)                   => ipcRenderer.invoke('overlay:thaw', payload),
+  snapshot: (request: SnapshotRequest): Promise<SnapshotResult> =>
+  ipcRenderer.invoke('overlay:snapshot', request),
+
   onUrlUpdate: (callback) => {
     const ch = 'overlay-url-updated'
     const h = (_e: IpcRendererEvent, data: { tabId: string; url?: string }) => callback(data)
     ipcRenderer.on(ch, h)
     return () => ipcRenderer.removeListener(ch, h)
   },
+
 
   onPopupRequest: (callback) => {
     const ch = 'overlay-popup-request'

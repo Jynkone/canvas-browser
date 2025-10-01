@@ -8,6 +8,7 @@ import WithHotkeys from './Utils/WithHotkeys'
 import { useUiChromeManager } from './Utils/useUiChromeManager'
 import { Toaster, toast } from 'react-hot-toast'
 import type { OverlayNotice } from '../../types/overlay'
+import LifecycleHost from './LifecycleHost'
 
 const BROWSER_W = 1200
 const BROWSER_H = 660
@@ -146,7 +147,7 @@ export default function App() {
                 w: BROWSER_W,
                 h: BROWSER_H,
                 url: 'https://google.com',
-                tabId: '',
+                
               },
             }
             editor.createShape(initial as unknown as BrowserShape)
@@ -157,6 +158,7 @@ export default function App() {
         }}
       >
         <WithHotkeys BROWSER_W={BROWSER_W} BROWSER_H={BROWSER_H} editorRef={editorRef} />
+        <LifecycleHost editorRef={editorRef} />   
       </Tldraw>
     </div>
   )

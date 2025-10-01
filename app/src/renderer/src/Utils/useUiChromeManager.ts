@@ -72,52 +72,24 @@ function collectTargets(): Target[] {
       '[class="tlui-popover"]',
       '.tlui-top-bar',
       '.tlui-menu-bar',
-      '[role="menubar"]',
       '[class*="tlui-top"]',
       '[class*="toolbar"]',
       '[class*="tlui-menu"]',
 
       '[class*="tlui-menu"]',
-      '[class*="tlui-buttons__horizontal"]',
       '[class*="toolbar"]',
 
 
     ].join(',')
   )
-  const bottomCandidates = pick(
-    [
-      '[data-testid="tlui-bottom-zone"]',
-      '.tlui-bottom-zone',
-      '.tlui-navigation-zone',
-      '.tlui-navigation-panel',
-      '.tlui-page-menu',
-      '.tlui-help-menu',
-      '[data-testid="tlui-zoom-zone"]',
-      '.tlui-zoom',
-      '.tlui-zoom-zone',
-      '.tlui-zoom-menu',
-      '[data-testid="tlui-minimap-zone"]',
-      '.tlui-minimap',
-      '.tlui-minimap-zone',
-      '[class*="zoom"]',
-      '[class*="minimap"]',
-    ].join(',')
-  )
-  const leftCandidates = pick(
-    ['[data-testid="tlui-left-zone"]', '.tlui-left-zone', '.tlui-tools', '.tlui-tools-dock', '[class*="tlui-left"]'].join(
-      ','
-    )
-  )
   const rightCandidates = pick(
-    ['[data-testid="tlui-right-zone"]', '.tlui-right-zone', '.tlui-style-panel', '.tlui-inspector', '[class*="tlui-right"]'].join(
+    ['[data-testid="tlui-right-zone"]',  '.tlui-style-panel',  '[class*="tlui-right"]'].join(
       ','
     )
   )
 
   const out: Target[] = []
   for (const el of uniq(topCandidates)) out.push({ el, pos: 'top' })
-  for (const el of uniq(bottomCandidates)) out.push({ el, pos: 'bottom' })
-  for (const el of uniq(leftCandidates)) out.push({ el, pos: 'left' })
   for (const el of uniq(rightCandidates)) out.push({ el, pos: 'right' })
   return out
 }

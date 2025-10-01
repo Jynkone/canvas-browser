@@ -15,13 +15,13 @@ import { NavigationBar, NAV_BAR_HEIGHT } from '../components/NavigationBar'
 
 export type BrowserShape = TLBaseShape<
   'browser-shape',
-  { w: number; h: number; url: string; tabId: string }
+  { w: number; h: number; url: string }
 >
 
 const DRAG_GUTTER = 60 // invisible move hit area (no longer affects visuals/geometry)
 const MIN_W = 300
 // Geometry is tight now; don't bake gutters into visual min height.
-const MIN_H = 525 + NAV_BAR_HEIGHT
+const MIN_H = 225 + NAV_BAR_HEIGHT
 
 type Rect = { x: number; y: number; width: number; height: number }
 type NavState = { currentUrl: string; canGoBack: boolean; canGoForward: boolean; title: string }
@@ -66,7 +66,7 @@ override indicator(shape: BrowserShape) {
 
 
   override getDefaultProps(): BrowserShape['props'] {
-    return { w: 1200, h: 600 + NAV_BAR_HEIGHT, url: 'https://google.com', tabId: '' }
+    return { w: 1200, h: 600 + NAV_BAR_HEIGHT, url: 'https://google.com' }
   }
 
 

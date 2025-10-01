@@ -46,7 +46,7 @@ export default function WithHotkeys({ BROWSER_W, BROWSER_H, editorRef }: WithHot
         type: 'browser-shape',
         x,
         y,
-        props: { w: BROWSER_W, h: BROWSER_H, url: 'https://google.com', tabId: '' },
+        props: { w: BROWSER_W, h: BROWSER_H, url: 'https://google.com' },
       })
     }
 
@@ -129,7 +129,7 @@ export default function WithHotkeys({ BROWSER_W, BROWSER_H, editorRef }: WithHot
 
       // Anchor: opener tab (by props.tabId OR shape.id) → selected → none
       const byOpener = openerTabId
-        ? browsers.find(s => s.props.tabId === openerTabId || s.id === openerTabId)
+        ? browsers.find(s => s.id === openerTabId)
         : undefined
       const selected = byOpener
         ? undefined
@@ -278,7 +278,7 @@ export default function WithHotkeys({ BROWSER_W, BROWSER_H, editorRef }: WithHot
         type: 'browser-shape',
         x,
         y,
-        props: { w, h, url, tabId: '' },
+        props: { w, h, url },
       })
 
       if (openerTabId && api.popupAck) {

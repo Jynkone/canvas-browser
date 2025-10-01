@@ -1,8 +1,8 @@
-import { BrowserWindow, WebContentsView, ipcMain, Menu, desktopCapturer,dialog } from 'electron'
+import { BrowserWindow, WebContentsView, ipcMain, Menu, desktopCapturer,dialog, WebContents } from 'electron'
 import type { Debugger as ElectronDebugger, Input } from 'electron'
 import { writeFileSync, readFileSync, existsSync } from 'fs'
 import { join } from 'path'
-import type { OverlayNotice } from '../../src/types/overlay'
+import type { OverlayNotice, Flags } from '../../src/types/overlay'
 
 type Rect = { x: number; y: number; width: number; height: number }
 
@@ -23,6 +23,7 @@ type ViewState = {
   }
 }
 
+
 type Ok<T = {}> = { ok: true } & T
 type Err = { ok: false; error: string }
 type CreateTabResponse = Ok<{ tabId: string }> | Err
@@ -36,6 +37,7 @@ const MAX_VIEWS = 32
 const BORDER = 2
 
 const clamp = (n: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, n))
+const destroying = new Set<string>() // prevent re-entrant destroy(tabId)
 
 let canvasZoom = 1
 const STARTUP_DELAY_MS = 500
@@ -102,6 +104,126 @@ function effToBucketKey(eff: number): ZoomBucket {
 
 export function setupOverlayIPC(getWindow: () => BrowserWindow | null): void {
   const views = new Map<string, ViewState>()
+
+  const setLifecycle = async (wc: WebContents, target: 'frozen' | 'active'): Promise<void> => {
+  const dbg: ElectronDebugger = wc.debugger;
+  if (!dbg.isAttached()) dbg.attach('1.3');
+  await dbg.sendCommand('Page.setWebLifecycleState', { state: target });
+};
+
+function wireFlagsFor(tabId: string, wc: Electron.WebContents): void {
+  const DEAD_FLAGS: Flags = {
+    audible: false,
+    devtools: false,
+    downloads: false,
+    pinned: false,
+    capturing: false,
+  }
+
+  // Safe flags snapshot: never touches a destroyed WC; never throws.
+  const snapshot = (): Flags => {
+    try {
+      // Bail out if WC is gone
+      // (typeof checks keep us safe across Electron versions / mocks)
+      if (!wc || (typeof wc.isDestroyed === 'function' && wc.isDestroyed())) {
+        return DEAD_FLAGS
+      }
+
+      const audible =
+        typeof wc.isCurrentlyAudible === 'function' ? wc.isCurrentlyAudible() : false
+      const devtools =
+        typeof wc.isDevToolsOpened === 'function' ? wc.isDevToolsOpened() : false
+
+      return {
+        audible,
+        devtools,
+        downloads: false, // flipped by will-download, then reset
+        pinned: false,    // set elsewhere in your UI if you support it
+        capturing: false, // wire in if you track per-tab capture state
+      }
+    } catch {
+      // If anything throws, treat as dead.
+      return DEAD_FLAGS
+    }
+  }
+
+  const send = (flags: Flags): void => {
+    try {
+      sendNotice({ kind: 'flags', tabId, flags })
+    } catch {
+      // Never allow notice-send to crash the process
+    }
+  }
+
+  const emit = (): void => send(snapshot())
+
+  // --- Event-driven updates (cheap and safe)
+  try { wc.on('audio-state-changed', () => emit()) } catch {}
+  try { wc.on('did-navigate-in-page', () => emit()) } catch {}
+  try { wc.on('did-navigate', () => emit()) } catch {}
+
+  // --- Session 'will-download' -> flip downloads=true while this WC owns the item
+  try {
+    const ses = wc.session
+    // Avoid listener leak warnings in long sessions
+    try { ses.setMaxListeners?.(0) } catch {}
+
+    // Only attach once per session
+    if (ses && ses.listenerCount('will-download') === 0) {
+      ses.on('will-download', (_e, item, sourceWc) => {
+        try {
+          if (!sourceWc || sourceWc.id !== wc.id) return
+          const f = snapshot()
+          send({ ...f, downloads: true })
+          item.once('done', () => emit())
+        } catch {
+          // Ignore — treat as dead / no-op
+        }
+      })
+    }
+  } catch {
+    // No session available; fine — downloads flag just won’t toggle via this path
+  }
+
+  // --- Light poller for properties without reliable events (devtools/pinned/capturing)
+  // Emits ONLY on change and is fully try/catch wrapped.
+  let last: Flags | null = null
+  const POLL_MS = 250
+  const poll = setInterval(() => {
+    try {
+      const now = snapshot()
+      if (
+        !last ||
+        now.audible !== last.audible ||
+        now.devtools !== last.devtools ||
+        now.downloads !== last.downloads ||
+        now.pinned !== last.pinned ||
+        now.capturing !== last.capturing
+      ) {
+        last = now
+        send(now)
+      }
+    } catch {
+      // Never crash the process from a timer; treat as dead on next tick
+      last = DEAD_FLAGS
+    }
+  }, POLL_MS)
+
+  // Cleanup: clear poller and listeners once WC is destroyed
+  try {
+    wc.once('destroyed', () => {
+      try { clearInterval(poll) } catch {}
+      try { wc.removeAllListeners('audio-state-changed') } catch {}
+      try { wc.removeAllListeners('did-navigate-in-page') } catch {}
+      try { wc.removeAllListeners('did-navigate') } catch {}
+      // Emit a final "dead" snapshot so renderer state settles immediately
+      try { send(DEAD_FLAGS) } catch {}
+    })
+  } catch {
+    // If we can’t attach the destroyed handler, at worst the poller will see DEAD_FLAGS on next tick
+  }
+}
+
 
   const S = {
     resolve(id?: string | null) {
@@ -239,11 +361,12 @@ reapply(state: ViewState) {
     },
 
 
-    roundRect(rect: Rect) {
-      const x = Math.floor(rect.x), y = Math.floor(rect.y)
-      const w = Math.ceil(rect.width), h = Math.ceil(rect.height)
-      return { x, y, w, h }
-    },
+roundRect(rect: Rect) {
+  // rect is always a real Rect after Fix 1, but keep clamps & ints here
+  const x = Math.floor(rect.x), y = Math.floor(rect.y)
+  const w = Math.max(1, Math.ceil(rect.width)), h = Math.max(1, Math.ceil(rect.height))
+  return { x, y, w, h }
+},
   }
 
   let creating = false
@@ -529,6 +652,8 @@ function clearForChild(childTabId: string): void {
             backgroundThrottling: true,
           },
         })
+        wireFlagsFor(tabId, view.webContents)
+
 // Auto-allow clipboard read & write for every tab, prompt only for media
 view.webContents.session.setPermissionRequestHandler(
   async (_wc, permission, callback, details) => {
@@ -1043,15 +1168,29 @@ ipcMain.handle(
 
   ipcMain.handle('overlay:get-zoom', async (): Promise<number> => canvasZoom)
 
-  ipcMain.handle('overlay:show', async (_e, { tabId, rect }: { tabId: string; rect: Rect }): Promise<void> => {
+ipcMain.handle(
+  'overlay:show',
+  async (_e, payload: { tabId: string; rect?: Rect }): Promise<void> => {
     const win = getWindow()
-    const { state } = S.resolve(tabId)
+    const { state } = S.resolve(payload.tabId)
     if (!win || !state) return
-    const { x, y, w, h } = S.roundRect(rect)
+
+    // If no rect came from the renderer, fall back to the last known bounds (or a tiny default).
+    const baseRect: Rect =
+      payload.rect ??
+      (state.lastBounds
+        ? { x: state.lastBounds.x, y: state.lastBounds.y, width: state.lastBounds.w, height: state.lastBounds.h }
+        : { x: 0, y: 0, width: 1, height: 1 })
+
+    const { x, y, w, h } = S.roundRect(baseRect)
     state.lastBounds = { x, y, w, h }
+
     S.attach(win, state)
-    try { state.view.setBounds({ x, y, width: w, height: h }) } catch {}
-  })
+    try {
+      state.view.setBounds({ x, y, width: w, height: h })
+    } catch {}
+  }
+)
 
 ipcMain.handle(
   'overlay:set-bounds',
@@ -1157,121 +1296,195 @@ ipcMain.handle(
   }
 )
 
+ipcMain.handle('overlay:freeze', async (_e, { tabId }: { tabId: string }): Promise<void> => {
+  const { state } = S.resolve(tabId);
+  if (!state) return;
+  await setLifecycle(state.view.webContents, 'frozen');
+});
+
+ipcMain.handle('overlay:thaw', async (_e, { tabId }: { tabId: string }): Promise<void> => {
+  const { state } = S.resolve(tabId);
+  if (!state) return;
+  await setLifecycle(state.view.webContents, 'active');
+});
+
+ipcMain.handle(
+  'overlay:snapshot',
+  async (_e, { tabId, maxWidth }: { tabId: string; maxWidth?: number }) => {
+    // 1) if a destroy is in progress, do nothing
+    if (destroying.has(tabId)) return { ok: false as const, error: 'tab-destroying' }
+
+    // 2) resolve once and validate
+    const { state } = S.resolve(tabId)
+    const wc = state?.view?.webContents
+    if (!wc || typeof wc.isDestroyed !== 'function' || wc.isDestroyed()) {
+      return { ok: false as const, error: 'webcontents-destroyed' }
+    }
+
+    // 3) try the capture; if WC dies mid-await, just return an error (no throw)
+    try {
+      const img = await wc.capturePage()
+      const { width, height } = img.getSize()
+      const targetW = Math.min(maxWidth ?? 1024, width)
+      const scale = targetW / Math.max(1, width)
+      const resized = img.resize({ width: targetW, height: Math.round(height * scale) })
+      const jpeg = resized.toJPEG(72)
+      const dataUrl = `data:image/jpeg;base64,${Buffer.from(jpeg).toString('base64')}`
+      return { ok: true as const, dataUrl, width: targetW, height: Math.round(height * scale) }
+    } catch {
+      return { ok: false as const, error: 'snapshot-failed' }
+    }
+  }
+)
 
 
 ipcMain.handle('overlay:destroy', async (_e, { tabId }: { tabId: string }): Promise<void> => {
-  const { state } = S.resolve(tabId)
-  if (!state) return
-
-  console.log(`[overlay] Starting destroy for tabId: ${tabId}`)
-
-  const win = getWindow()
-  const view = state.view
-  const wc = view.webContents
-
-  // Step 1: Remove from our tracking immediately to prevent further operations
-  views.delete(tabId)
-  clearForChild(tabId)
-  delete browserState[tabId]
-  clearForOpener?.(tabId)
-
-  // Step 2: Stop all web activity immediately
-  try {
-    if (!wc.isDestroyed()) {
-      wc.stop()
-      wc.setAudioMuted(true)
-    }
-  } catch (e) {
-    console.warn(`[overlay] Error stopping webcontents for ${tabId}:`, e)
+  // Make it safe to call destroy multiple times
+  if (destroying.has(tabId)) {
+    console.warn(`[overlay] destroy already in progress for ${tabId}`)
+    return
   }
+  destroying.add(tabId)
 
-  // Step 3: Detach from parent window first (critical)
   try {
-    if (win && !win.isDestroyed() && state.attached) {
-      S.detach(win, state)
+    const resolved = S.resolve(tabId)
+    const state = resolved?.state
+    if (!state) {
+      console.warn(`[overlay] destroy: no state for ${tabId} (already removed)`)
+      return
     }
-  } catch (e) {
-    console.warn(`[overlay] Error detaching view for ${tabId}:`, e)
-  }
 
-  // Step 4: Clean up debugger and dev tools
-  try {
-    if (!wc.isDestroyed()) {
-      if (wc.isDevToolsOpened()) {
-        wc.closeDevTools()
-      }
-      if (wc.debugger.isAttached()) {
-        wc.debugger.detach()
-      }
-    }
-  } catch (e) {
-    console.warn(`[overlay] Error cleaning up debugger for ${tabId}:`, e)
-  }
+    console.log(`[overlay] Starting destroy for tabId: ${tabId}`)
 
-  // Step 5: Remove all event listeners to prevent memory leaks
-  try {
-    if (!wc.isDestroyed()) {
-      wc.removeAllListeners()
-    }
-  } catch (e) {
-    console.warn(`[overlay] Error removing listeners for ${tabId}:`, e)
-  }
+    const win: BrowserWindow | null = getWindow() ?? null
+    const view = state.view
+    const wc: WebContents | undefined = view?.webContents
 
-  // Step 6: Proper WebContents cleanup sequence
-  if (!wc.isDestroyed()) {
+    // Remove from tracking first to prevent new work racing in
     try {
-      // First try the documented close() method
-      await new Promise<void>((resolve) => {
-        let isResolved = false
+      views.delete(tabId)
+      clearForChild(tabId)
+      delete browserState[tabId]
+      clearForOpener?.(tabId)
+    } catch (e) {
+      console.warn(`[overlay] Error clearing maps for ${tabId}:`, e)
+    }
 
-        const cleanup = () => {
-          if (isResolved) return
-          isResolved = true
-          
+    // Stop activity early (only if wc exists)
+    try {
+      if (wc && !wc.isDestroyed()) {
+        wc.stop()
+        wc.setAudioMuted(true)
+      }
+    } catch (e) {
+      console.warn(`[overlay] Error stopping webcontents for ${tabId}:`, e)
+    }
+
+    // Detach from window if attached
+    try {
+      if (win && !win.isDestroyed() && state.attached) {
+        S.detach(win, state)
+      }
+    } catch (e) {
+      console.warn(`[overlay] Error detaching view for ${tabId}:`, e)
+    }
+
+    // Clean up devtools/debugger
+    try {
+      if (wc && !wc.isDestroyed()) {
+        if (typeof wc.isDevToolsOpened === 'function' && wc.isDevToolsOpened()) {
+          wc.closeDevTools()
+        }
+        if (wc.debugger && typeof wc.debugger.isAttached === 'function' && wc.debugger.isAttached()) {
+          // Clear any emulation overrides defensively, ignore failures
           try {
-            wc.off('destroyed', onDestroyed)
+            await wc.debugger.sendCommand?.('Emulation.clearDeviceMetricsOverride', {})
           } catch {}
-          
+          try {
+            wc.debugger.detach()
+          } catch {}
+        }
+      }
+    } catch (e) {
+      console.warn(`[overlay] Error cleaning up debugger for ${tabId}:`, e)
+    }
+
+    // Remove listeners we added (best-effort)
+    try {
+      if (wc && !wc.isDestroyed()) {
+        wc.removeAllListeners() // if you prefer, list specific events instead
+      }
+    } catch (e) {
+      console.warn(`[overlay] Error removing listeners for ${tabId}:`, e)
+    }
+
+    // Close/destroy sequence (guarded, with timeout fallback)
+    if (wc && !wc.isDestroyed()) {
+      const done = new Promise<void>((resolve) => {
+        let settled = false
+        const cleanup = (): void => {
+          if (settled) return
+          settled = true
+          try { wc.off('destroyed', onDestroyed) } catch {}
+          clearTimeout(to)
           resolve()
         }
-
-        // Listen for the destroyed event
-        const onDestroyed = () => {
+        const onDestroyed = (): void => {
           console.log(`[overlay] WebContents destroyed for ${tabId}`)
           cleanup()
         }
-        
+        const to = setTimeout(() => {
+          // If we timed out but wc still isn’t destroyed, attempt hard destroy if available
+          if (!wc.isDestroyed()) {
+            try {
+              // Cast without any: extend at runtime if method exists
+              (wc as WebContents & { destroy?: () => void }).destroy?.()
+              console.log(`[overlay] Called destroy() fallback for ${tabId} after timeout`)
+            } catch (err) {
+              console.warn(`[overlay] destroy() fallback failed for ${tabId}:`, err)
+            }
+          }
+          cleanup()
+        }, 1500) // 1.5s safety
+
         wc.once('destroyed', onDestroyed)
 
-        // Try close first (recommended approach)
         try {
           wc.close()
           console.log(`[overlay] Called close() for ${tabId}`)
-        } catch (closeError) {
-          console.warn(`[overlay] Close failed for ${tabId}, trying destroy:`, closeError)
-          // Fallback to destroy if close fails
+        } catch (closeErr) {
+          console.warn(`[overlay] close() failed for ${tabId}, trying destroy():`, closeErr)
           try {
-            (wc as any).destroy()
+            (wc as WebContents & { destroy?: () => void }).destroy?.()
             console.log(`[overlay] Called destroy() for ${tabId}`)
-          } catch (destroyError) {
-            console.error(`[overlay] Both close() and destroy() failed for ${tabId}:`, destroyError)
+          } catch (destroyErr) {
+            console.error(`[overlay] Both close() and destroy() failed for ${tabId}:`, destroyErr)
             cleanup()
           }
         }
       })
-    } catch (e) {
-      console.error(`[overlay] Error in cleanup sequence for ${tabId}:`, e)
+
+      try {
+        await done
+      } catch (e) {
+        console.error(`[overlay] Error in cleanup sequence for ${tabId}:`, e)
+      }
+    } else {
+      // wc is already gone or never created — nothing to close
+      console.log(`[overlay] No webContents for ${tabId}, destroy is a no-op`)
     }
-  }
 
-  // Step 7: Flush state to disk
-  try {
-    flushBrowserState()
-  } catch (e) {
-    console.warn(`[overlay] Error flushing browser state:`, e)
-  }
+    // Flush state to disk (best-effort)
+    try {
+      flushBrowserState()
+    } catch (e) {
+      console.warn('[overlay] Error flushing browser state:', e)
+    }
 
-  console.log(`[overlay] Destroy completed for tabId: ${tabId}`)
+    console.log(`[overlay] Destroy completed for tabId: ${tabId}`)
+  } finally {
+    destroying.delete(tabId)
+  }
 })
 
 
