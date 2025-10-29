@@ -48,13 +48,19 @@ const overlay: OverlayAPI = {
     return () => ipcRenderer.removeListener(ch, h)
   },
 
+onNavFinished: (cb) => {
+  const ch = 'overlay-nav-finished'
+  const h = (_e: IpcRendererEvent, data: { tabId: string; at: number }) => cb(data)
+  ipcRenderer.on(ch, h)
+  return () => ipcRenderer.removeListener(ch, h)
+},
 
-  onPopupRequest: (callback) => {
-    const ch = 'overlay-popup-request'
-    const h = (_e: IpcRendererEvent, data: PopupRequestPayload) => callback(data)
-    ipcRenderer.on(ch, h)
-    return () => ipcRenderer.removeListener(ch, h)
-  },
+onPopupRequest: (callback) => {
+  const ch = 'overlay-popup-request'
+  const h = (_e: IpcRendererEvent, data: PopupRequestPayload) => callback(data)
+  ipcRenderer.on(ch, h)
+  return () => ipcRenderer.removeListener(ch, h)
+},
 
   popupAck: (payload: PopupAckPayload) => ipcRenderer.invoke('overlay:popup-ack', payload),
 
@@ -64,6 +70,14 @@ const overlay: OverlayAPI = {
     ipcRenderer.on(ch, h)
     return () => ipcRenderer.removeListener(ch, h)
   },
+
+  onPressure: (cb) => {
+  const ch = 'overlay-pressure'
+  const h = (_e: IpcRendererEvent, p: { level: 'normal' | 'elevated' | 'critical'; freeMB: number; totalMB: number }) => cb(p)
+  ipcRenderer.on(ch, h)
+  return () => ipcRenderer.removeListener(ch, h)
+},
+
 } satisfies OverlayAPI
 
 contextBridge.exposeInMainWorld('overlay', overlay)

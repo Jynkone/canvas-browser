@@ -1,6 +1,16 @@
 import { useEffect, useMemo, useRef } from 'react'
 import type { Editor, TLShapeId } from 'tldraw'
 import { useLifecycleManager } from './useLifecycleManager'
+import type { OverlayAPI } from '../../types/overlay'
+
+declare global {
+  interface Window {
+    overlay: OverlayAPI
+    __tabState?: Map<string, 'hot' | 'warm' | 'frozen' | 'discarded'>
+    __tabThumbs?: Map<string, { url: string; dataUrlWebp: string }>
+  }
+}
+
 
 type Props = { editorRef: React.MutableRefObject<Editor | null> }
 
@@ -47,6 +57,26 @@ const readTabInfoFromShape = (
   return { tabId: String(shapeId), url: typeof url === 'string' ? url : '' }
 }
 
+/* ------------------------------------------------------------------ */
+
+if (!window.__tabState) window.__tabState = new Map()
+if (!window.__tabThumbs) window.__tabThumbs = new Map()
+
+/** Convert a PNG data URL (from main) to a WebP data URL (renderer side). */
+async function pngDataUrlToWebpDataUrl(pngDataUrl: string, quality: number): Promise<string> {
+  const res = await fetch(pngDataUrl)
+  const blob = await res.blob()
+  const bmp = await createImageBitmap(blob)
+  const canvas = new OffscreenCanvas(bmp.width, bmp.height)
+  const ctx = canvas.getContext('2d', { willReadFrequently: false })
+  if (!ctx) return pngDataUrl
+  ctx.drawImage(bmp, 0, 0)
+  const webp = await canvas.convertToBlob({ type: 'image/webp', quality })
+  const buf = await webp.arrayBuffer()
+  const base64 = btoa(String.fromCharCode(...new Uint8Array(buf)))
+  return `data:image/webp;base64,${base64}`
+}
+
 export default function LifecycleHost({ editorRef }: Props) {
   // Selection-driven “last interaction” timestamps
   const lastInteraction = useRef<Map<TLShapeId, number>>(new Map())
@@ -76,7 +106,11 @@ export default function LifecycleHost({ editorRef }: Props) {
   useEffect(() => {
     const off = window.overlay.onNotice(n => {
       if ((n as { kind?: unknown }).kind === 'flags') {
-        const rec = n as { kind: 'flags'; tabId: string; flags: { audible: boolean; capturing: boolean; devtools: boolean; downloads: boolean; pinned: boolean } }
+        const rec = n as {
+          kind: 'flags'
+          tabId: string
+          flags: { audible: boolean; capturing: boolean; devtools: boolean; downloads: boolean; pinned: boolean }
+        }
         flagsByTab.current.set(rec.tabId, rec.flags)
       }
     })
@@ -144,30 +178,69 @@ export default function LifecycleHost({ editorRef }: Props) {
       thaw: async (tabId: string) => { await window.overlay.thaw({ tabId }) },
       destroy: async (tabId: string) => { await window.overlay.destroy({ tabId }) },
 
-      // Optional: thumbnails (safe no-op right now)
-      snapshot: async (_tabId: string, _maxWidth?: number) => { /* no-op for now */ },
+      // Thumbnails: capture (main returns PNG), convert to WebP, store once
+      snapshot: async (tabId: string, maxWidth = 640) => {
+        const res = await window.overlay.snapshot({ tabId, maxWidth })
+        if (!('ok' in res) || !res.ok) return null
+
+        const webp = await pngDataUrlToWebpDataUrl(res.dataUrl, 0.65)
+        // Tag with current URL to avoid duplicates
+        const nav = await window.overlay.getNavigationState({ tabId })
+        const currentUrl = ('ok' in nav && nav.ok) ? (nav.currentUrl ?? 'about:blank') : 'about:blank'
+        window.__tabThumbs!.set(tabId, { url: currentUrl, dataUrlWebp: webp })
+        return webp
+      },
     }
   }, [editorRef])
 
   const outputs = useMemo(() => {
     return {
-      setLifecycle: (_shapeId: TLShapeId, _state: 'hot' | 'warm' | 'frozen' | 'discarded') => {
-        // Hook for UI chips / debug logs
-        // console.debug('[lifecycle]', _shapeId, _state)
+      setLifecycle: (shapeId: TLShapeId, state: 'hot' | 'warm' | 'frozen' | 'discarded') => {
+        // Update per-tab state map for BrowserShapeUtil / UI
+        const ed = editorRef.current
+        if (ed) {
+          const info = readTabInfoFromShape(ed, shapeId)
+          if (info) {
+            window.__tabState!.set(info.tabId, state)
+            // If we demote and there is no thumbnail yet, capture once in background
+            if ((state === 'warm' || state === 'frozen') && !window.__tabThumbs!.has(info.tabId)) {
+              void inputs.snapshot(info.tabId, 640)
+            }
+          }
+        }
       },
     }
-  }, [])
+  }, [editorRef, inputs])
 
   // Conservative but reasonable defaults
   const limits = useMemo(() => ({
-    hotCapNormal: 6,
-    hotCapOverview: 6,
+    hotCapNormal: 6,      // >45%: in-view toggling; cap can be relaxed by the manager
+    hotCapOverview: 6,    // ≤45%: keep exactly 6 HOT (policy)
     liveCap: 14,
     warmIdleMs: 15_000,
     freezeHiddenMs: 240_000,
     discardHiddenMs: 2_400_000,
     tinyPxFloor: 48_000,
   }), [])
+
+  // Snapshot strictly on nav-finished, and only if currently HOT
+  useEffect(() => {
+    const off = window.overlay.onNavFinished(async ({ tabId }: { tabId: string; at: number }) => {
+      const isHot = window.__tabState!.get(tabId) === 'hot'
+      if (!isHot) return
+
+      const nav = await window.overlay.getNavigationState({ tabId })
+      if (!('ok' in nav) || !nav.ok) return
+      const currentUrl = nav.currentUrl ?? 'about:blank'
+
+      const prev = window.__tabThumbs!.get(tabId)
+      if (prev && prev.url === currentUrl) return
+
+      // small delay so first stable paint is captured
+      setTimeout(() => { void inputs.snapshot(tabId, 640) }, 80)
+    })
+    return () => off()
+  }, [inputs])
 
   useLifecycleManager(inputs, outputs, limits)
   return null

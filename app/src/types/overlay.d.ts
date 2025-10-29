@@ -113,6 +113,10 @@ export interface OverlayAPI {
 
   // events
   onUrlUpdate(callback: (data: { tabId: string; url?: string }) => void): () => void
+  onPressure(
+  cb: (p: { level: 'normal' | 'elevated' | 'critical'; freeMB: number; totalMB: number }) => void
+): () => void
+
 
   /** Emits when main wants the renderer to create a BrowserShape. */
   onPopupRequest(callback: (data: PopupRequestPayload) => void): () => void
@@ -130,14 +134,9 @@ export interface OverlayAPI {
   goForward(payload: TabIdPayload): Promise<SimpleResult>
   reload(payload: TabIdPayload): Promise<SimpleResult>
   getNavigationState(payload: TabIdPayload): Promise<NavigationStateResult>
-}
+  onNavFinished(cb: (n: { tabId: string; at: number }) => void): () => void
 
-/* =========================================================================================
-   Electron typings augmentation
-   Reason: your Electron .d.ts may not declare these WebContents/Session event overloads.
-   This adds them so calls like wc.on('media-started-playing', ...) type-check cleanly.
-   Purely type-level; no runtime impact.
-   ========================================================================================= */
+}
 
 import 'electron'
 
@@ -180,7 +179,6 @@ declare module 'electron' {
       ) => void
     ): this
 
-    /** Present in Node's EventEmitter; declare to keep TS happy when you use it. */
     listenerCount(eventName: string): number
     setMaxListeners(n: number): this
   }
