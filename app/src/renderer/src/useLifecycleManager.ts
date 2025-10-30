@@ -68,8 +68,8 @@ export interface Limits {
 
 /* ====================== Local constants ====================== */
 
-/** Strict overview pivot: below this, do NOT turn tabs on unless interacted */
-const OVERVIEW_ZOOM_CUTOFF = 0.45
+/** Strict overview pivot: below/equal this, we DO NOT swap by visibility while panning. */
+const OVERVIEW_ZOOM_CUTOFF = 0.30 // 30%
 /** Polling cadence for reconciliation (~33 FPS) */
 const TICK_MS = 30
 /** Motion idleness thresholds */
@@ -94,9 +94,14 @@ export function useLifecycleManager(inputs: Inputs, outputs: Outputs, limits: Li
     // motion tracking
     lastPanSig: number
     lastPanTs: number
+    wasPanIdle: boolean
     lastZoom: number
     lastZoomTs: number
     ticking: boolean
+    // overview pan lock
+    lockedHot: Set<TabId>
+    // MRU tracking (last seen interaction timestamps per tab)
+    lastInteractionByTab: Map<TabId, number>
   }>({
     hot: new Map(),
     warm: new Map(),
@@ -106,9 +111,12 @@ export function useLifecycleManager(inputs: Inputs, outputs: Outputs, limits: Li
     byShape: new Map(),
     lastPanSig: 0,
     lastPanTs: 0,
+    wasPanIdle: true,
     lastZoom: 1,
     lastZoomTs: 0,
     ticking: false,
+    lockedHot: new Set<TabId>(),
+    lastInteractionByTab: new Map<TabId, number>(),
   })
 
   useEffect(() => {
@@ -134,6 +142,13 @@ export function useLifecycleManager(inputs: Inputs, outputs: Outputs, limits: Li
       for (const [sid, tid] of st.current.byShape) {
         if (tid === tabId) st.current.byShape.delete(sid)
       }
+    }
+
+    const shapeIdForTab = (tabId: TabId): TLShapeId | undefined => {
+      for (const [sid, tid] of st.current.byShape) {
+        if (tid === tabId) return sid
+      }
+      return undefined
     }
 
     const promoteToHot = (shapeId: TLShapeId, tabId: TabId): void => {
@@ -178,6 +193,8 @@ export function useLifecycleManager(inputs: Inputs, outputs: Outputs, limits: Li
       void inputs.destroy(tabId)
       st.current.hidden.delete(tabId)
       untrackShapeTab(tabId)
+      st.current.lastInteractionByTab.delete(tabId)
+      st.current.lockedHot.delete(tabId)
     }
 
     const panSignature = (geoms: ReadonlyArray<ShapeGeom>): number => {
@@ -192,6 +209,68 @@ export function useLifecycleManager(inputs: Inputs, outputs: Outputs, limits: Li
         acc += (h % 9973) * g.overlap
       }
       return acc
+    }
+
+    /** Build locked HOT = elevated ∪ top-N MRU (by lastInteraction), across all tracked shapes */
+    const rebuildLockedHot = (): void => {
+      const next = new Set<TabId>()
+      // 1) elevated (across ALL tracked shapes)
+      for (const [shapeId, tabId] of st.current.byShape) {
+        const flags = inputs.getFlags(shapeId)
+        if (isElevated(flags)) next.add(tabId)
+      }
+      // 2) non-elevated top-N MRU
+      const nonElev: Array<{ tabId: TabId; shapeId: TLShapeId; last: number }> = []
+      for (const [shapeId, tabId] of st.current.byShape) {
+        const flags = inputs.getFlags(shapeId)
+        if (isElevated(flags)) continue
+        const last = inputs.getLastInteractionMs(shapeId) ?? 0
+        nonElev.push({ tabId, shapeId, last })
+      }
+      nonElev.sort((a, b) => b.last - a.last)
+      const toTake = Math.max(0, limits.hotCapOverview - next.size)
+      for (let i = 0, taken = 0; i < nonElev.length && taken < toTake; i++) {
+        const tid = nonElev[i]!.tabId
+        if (next.has(tid)) continue
+        next.add(tid)
+        taken++
+      }
+      st.current.lockedHot = next
+    }
+
+    /** Enforce the locked set: keep locked (or elevated) HOT, everyone else non-elevated → WARM */
+    const enforceLockedHot = (): void => {
+      // Demote any non-elevated HOT not in locked set
+      for (const [tid, rec] of st.current.hot) {
+        // If it's locked or elevated, keep hot
+        const flags = inputs.getFlags(rec.shapeId)
+        if (st.current.lockedHot.has(tid) || isElevated(flags)) continue
+        demoteToWarm(rec.shapeId, tid)
+      }
+      // Promote all locked that are not hot yet
+      for (const tid of st.current.lockedHot) {
+        if (st.current.hot.has(tid)) continue
+        const sid = shapeIdForTab(tid)
+        if (!sid) continue
+        promoteToHot(sid, tid)
+      }
+    }
+
+    /** Track interaction changes and refresh lock if an MRU bump happened */
+    const maybeRefreshLockOnInteraction = (inOverviewAndPanning: boolean): void => {
+      if (!inOverviewAndPanning) return
+      let changed = false
+      for (const [shapeId, tabId] of st.current.byShape) {
+        const last = inputs.getLastInteractionMs(shapeId) ?? 0
+        const prev = st.current.lastInteractionByTab.get(tabId) ?? 0
+        if (last !== prev) {
+          changed = true
+        }
+        st.current.lastInteractionByTab.set(tabId, last)
+      }
+      if (changed) {
+        rebuildLockedHot()
+      }
     }
 
     /* ---------- main reconcile ---------- */
@@ -231,18 +310,40 @@ export function useLifecycleManager(inputs: Inputs, outputs: Outputs, limits: Li
           const lastInteraction = inputs.getLastInteractionMs(g.id) ?? 0
           visible.push({ shapeId: g.id, tabId: info.tabId, flags, px, lastInteraction })
           trackShapeTab(g.id, info.tabId)
+          // keep MRU cache up-to-date
+          st.current.lastInteractionByTab.set(info.tabId, lastInteraction)
         }
         const visibleSet = new Set<TabId>(visible.map(v => v.tabId))
 
-        /* ---------- NOTHING mutational during zoom ---------- */
+        // Detect pan state transition
+        const panBecameActive = st.current.wasPanIdle && !panIdle
+        const isOverviewAndPanning = overviewMode && !panIdle
+        st.current.wasPanIdle = panIdle
+
+        /* ---------- NOTHING mutational during zoom motion ---------- */
         if (!zoomIdle) {
           // Do not promote, do not demote (even off-screen), do not run timers.
           return
         }
 
-        /* ---------- PANNING-ONLY fast path (zoom idle, pan active) ---------- */
+        /* ---------- OVERVIEW (≤ 30%) + PANNING: LOCKED HOT ---------- */
+        if (isOverviewAndPanning) {
+          if (panBecameActive) {
+            // Latch the lock when panning starts in overview
+            rebuildLockedHot()
+          } else {
+            // If any MRU changed, rebuild the lock so interaction can reshuffle while panning
+            maybeRefreshLockOnInteraction(true)
+          }
+          // Enforce the lock: no visibility-based swapping here
+          enforceLockedHot()
+          // Skip timers during active pan to minimize work
+          return
+        }
+
+        /* ---------- DETAIL (> 30%) + PANNING: fast follow visibility ---------- */
         if (!panIdle) {
-          // Instant off-screen demote for non-elevated hots (Goal 1)
+          // Instant off-screen demote for non-elevated hots
           for (const [tid, rec] of st.current.hot) {
             if (visibleSet.has(tid)) continue
             const flags = inputs.getFlags(rec.shapeId)
@@ -250,27 +351,22 @@ export function useLifecycleManager(inputs: Inputs, outputs: Outputs, limits: Li
             demoteToWarm(rec.shapeId, tid)
           }
 
-          if (overviewMode) {
-            // Below 45%: never turn on during pan
-            // (elevated remain hot due to guard above)
-          } else {
-            // ≥ 45%: allow at most one safe promotion per tick to keep UX snappy
-            const strongPx = limits.tinyPxFloor * 8
-            let chosen: { shapeId: TLShapeId; tabId: TabId } | null = null
-            const ordered = [...visible]
-              .filter(v => !st.current.hot.has(v.tabId))
-              .sort((a, b) => (b.px - a.px))
-            for (let i = 0; i < ordered.length; i++) {
-              const v = ordered[i]!
-              if (isElevated(v.flags) || v.px >= strongPx) {
-                chosen = { shapeId: v.shapeId, tabId: v.tabId }
-                break
-              }
+          // Allow at most one safe promotion per tick
+          const strongPx = limits.tinyPxFloor * 8
+          let chosen: { shapeId: TLShapeId; tabId: TabId } | null = null
+          const ordered = [...visible]
+            .filter(v => !st.current.hot.has(v.tabId))
+            .sort((a, b) => (b.px - a.px))
+          for (let i = 0; i < ordered.length; i++) {
+            const v = ordered[i]!
+            if (isElevated(v.flags) || v.px >= strongPx) {
+              chosen = { shapeId: v.shapeId, tabId: v.tabId }
+              break
             }
-            if (chosen) promoteToHot(chosen.shapeId, chosen.tabId)
           }
+          if (chosen) promoteToHot(chosen.shapeId, chosen.tabId)
 
-          // Skip timers during active pan to minimize work
+          // Skip timers during active pan
           return
         }
 
@@ -278,24 +374,27 @@ export function useLifecycleManager(inputs: Inputs, outputs: Outputs, limits: Li
 
         // 1) Elevated tabs always hot (visible or not)
         const desiredHot = new Set<TabId>()
-        for (let i = 0; i < visible.length; i++) {
-          const v = visible[i]!
-          if (isElevated(v.flags)) desiredHot.add(v.tabId)
-        }
-        for (const [tid, rec] of st.current.hot) {
-          const flags = inputs.getFlags(rec.shapeId)
-          if (isElevated(flags)) desiredHot.add(tid)
+        // Use all tracked shapes to keep elevated hot even if not visible
+        for (const [shapeId, tabId] of st.current.byShape) {
+          const flags = inputs.getFlags(shapeId)
+          if (isElevated(flags)) desiredHot.add(tabId)
         }
 
         // 2) Non-elevated selection
         if (overviewMode) {
-          // STRICT: only interacted tabs may turn hot (MRU>0), cap to hotCapOverview
-          const nonElevInteracted = visible
-            .filter(v => !isElevated(v.flags) && v.lastInteraction > 0)
-            .sort((a, b) => (b.lastInteraction - a.lastInteraction))
-          const take = Math.max(0, limits.hotCapOverview - desiredHot.size)
-          for (let i = 0; i < nonElevInteracted.length && i < take; i++) {
-            desiredHot.add(nonElevInteracted[i]!.tabId)
+          // STRICT overview: fill with top-N MRU across all tracked shapes (not just visible)
+          const nonElev: Array<{ tabId: TabId; shapeId: TLShapeId; last: number }> = []
+          for (const [shapeId, tabId] of st.current.byShape) {
+            if (desiredHot.has(tabId)) continue // already elevated
+            const flags = inputs.getFlags(shapeId)
+            if (isElevated(flags)) continue
+            const last = inputs.getLastInteractionMs(shapeId) ?? 0
+            if (last > 0) nonElev.push({ tabId, shapeId, last })
+          }
+          nonElev.sort((a, b) => b.last - a.last)
+          for (let i = 0; i < nonElev.length && desiredHot.size < limits.hotCapOverview; i++) {
+            const tid = nonElev[i]!.tabId
+            if (!desiredHot.has(tid)) desiredHot.add(tid)
           }
         } else {
           // Normal zoom: all visible non-elevated are hot
@@ -314,12 +413,24 @@ export function useLifecycleManager(inputs: Inputs, outputs: Outputs, limits: Li
         }
 
         // Promote desired that aren’t hot yet
-        for (let i = 0; i < visible.length; i++) {
-          const v = visible[i]!
-          if (!desiredHot.has(v.tabId)) continue
-          if (!st.current.hot.has(v.tabId)) {
-            promoteToHot(v.shapeId, v.tabId)
+        // For overview idle, promote both visible and offscreen desired (since they're MRU/elevated picks)
+        const promoteList: Array<{ tabId: TabId; shapeId: TLShapeId }> = []
+        if (overviewMode) {
+          for (const tid of desiredHot) {
+            if (st.current.hot.has(tid)) continue
+            const sid = shapeIdForTab(tid)
+            if (sid) promoteList.push({ tabId: tid, shapeId: sid })
           }
+        } else {
+          for (let i = 0; i < visible.length; i++) {
+            const v = visible[i]!
+            if (!desiredHot.has(v.tabId)) continue
+            if (!st.current.hot.has(v.tabId)) promoteList.push({ tabId: v.tabId, shapeId: v.shapeId })
+          }
+        }
+        for (let i = 0; i < promoteList.length; i++) {
+          const p = promoteList[i]!
+          promoteToHot(p.shapeId, p.tabId)
         }
 
         /* ---------- Hidden timers (freeze / discard) ---------- */

@@ -52,7 +52,7 @@ onNavFinished: (cb) => {
   const ch = 'overlay-nav-finished'
   const h = (_e: IpcRendererEvent, data: { tabId: string; at: number }) => cb(data)
   ipcRenderer.on(ch, h)
-  return () => ipcRenderer.removeListener(ch, h)
+  return () => ipcRenderer.off(ch, h)
 },
 
 onPopupRequest: (callback) => {

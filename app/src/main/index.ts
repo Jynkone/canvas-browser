@@ -86,12 +86,15 @@ function createWindow(): void {
     autoHideMenuBar: true,
     webPreferences: {
       preload: join(__dirname, "../preload/index.js"),
-      devTools: false,
+      devTools: true,
       nodeIntegration: false,
       contextIsolation: true,
       zoomFactor: 1.0, // start at 100%
     },
+    
   });
+
+  mainWindow.webContents.openDevTools({ mode: "detach" });
 
   // ——— Hard-lock window zoom at 100% ———
   const wc = mainWindow.webContents;

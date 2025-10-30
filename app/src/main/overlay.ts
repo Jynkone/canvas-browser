@@ -3,6 +3,7 @@ import type { Debugger as ElectronDebugger, Input, SystemMemoryInfo } from 'elec
 import { writeFileSync, readFileSync, existsSync } from 'fs'
 import { join } from 'path'
 import type { OverlayNotice, Flags } from '../../src/types/overlay'
+import sharp from 'sharp';
 
 type Rect = { x: number; y: number; width: number; height: number }
 
@@ -103,6 +104,22 @@ function effToBucketKey(eff: number): ZoomBucket {
   return clamped as ZoomBucket
 }
 
+function chooseDownscale(state: ViewState | null): number {
+  if (!state) return 0.30;
+
+  const raw = (state as { lastAppliedZoomKey?: number | string }).lastAppliedZoomKey;
+  if (raw == null) return 0.30;
+
+  const n = typeof raw === "string" ? Number(raw) : raw;
+  if (!Number.isFinite(n) || n <= 0) return 0.30;
+  const known: Record<number, number> = {10: 0.10, 15: 0.15, 20: 0.20, 25: 0.25, 30: 0.30 };
+  if (known[n]) return known[n];
+
+  const scaled = n / 100;
+  if (scaled > 0 && scaled <= 1) return scaled;
+
+  return 0.30;
+}
 
 
 
@@ -1390,36 +1407,84 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null): void {
 
 ipcMain.handle(
   'overlay:snapshot',
-  async (_e, payload: { tabId: string; maxWidth?: number }): Promise<
+  async (
+    _e,
+    payload: { tabId: string; maxWidth?: number }
+  ): Promise<
     | { ok: true; dataUrl: string; width: number; height: number }
-    | { ok: false; error: 'tab-destroying' | 'webcontents-destroyed' | 'snapshot-failed' }
+    | {
+        ok: false;
+        error:
+          | 'tab-destroying'
+          | 'webcontents-destroyed'
+          | 'snapshot-failed'
+          | 'no-view';
+      }
   > => {
-    const tabId = payload?.tabId
-    const maxWidth = Math.max(64, Math.min(payload?.maxWidth ?? 640, 4096))
+    const tabId: string | undefined = payload?.tabId;
+    if (!tabId) return { ok: false, error: 'no-view' };
+    if (destroying.has(tabId)) return { ok: false, error: 'tab-destroying' };
 
-    if (destroying.has(tabId)) return { ok: false, error: 'tab-destroying' }
+    const { state } = S.resolve(tabId);
+    const view = state?.view ?? null;
+    const wc = view?.webContents ?? null;
 
-    const { state } = S.resolve(tabId)
-    const wc = state?.view?.webContents
-    if (!wc || typeof wc.isDestroyed !== 'function' || wc.isDestroyed()) {
-      return { ok: false, error: 'webcontents-destroyed' }
+    if (!state || !view || !wc || (typeof wc.isDestroyed === 'function' && wc.isDestroyed())) {
+      return { ok: false, error: 'webcontents-destroyed' };
     }
 
     try {
-      const img = await wc.capturePage()
-      const { width, height } = img.getSize()
-      const targetW = Math.min(maxWidth, width)
-      const scale = targetW / Math.max(1, width)
-      const resized = img.resize({ width: targetW, height: Math.round(height * scale) })
-      const png = resized.toPNG()
-      const dataUrl = `data:image/png;base64,${Buffer.from(png).toString('base64')}`
+      const downscale: number = chooseDownscale(state);
 
-      return { ok: true, dataUrl, width: targetW, height: Math.round(height * scale) }
-    } catch {
-      return { ok: false, error: 'snapshot-failed' }
+      // 20 ms settle instead of double rAF
+      await wc.executeJavaScript(
+  "new Promise(r => requestAnimationFrame(() => requestAnimationFrame(() => setTimeout(r, 10))))"
+);
+
+
+      const img = await wc.capturePage();
+      const src = img.getSize();
+      const srcW: number = Math.max(1, src.width);
+      const srcH: number = Math.max(1, src.height);
+
+      const baseW: number = Math.max(1, Math.floor(srcW * downscale));
+      const baseH: number = Math.max(1, Math.floor(srcH * downscale));
+
+      const maxW: number = Math.max(64, Math.min(payload?.maxWidth ?? baseW, 4096));
+      const clampScale: number = baseW > maxW ? maxW / baseW : 1;
+
+      const targetW: number = Math.max(1, Math.floor(baseW * clampScale));
+      const targetH: number = Math.max(1, Math.floor(baseH * clampScale));
+
+      const input: Buffer = img.toPNG();
+
+      const outBuf: Buffer = await sharp(input)
+        .resize({
+          width: targetW,
+          height: targetH,
+          fit: 'inside',
+          withoutEnlargement: true,
+          kernel: sharp.kernel.lanczos3,
+        })
+        // a touch stronger than 0.6 to reduce "soft" look after downscale
+        .sharpen({ sigma: 0.22, m1: 1.4, m2: 0, x1: 2 })
+        .webp({
+          quality: 94,      // higher than 84 → fewer ringing/blurry edges
+          effort: 4,
+          nearLossless: false,
+        })
+        .toBuffer();
+
+      const dataUrl: string = `data:image/webp;base64,${outBuf.toString('base64')}`;
+
+      return { ok: true, dataUrl, width: targetW, height: targetH };
+    } catch (err) {
+      console.error('snapshot failed:', err);
+      return { ok: false, error: 'snapshot-failed' };
     }
   }
-)
+);
+
 
 
   ipcMain.handle('overlay:destroy', async (_e, { tabId }: { tabId: string }): Promise<void> => {

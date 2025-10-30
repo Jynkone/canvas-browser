@@ -19,6 +19,8 @@ export type BrowserShape = TLBaseShape<
   { w: number; h: number; url: string }
 >
 
+const TAB_ACTIVITY_EVENT = 'paper:tab-activity' as const
+const NEW_TAB_EVENT = 'paper:new-tab' as const
 
 
 const DRAG_GUTTER = 60 // invisible move hit area (no longer affects visuals/geometry)
@@ -120,6 +122,14 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
             const id = res.tabId
             tabIdRef.current = id
 
+            window.dispatchEvent(new CustomEvent<Readonly<{ tabId: string; shapeId: TLShapeId }>>(NEW_TAB_EVENT, {
+              detail: { tabId: id, shapeId: shape.id as TLShapeId },
+            }))
+            window.dispatchEvent(new CustomEvent<Readonly<{ tabId: string }>>(TAB_ACTIVITY_EVENT, {
+              detail: { tabId: id },
+            }))
+
+
           } catch {
             // creation failed → cleanup happens naturally
           }
@@ -136,7 +146,7 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
 
       let alive = true
 
-      const sync = async () => {
+      const sync = async (): Promise<void> => {
         const id = tabIdRef.current
         if (!id) return
         try {
@@ -154,17 +164,31 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
         }
       }
 
-      // initial load
+      // initial fetch
       void sync()
 
-      // live updates from main
-      const off = api.onUrlUpdate(({ tabId }: { tabId: string; url?: string }) => {
-        if (tabId === tabIdRef.current) void sync()
+      // 1) URL changed (clicking links, history.push/replace, redirects that change URL)
+      const offUrl = api.onUrlUpdate(({ tabId }: { tabId: string; url?: string }) => {
+        if (tabId !== tabIdRef.current) return
+        void sync()
+        window.dispatchEvent(
+          new CustomEvent<Readonly<{ tabId: string }>>(TAB_ACTIVITY_EVENT, { detail: { tabId } })
+        )
+      })
+
+      // 2) Navigation finished (covers loads/reloads/SPAs that settle without a new URL)
+      const offNav = api.onNavFinished?.(({ tabId }: { tabId: string }) => {
+        if (tabId !== tabIdRef.current) return
+        void sync()
+        window.dispatchEvent(
+          new CustomEvent<Readonly<{ tabId: string }>>(TAB_ACTIVITY_EVENT, { detail: { tabId } })
+        )
       })
 
       return () => {
         alive = false
-        if (off) off()
+        offUrl?.()
+        offNav?.()
       }
     }, [api])
 
@@ -217,6 +241,33 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
       raf = requestAnimationFrame(loop)
       return () => cancelAnimationFrame(raf)
     }, [api, editor, shape.id])
+
+    // Treat typing in the nav bar and clicking its controls as interaction
+    // Replace your current "Treat typing in the nav bar..." effect with this:
+    useEffect(() => {
+      const isInNav = (target: EventTarget | null): boolean =>
+        target instanceof Element && !!target.closest('[data-nav-root="1"]')
+
+      const bumpIfNav = (e: Event): void => {
+        if (!isInNav(e.target)) return
+        const id = tabIdRef.current
+        if (!id) return
+        window.dispatchEvent(
+          new CustomEvent<Readonly<{ tabId: string }>>('paper:tab-activity', { detail: { tabId: id } })
+        )
+      }
+
+      window.addEventListener('keydown', bumpIfNav, { capture: true })
+      window.addEventListener('input', bumpIfNav, { capture: true })
+      window.addEventListener('pointerdown', bumpIfNav, { capture: true })
+
+      return () => {
+        window.removeEventListener('keydown', bumpIfNav, { capture: true } as AddEventListenerOptions)
+        window.removeEventListener('input', bumpIfNav, { capture: true } as AddEventListenerOptions)
+        window.removeEventListener('pointerdown', bumpIfNav, { capture: true } as AddEventListenerOptions)
+      }
+    }, [])
+
 
     // ---- Minimal fit toggle ------------------------------------------------
     // --- Fit state ---
@@ -461,9 +512,6 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
       const target = editor.getShape(st.targetId)
       if (!target || !hasXY(target)) return
 
-      // Move the correct thing:
-      // - if target is a group → move the group (children follow)
-      // - else                → move the single browser-shape
       if (target.type === 'group') {
         editor.updateShapes([
           { id: st.targetId, type: 'group', x: target.x + dx, y: target.y + dy },
@@ -522,16 +570,18 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
           alt=""
           style={{
             position: 'absolute',
-            top: 0, left: 0, right: 0, bottom: 0,
+            inset: 0,             // top/left/right/bottom = 0
+            width: '100%',
+            height: '100%',
             objectFit: 'cover',
-            margin: `${3}px`, // same BORDER as live view
             pointerEvents: 'none',
+
           }}
           draggable={false}
         />
       )
     }
-    
+
     return (
       <HTMLContainer
         style={{

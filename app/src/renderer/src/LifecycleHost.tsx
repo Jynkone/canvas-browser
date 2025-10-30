@@ -11,6 +11,13 @@ declare global {
   }
 }
 
+const TAB_ACTIVITY_EVENT = 'paper:tab-activity' as const
+const NEW_TAB_EVENT = 'paper:new-tab' as const
+
+type TabActivityDetail = Readonly<{ tabId: string }>
+type NewTabDetail = Readonly<{ tabId: string; shapeId: TLShapeId }>
+
+
 
 type Props = { editorRef: React.MutableRefObject<Editor | null> }
 
@@ -62,24 +69,21 @@ const readTabInfoFromShape = (
 if (!window.__tabState) window.__tabState = new Map()
 if (!window.__tabThumbs) window.__tabThumbs = new Map()
 
-/** Convert a PNG data URL (from main) to a WebP data URL (renderer side). */
-async function pngDataUrlToWebpDataUrl(pngDataUrl: string, quality: number): Promise<string> {
-  const res = await fetch(pngDataUrl)
-  const blob = await res.blob()
-  const bmp = await createImageBitmap(blob)
-  const canvas = new OffscreenCanvas(bmp.width, bmp.height)
-  const ctx = canvas.getContext('2d', { willReadFrequently: false })
-  if (!ctx) return pngDataUrl
-  ctx.drawImage(bmp, 0, 0)
-  const webp = await canvas.convertToBlob({ type: 'image/webp', quality })
-  const buf = await webp.arrayBuffer()
-  const base64 = btoa(String.fromCharCode(...new Uint8Array(buf)))
-  return `data:image/webp;base64,${base64}`
-}
 
 export default function LifecycleHost({ editorRef }: Props) {
   // Selection-driven “last interaction” timestamps
   const lastInteraction = useRef<Map<TLShapeId, number>>(new Map())
+  const tabToShape = useRef(new Map<string, TLShapeId>())
+
+const bumpInteractionByShapeId = (shapeId: TLShapeId): void => {
+  lastInteraction.current.set(shapeId, performance.now())
+}
+
+const bumpInteractionByTabId = (tabId: string): void => {
+  const shapeId = tabToShape.current.get(tabId)
+  if (shapeId) bumpInteractionByShapeId(shapeId)
+}
+
 
   useEffect(() => {
     const ed = editorRef.current
@@ -183,7 +187,7 @@ export default function LifecycleHost({ editorRef }: Props) {
         const res = await window.overlay.snapshot({ tabId, maxWidth })
         if (!('ok' in res) || !res.ok) return null
 
-        const webp = await pngDataUrlToWebpDataUrl(res.dataUrl, 0.65)
+        const webp = res.dataUrl
         // Tag with current URL to avoid duplicates
         const nav = await window.overlay.getNavigationState({ tabId })
         const currentUrl = ('ok' in nav && nav.ok) ? (nav.currentUrl ?? 'about:blank') : 'about:blank'
@@ -222,6 +226,37 @@ export default function LifecycleHost({ editorRef }: Props) {
     discardHiddenMs: 2_400_000,
     tinyPxFloor: 48_000,
   }), [])
+
+  useEffect(() => {
+  const onActivity = (e: Event): void => {
+    const detail = (e as CustomEvent<TabActivityDetail>).detail
+    if (detail?.tabId) bumpInteractionByTabId(detail.tabId)
+  }
+
+  const onNewTab = (e: Event): void => {
+    const detail = (e as CustomEvent<NewTabDetail>).detail
+    if (detail?.tabId && detail?.shapeId) {
+      tabToShape.current.set(detail.tabId, detail.shapeId)
+      bumpInteractionByShapeId(detail.shapeId) // creation counts as interaction
+    }
+  }
+
+  window.addEventListener(TAB_ACTIVITY_EVENT, onActivity as EventListener, { capture: true })
+  window.addEventListener(NEW_TAB_EVENT, onNewTab as EventListener, { capture: true })
+
+  // Also bump on overlay events (clicking links / navigations)
+  const api = window.overlay
+  const offUrl = api.onUrlUpdate(({ tabId }) => { bumpInteractionByTabId(tabId) })
+  const offNav = api.onNavFinished(({ tabId }) => { bumpInteractionByTabId(tabId) })
+
+  return () => {
+    window.removeEventListener(TAB_ACTIVITY_EVENT, onActivity as EventListener, { capture: true } as AddEventListenerOptions)
+    window.removeEventListener(NEW_TAB_EVENT, onNewTab as EventListener, { capture: true } as AddEventListenerOptions)
+    offUrl()
+    offNav()
+  }
+}, [])
+
 
   // Snapshot strictly on nav-finished, and only if currently HOT
   useEffect(() => {
