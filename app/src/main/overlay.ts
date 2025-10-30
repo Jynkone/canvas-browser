@@ -1436,13 +1436,18 @@ ipcMain.handle(
     try {
       const downscale: number = chooseDownscale(state);
 
-      // 20 ms settle instead of double rAF
-      await wc.executeJavaScript(
-  "new Promise(r => requestAnimationFrame(() => requestAnimationFrame(() => setTimeout(r, 10))))"
-);
+      // OPTION 1: Capture with explicit rect (prevents full window capture)
+      const bounds = view.getBounds();
+      const captureRect = {
+        x: 0,
+        y: 0,
+        width: bounds.width,
+        height: bounds.height
+      };
 
-
-      const img = await wc.capturePage();
+      // Capture ONLY this view's rectangle - no settling delay needed
+      const img = await wc.capturePage(captureRect);
+      
       const src = img.getSize();
       const srcW: number = Math.max(1, src.width);
       const srcH: number = Math.max(1, src.height);
@@ -1466,10 +1471,9 @@ ipcMain.handle(
           withoutEnlargement: true,
           kernel: sharp.kernel.lanczos3,
         })
-        // a touch stronger than 0.6 to reduce "soft" look after downscale
         .sharpen({ sigma: 0.22, m1: 1.4, m2: 0, x1: 2 })
         .webp({
-          quality: 94,      // higher than 84 → fewer ringing/blurry edges
+          quality: 94,
           effort: 4,
           nearLossless: false,
         })
@@ -1484,7 +1488,6 @@ ipcMain.handle(
     }
   }
 );
-
 
 
   ipcMain.handle('overlay:destroy', async (_e, { tabId }: { tabId: string }): Promise<void> => {
