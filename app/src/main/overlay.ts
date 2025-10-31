@@ -1565,7 +1565,7 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null): void {
     await setLifecycle(state.view.webContents, 'active');
   })
 
-  ipcMain.handle(
+ipcMain.handle(
     'overlay:snapshot',
     async (
       _e,
@@ -1578,7 +1578,8 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null): void {
         | 'tab-destroying'
         | 'webcontents-destroyed'
         | 'snapshot-failed'
-        | 'no-view';
+        | 'no-view'
+        | 'not-ready';
       }
     > => {
       const tabId: string | undefined = payload?.tabId;
@@ -1594,16 +1595,48 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null): void {
       }
 
       try {
+        // ✅ Check 1: URL must be real
+        const url = wc.getURL();
+        if (!url || url === 'about:blank' || url.length === 0) {
+          return { ok: false, error: 'not-ready' };
+        }
+
+        // ✅ Check 2: Must not be actively loading
+        if (wc.isLoading()) {
+          return { ok: false, error: 'not-ready' };
+        }
+
+        // ✅ Check 3: Must have valid bounds (view is sized and placed)
         const { width: vw, height: vh } = view.getBounds();
+        if (vw <= 0 || vh <= 0) {
+          return { ok: false, error: 'not-ready' };
+        }
+
+        // ✅ Check 4: DOM must be ready (via executeJavaScript - cheap and fast)
+        try {
+          const domReady = await wc.executeJavaScript(
+            'document.readyState === "complete" || document.readyState === "interactive"',
+            true
+          );
+          if (!domReady) {
+            return { ok: false, error: 'not-ready' };
+          }
+        } catch {
+          // If we can't even run JS, definitely not ready
+          return { ok: false, error: 'not-ready' };
+        }
+
+        // All checks passed - capture immediately
         const rect = { x: 0, y: 0, width: Math.max(1, vw), height: Math.max(1, vh) };
-
-        // allow one frame to present before readback (avoids flash)
-        await new Promise<void>((r) => setTimeout(r, 0));
-
         const img = await wc.capturePage(rect);
         const { width: srcW, height: srcH } = img.getSize();
 
-        // ---- single downscale to reduce KB, keep text crisp ----
+        // Sanity check: if we got a 0x0 image despite passing checks, something's wrong
+        if (srcW === 0 || srcH === 0) {
+          return { ok: false, error: 'snapshot-failed' };
+        }
+
+        // ---- Downscale and compress ----
         const MAX_TARGET_W: number = Math.max(512, Math.min(payload?.maxWidth ?? 1400, 1600));
         const scale: number = srcW > MAX_TARGET_W ? MAX_TARGET_W / srcW : 1;
 
@@ -1612,7 +1645,6 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null): void {
 
         const pngBuf: Buffer = img.toPNG();
 
-        // WebP lossy: smaller than PNG, still sharp for UI text
         const outBuf: Buffer = await sharp(pngBuf)
           .resize({
             width: targetW,
@@ -1621,12 +1653,11 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null): void {
             withoutEnlargement: true,
             kernel: sharp.kernel.lanczos3,
           })
-          // smartSubsample reduces color bleeding on small text/edges
           .webp({
-            quality: 96,          // adjust 80–90 to trade size vs. sharpness
+            quality: 96,
             alphaQuality: 100,
-            nearLossless: false,  // keep file size down
-            effort: 5,            // better compression without huge CPU hit
+            nearLossless: false,
+            effort: 5,
             smartSubsample: true,
           })
           .toBuffer();
@@ -1640,7 +1671,6 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null): void {
       }
     }
   );
-
 
   ipcMain.handle('overlay:destroy', async (_e, { tabId }: { tabId: string }): Promise<void> => {
     // Make it safe to call destroy multiple times
