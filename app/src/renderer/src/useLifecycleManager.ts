@@ -79,8 +79,8 @@ const ZOOM_EPS = 0.0005
 
 /* ====================== Internal state ====================== */
 
-type HotRec = { readonly tabId: TabId; readonly shapeId: TLShapeId }
-type WarmRec = { readonly tabId: TabId; readonly shapeId: TLShapeId; lastSeenVisibleAt: number; }
+type HotRec = { readonly tabId: TabId; readonly shapeId: TLShapeId; readonly createdAt: number }
+type WarmRec = { readonly tabId: TabId; readonly shapeId: TLShapeId; readonly createdAt: number }
 type HiddenInfo = { hiddenSince: number }
 
 export function useLifecycleManager(inputs: Inputs, outputs: Outputs, limits: Limits): void {
@@ -139,51 +139,57 @@ export function useLifecycleManager(inputs: Inputs, outputs: Outputs, limits: Li
     }
 
     const promoteToHot = (shapeId: TLShapeId, tabId: TabId): void => {
-      st.current.warm.delete(tabId)
-      st.current.frozen.delete(tabId)
-      st.current.hot.set(tabId, { tabId, shapeId })
-      setLife(shapeId, 'hot')
-      void inputs.thaw(tabId)
-      void inputs.show(tabId)
-      st.current.hidden.delete(tabId)
-    }
+  // Preserve createdAt if this tab was warm/hot before
+  const existingWarm = st.current.warm.get(tabId)
+  const existingHot = st.current.hot.get(tabId)
+  const createdAt = existingWarm?.createdAt ?? existingHot?.createdAt ?? inputs.now()
+  
+  st.current.warm.delete(tabId)
+  st.current.frozen.delete(tabId)
+  st.current.hot.set(tabId, { tabId, shapeId, createdAt })
+  setLife(shapeId, 'hot')
+  void inputs.thaw(tabId)
+  void inputs.show(tabId)
+  st.current.hidden.delete(tabId)
+}
 
     const demoteToWarm = (shapeId: TLShapeId, tabId: TabId): void => {
-      if (!st.current.hot.has(tabId)) return
+  if (!st.current.hot.has(tabId)) return
 
-      st.current.hot.delete(tabId)
-      st.current.warm.set(tabId, {
-        tabId,
-        shapeId,
-        lastSeenVisibleAt: inputs.now(),
-      })
+  const hotRec = st.current.hot.get(tabId)!
+  st.current.hot.delete(tabId)
+  st.current.warm.set(tabId, {
+    tabId,
+    shapeId,
+    createdAt: hotRec.createdAt,  // ← Preserve birth time
+  })
 
-      const thumbs: Map<string, { url: string; dataUrlWebp: string }> | undefined =
-        (window as unknown as {
-          __tabThumbs?: Map<string, { url: string; dataUrlWebp: string }>
-        }).__tabThumbs
+  const thumbs: Map<string, { url: string; dataUrlWebp: string }> | undefined =
+    (window as unknown as {
+      __tabThumbs?: Map<string, { url: string; dataUrlWebp: string }>
+    }).__tabThumbs
 
-      const hasThumb: boolean =
-        !!thumbs &&
-        thumbs.has(tabId) &&
-        typeof thumbs.get(tabId)?.dataUrlWebp === 'string'
+  const hasThumb: boolean =
+    !!thumbs &&
+    thumbs.has(tabId) &&
+    typeof thumbs.get(tabId)?.dataUrlWebp === 'string'
 
-      // If no local thumb, take one NOW (before hide)
-      void (async () => {
-        try {
-          if (!hasThumb) {
-            // width to match your nav-finished capture
-            await inputs.snapshot(tabId, 896)
-          }
-          await inputs.hide(tabId)
-          st.current.hidden.set(tabId, { hiddenSince: inputs.now() })
-        } catch {
-          /* noop */
-        }
-      })()
-
-      setLife(shapeId, 'warm')
+  // If no local thumb, take one NOW (before hide)
+  void (async () => {
+    try {
+      if (!hasThumb) {
+        // width to match your nav-finished capture
+        await inputs.snapshot(tabId, 896)
+      }
+      await inputs.hide(tabId)
+      st.current.hidden.set(tabId, { hiddenSince: inputs.now() })
+    } catch {
+      /* noop */
     }
+  })()
+
+  setLife(shapeId, 'warm')
+}
 
 
     const freezeWarm = (tabId: TabId): void => {
@@ -255,29 +261,27 @@ export function useLifecycleManager(inputs: Inputs, outputs: Outputs, limits: Li
       }
     }
 
-    const runInteractionTimers = (nowMs: number): void => {
-      for (const [tid, wr] of st.current.warm) {
-        const shapeId = wr.shapeId
-        const last = inputs.getLastInteractionMs(shapeId)
+const runInteractionTimers = (nowMs: number): void => {
+  for (const [tid, wr] of st.current.warm) {
+    const shapeId = wr.shapeId
+    const last = inputs.getLastInteractionMs(shapeId)
 
-        // 👇 ONLY real interaction keeps it alive
-        if (typeof last === 'number' && last > 0) {
-          const idleFor = nowMs - last
-          if (idleFor >= limits.freezeHiddenMs) {
-            freezeWarm(tid)
-          }
-          continue
-        }
-
-        // 👇 NO real interaction ever → age from when it became warm, NOT from lastSeenVisibleAt
-        const bornWarmAt = wr.lastSeenVisibleAt
-        const idleFor = nowMs - bornWarmAt
-        if (idleFor >= limits.freezeHiddenMs) {
-          freezeWarm(tid)
-        }
+    // 👇 ONLY real interaction keeps it alive
+    if (typeof last === 'number' && last > 0) {
+      const idleFor = nowMs - last
+      if (idleFor >= limits.freezeHiddenMs) {
+        freezeWarm(tid)
       }
+      continue
     }
 
+    // 👇 NO real interaction ever → age from creation time
+    const idleFor = nowMs - wr.createdAt
+    if (idleFor >= limits.freezeHiddenMs) {
+      freezeWarm(tid)
+    }
+  }
+}
 
 
     /** Track interaction changes and refresh lock if an MRU bump happened */
