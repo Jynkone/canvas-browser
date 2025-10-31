@@ -26,7 +26,7 @@ export type Flags = {
   pinned: boolean
 }
 
-export type LifecycleState = 'hot' | 'warm' | 'frozen' | 'discarded'
+export type LifecycleState = 'hot' | 'warm' | 'frozen' 
 
 export type NavigationStateResult =
   | ({ ok: true } & NavigationState & { /** surfaced from main via isLoading() */ isLoading: boolean })
@@ -76,6 +76,26 @@ export interface FreezePayload { tabId: string }
 export interface ThawPayload { tabId: string }
 
 export interface SnapshotRequest { tabId: string; maxWidth?: number }
+
+export interface SetLifecyclePayload {
+  tabId: string;
+  lifecycle: LifecycleState;
+  hasScreenshot: boolean;
+}
+
+export interface PersistedTabInfo {
+  tabId: string;
+  currentUrl: string;
+  lastInteraction: number;
+  lifecycle: LifecycleState;
+  hasScreenshot: boolean;
+  thumbPath: string | null;
+}
+
+export type PersistedStateResult =
+  | { ok: true; tabs: PersistedTabInfo[] }
+  | { ok: false; error: string };
+
 export type SnapshotResult =
   | { ok: true; dataUrl: string; width: number; height: number }
   | { ok: false; error: string }
@@ -114,8 +134,8 @@ export interface OverlayAPI {
   // events
   onUrlUpdate(callback: (data: { tabId: string; url?: string }) => void): () => void
   onPressure(
-  cb: (p: { level: 'normal' | 'elevated' | 'critical'; freeMB: number; totalMB: number }) => void
-): () => void
+    cb: (p: { level: 'normal' | 'elevated' | 'critical'; freeMB: number; totalMB: number }) => void
+  ): () => void
 
 
   /** Emits when main wants the renderer to create a BrowserShape. */
@@ -135,6 +155,13 @@ export interface OverlayAPI {
   reload(payload: TabIdPayload): Promise<SimpleResult>
   getNavigationState(payload: TabIdPayload): Promise<NavigationStateResult>
   onNavFinished(cb: (n: { tabId: string; at: number }) => void): () => void
+
+  setLifecycle(payload: SetLifecyclePayload): Promise<SimpleResult>
+  getPersistedState(): Promise<PersistedStateResult>
+
+  saveThumb(
+    payload: { tabId: string; url: string; dataUrlWebp: string }
+  ): Promise<{ ok: true; thumbPath: string } | { ok: false }>;
 
 }
 

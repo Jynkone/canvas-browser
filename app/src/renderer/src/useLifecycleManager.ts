@@ -3,7 +3,7 @@ import type { TLShapeId } from 'tldraw'
 
 /* ====================== Types ====================== */
 
-export type LifecycleState = 'hot' | 'warm' | 'frozen' | 'discarded'
+export type LifecycleState = 'hot' | 'warm' | 'frozen'
 
 export interface ShapeGeom {
   readonly id: TLShapeId
@@ -48,6 +48,8 @@ export interface Inputs {
   readonly freeze: (tabId: TabId) => Promise<void>
   readonly thaw: (tabId: TabId) => Promise<void>
   readonly destroy: (tabId: TabId) => Promise<void>
+  readonly snapshot: (tabId: TabId, maxWidth?: number) => Promise<string | null>
+
 }
 
 export interface Outputs {
@@ -62,8 +64,6 @@ export interface Limits {
   readonly tinyPxFloor: number
   /** After being hidden for this long, warm → frozen */
   readonly freezeHiddenMs: number
-  /** After being hidden for this long, frozen/warm → discarded */
-  readonly discardHiddenMs: number
 }
 
 /* ====================== Local constants ====================== */
@@ -80,7 +80,7 @@ const ZOOM_EPS = 0.0005
 /* ====================== Internal state ====================== */
 
 type HotRec = { readonly tabId: TabId; readonly shapeId: TLShapeId }
-type WarmRec = { readonly tabId: TabId; readonly shapeId: TLShapeId; lastSeenVisibleAt: number }
+type WarmRec = { readonly tabId: TabId; readonly shapeId: TLShapeId; lastSeenVisibleAt: number; }
 type HiddenInfo = { hiddenSince: number }
 
 export function useLifecycleManager(inputs: Inputs, outputs: Outputs, limits: Limits): void {
@@ -88,7 +88,6 @@ export function useLifecycleManager(inputs: Inputs, outputs: Outputs, limits: Li
     hot: Map<TabId, HotRec>
     warm: Map<TabId, WarmRec>
     frozen: Set<TabId>
-    discarded: Set<TabId>
     hidden: Map<TabId, HiddenInfo>
     byShape: Map<TLShapeId, TabId>
     // motion tracking
@@ -106,7 +105,6 @@ export function useLifecycleManager(inputs: Inputs, outputs: Outputs, limits: Li
     hot: new Map(),
     warm: new Map(),
     frozen: new Set(),
-    discarded: new Set(),
     hidden: new Map(),
     byShape: new Map(),
     lastPanSig: 0,
@@ -120,8 +118,6 @@ export function useLifecycleManager(inputs: Inputs, outputs: Outputs, limits: Li
   })
 
   useEffect(() => {
-    /* ---------- helpers ---------- */
-
     const isElevated = (f: Flags): boolean =>
       f.audible || f.capturing || f.devtools || f.downloads || f.pinned
 
@@ -129,21 +125,12 @@ export function useLifecycleManager(inputs: Inputs, outputs: Outputs, limits: Li
       const ov = g.overlap <= 0 ? 0 : g.overlap >= 1 ? 1 : g.overlap
       return g.w * g.h * ov
     }
-
     const setLife = (shapeId: TLShapeId, state: LifecycleState): void => {
       outputs.setLifecycle(shapeId, state)
     }
-
     const trackShapeTab = (shapeId: TLShapeId, tabId: TabId): void => {
       st.current.byShape.set(shapeId, tabId)
     }
-
-    const untrackShapeTab = (tabId: TabId): void => {
-      for (const [sid, tid] of st.current.byShape) {
-        if (tid === tabId) st.current.byShape.delete(sid)
-      }
-    }
-
     const shapeIdForTab = (tabId: TabId): TLShapeId | undefined => {
       for (const [sid, tid] of st.current.byShape) {
         if (tid === tabId) return sid
@@ -154,7 +141,6 @@ export function useLifecycleManager(inputs: Inputs, outputs: Outputs, limits: Li
     const promoteToHot = (shapeId: TLShapeId, tabId: TabId): void => {
       st.current.warm.delete(tabId)
       st.current.frozen.delete(tabId)
-      st.current.discarded.delete(tabId)
       st.current.hot.set(tabId, { tabId, shapeId })
       setLife(shapeId, 'hot')
       void inputs.thaw(tabId)
@@ -164,12 +150,41 @@ export function useLifecycleManager(inputs: Inputs, outputs: Outputs, limits: Li
 
     const demoteToWarm = (shapeId: TLShapeId, tabId: TabId): void => {
       if (!st.current.hot.has(tabId)) return
+
       st.current.hot.delete(tabId)
-      st.current.warm.set(tabId, { tabId, shapeId, lastSeenVisibleAt: inputs.now() })
+      st.current.warm.set(tabId, {
+        tabId,
+        shapeId,
+        lastSeenVisibleAt: inputs.now(),
+      })
+
+      const thumbs: Map<string, { url: string; dataUrlWebp: string }> | undefined =
+        (window as unknown as {
+          __tabThumbs?: Map<string, { url: string; dataUrlWebp: string }>
+        }).__tabThumbs
+
+      const hasThumb: boolean =
+        !!thumbs &&
+        thumbs.has(tabId) &&
+        typeof thumbs.get(tabId)?.dataUrlWebp === 'string'
+
+      // If no local thumb, take one NOW (before hide)
+      void (async () => {
+        try {
+          if (!hasThumb) {
+            // width to match your nav-finished capture
+            await inputs.snapshot(tabId, 896)
+          }
+          await inputs.hide(tabId)
+          st.current.hidden.set(tabId, { hiddenSince: inputs.now() })
+        } catch {
+          /* noop */
+        }
+      })()
+
       setLife(shapeId, 'warm')
-      void inputs.hide(tabId)
-      st.current.hidden.set(tabId, { hiddenSince: inputs.now() })
     }
+
 
     const freezeWarm = (tabId: TabId): void => {
       const rec = st.current.warm.get(tabId)
@@ -180,22 +195,6 @@ export function useLifecycleManager(inputs: Inputs, outputs: Outputs, limits: Li
       void inputs.freeze(tabId)
     }
 
-    const discardAny = (tabId: TabId): void => {
-      const hot = st.current.hot.get(tabId)
-      const warm = st.current.warm.get(tabId)
-      const shapeId: TLShapeId | undefined = hot?.shapeId ?? warm?.shapeId
-      st.current.hot.delete(tabId)
-      st.current.warm.delete(tabId)
-      st.current.frozen.delete(tabId)
-      st.current.discarded.add(tabId)
-      if (shapeId) setLife(shapeId, 'discarded')
-      void inputs.hide(tabId)
-      void inputs.destroy(tabId)
-      st.current.hidden.delete(tabId)
-      untrackShapeTab(tabId)
-      st.current.lastInteractionByTab.delete(tabId)
-      st.current.lockedHot.delete(tabId)
-    }
 
     const panSignature = (geoms: ReadonlyArray<ShapeGeom>): number => {
       // Deterministic signature that shifts when the viewport pans
@@ -255,6 +254,31 @@ export function useLifecycleManager(inputs: Inputs, outputs: Outputs, limits: Li
         promoteToHot(sid, tid)
       }
     }
+
+    const runInteractionTimers = (nowMs: number): void => {
+      for (const [tid, wr] of st.current.warm) {
+        const shapeId = wr.shapeId
+        const last = inputs.getLastInteractionMs(shapeId)
+
+        // 👇 ONLY real interaction keeps it alive
+        if (typeof last === 'number' && last > 0) {
+          const idleFor = nowMs - last
+          if (idleFor >= limits.freezeHiddenMs) {
+            freezeWarm(tid)
+          }
+          continue
+        }
+
+        // 👇 NO real interaction ever → age from when it became warm, NOT from lastSeenVisibleAt
+        const bornWarmAt = wr.lastSeenVisibleAt
+        const idleFor = nowMs - bornWarmAt
+        if (idleFor >= limits.freezeHiddenMs) {
+          freezeWarm(tid)
+        }
+      }
+    }
+
+
 
     /** Track interaction changes and refresh lock if an MRU bump happened */
     const maybeRefreshLockOnInteraction = (inOverviewAndPanning: boolean): void => {
@@ -322,6 +346,7 @@ export function useLifecycleManager(inputs: Inputs, outputs: Outputs, limits: Li
 
         /* ---------- NOTHING mutational during zoom motion ---------- */
         if (!zoomIdle) {
+          runInteractionTimers(now)
           // Do not promote, do not demote (even off-screen), do not run timers.
           return
         }
@@ -337,6 +362,7 @@ export function useLifecycleManager(inputs: Inputs, outputs: Outputs, limits: Li
           }
           // Enforce the lock: no visibility-based swapping here
           enforceLockedHot()
+          runInteractionTimers(now)
           // Skip timers during active pan to minimize work
           return
         }
@@ -366,7 +392,7 @@ export function useLifecycleManager(inputs: Inputs, outputs: Outputs, limits: Li
           }
           if (chosen) promoteToHot(chosen.shapeId, chosen.tabId)
 
-          // Skip timers during active pan
+          runInteractionTimers(now)
           return
         }
 
@@ -433,24 +459,6 @@ export function useLifecycleManager(inputs: Inputs, outputs: Outputs, limits: Li
           promoteToHot(p.shapeId, p.tabId)
         }
 
-        /* ---------- Hidden timers (freeze / discard) ---------- */
-        // Only run timers when fully idle to minimize interference with interactions
-        for (const [tid, wr] of st.current.warm) {
-          if (visibleSet.has(tid)) {
-            st.current.hidden.delete(tid)
-            st.current.warm.set(tid, { ...wr, lastSeenVisibleAt: now })
-          } else if (!st.current.hidden.has(tid)) {
-            st.current.hidden.set(tid, { hiddenSince: now })
-          }
-        }
-        for (const [tid, info] of st.current.hidden) {
-          const hiddenFor = now - info.hiddenSince
-          if (hiddenFor >= limits.discardHiddenMs) {
-            discardAny(tid)
-          } else if (hiddenFor >= limits.freezeHiddenMs && !st.current.frozen.has(tid)) {
-            freezeWarm(tid)
-          }
-        }
       } finally {
         st.current.ticking = false
       }

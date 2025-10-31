@@ -1,9 +1,12 @@
-import { BrowserWindow, WebContentsView, ipcMain, Menu, desktopCapturer, dialog, WebContents } from 'electron'
+import { app, BrowserWindow, WebContentsView, ipcMain, Menu, desktopCapturer, dialog, WebContents } from 'electron'
 import type { Debugger as ElectronDebugger, Input, SystemMemoryInfo } from 'electron'
 import { writeFileSync, readFileSync, existsSync } from 'fs'
 import { join } from 'path'
 import type { OverlayNotice, Flags } from '../../src/types/overlay'
 import sharp from 'sharp';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+
 
 type Rect = { x: number; y: number; width: number; height: number }
 
@@ -23,6 +26,14 @@ type ViewState = {
     title: string
   }
   lastCaptureAt?: number
+}
+
+const THUMBS_DIR: string = path.join(app.getPath('userData'), 'thumbs');
+
+function ensureThumbsDir(): void {
+  if (!fs.existsSync(THUMBS_DIR)) {
+    fs.mkdirSync(THUMBS_DIR, { recursive: true });
+  }
 }
 
 
@@ -70,7 +81,18 @@ async function initializeStartupRestore(): Promise<void> {
   startupRestoreComplete = true
 }
 
-const browserState: Record<string, { currentUrl: string; lastInteraction: number }> = {}
+type LifecycleKind = 'hot' | 'warm' | 'frozen';
+
+interface PersistedTabState {
+  currentUrl: string;
+  lastInteraction: number;
+  lifecycle?: LifecycleKind;
+  hasScreenshot?: boolean;
+  thumbPath?: string;
+}
+
+const browserState: Record<string, PersistedTabState> = {};
+
 const STATE_FILE = join(process.cwd(), 'browser-state.json')
 if (existsSync(STATE_FILE)) {
   try {
@@ -102,23 +124,6 @@ function effToBucketKey(eff: number): ZoomBucket {
   const floor5 = Math.floor((pct + EPS) / 5) * 5   // [5,10) => 5, [10,15) => 10, etc.
   const clamped = Math.max(5, Math.min(20, floor5)) // 5..20 only; 25 handled by native
   return clamped as ZoomBucket
-}
-
-function chooseDownscale(state: ViewState | null): number {
-  if (!state) return 0.30;
-
-  const raw = (state as { lastAppliedZoomKey?: number | string }).lastAppliedZoomKey;
-  if (raw == null) return 0.30;
-
-  const n = typeof raw === "string" ? Number(raw) : raw;
-  if (!Number.isFinite(n) || n <= 0) return 0.30;
-  const known: Record<number, number> = {10: 0.10, 15: 0.15, 20: 0.20, 25: 0.25, 30: 0.30 };
-  if (known[n]) return known[n];
-
-  const scaled = n / 100;
-  if (scaled > 0 && scaled <= 1) return scaled;
-
-  return 0.30;
 }
 
 
@@ -692,17 +697,37 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null): void {
     }
 
     return enqueue<Ok<{ tabId: string }>>(async () => {
-      const tabId = payload?.shapeId!
-      let savedUrl = payload?.url || 'https://google.com/'
-      let delayMs = 0
+      const tabId: string = payload?.shapeId!;
+      const incomingUrl: string | undefined = payload?.url;
+      const hasIncoming: boolean = typeof incomingUrl === 'string' && incomingUrl.trim().length > 0;
 
-      const isStartupRestore = startupQueue.length > 0 && startupBrowserState[tabId]
-      if (isStartupRestore) {
-        savedUrl = startupBrowserState[tabId].currentUrl || savedUrl
-        const queueIndex = startupQueue.findIndex(item => item.shapeId === tabId)
+      let savedUrl: string;
+      let delayMs = 0;
+
+      // Case 1: During app startup, if this tab is in the startup queue, restore EXACTLY what we persisted.
+      const isStartupRestoreForThisTab: boolean =
+        startupQueue.length > 0 && !!startupBrowserState[tabId];
+
+      if (isStartupRestoreForThisTab) {
+        const restoredUrl: string | undefined = startupBrowserState[tabId]?.currentUrl;
+        savedUrl = (restoredUrl && restoredUrl.trim().length > 0)
+          ? restoredUrl
+          : (hasIncoming ? incomingUrl!.trim() : 'https://google.com/');
+
+        const queueIndex = startupQueue.findIndex(item => item.shapeId === tabId);
         if (queueIndex >= 0) {
-          delayMs = queueIndex * STARTUP_DELAY_MS
-          startupQueue.splice(queueIndex, 1)
+          delayMs = queueIndex * STARTUP_DELAY_MS;
+          startupQueue.splice(queueIndex, 1);
+        }
+      } else {
+        // After startup:
+        // Case 3 (Revive): if renderer sent a URL, use it.
+        if (hasIncoming) {
+          savedUrl = incomingUrl!.trim();
+        } else {
+          // Case 2 (New tab) or revive without url: try last known, else default.
+          const lastUrl: string | undefined = browserState[tabId]?.currentUrl;
+          savedUrl = (lastUrl && lastUrl.trim().length > 0) ? lastUrl : 'https://google.com/';
         }
       }
 
@@ -894,14 +919,27 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null): void {
           } catch { }
         }
 
+        try {
+          await S.reapply(state);
+          await view.webContents.loadURL(savedUrl);
+        } catch (err) {
+          console.error('[overlay] loadURL failed:', err);
+        }
 
         view.webContents.on('dom-ready', safeReapply)
 
         view.webContents.on('did-navigate', () => {
           if (!state) return
           safeReapply()
-          const currentUrl = view.webContents.getURL()
-          browserState[tabId] = { currentUrl, lastInteraction: Date.now() }
+          const currentUrl: string = view.webContents.getURL()
+          const prev: PersistedTabState | undefined = browserState[tabId]
+          browserState[tabId] = {
+            currentUrl,
+            lastInteraction: Date.now(),
+            lifecycle: prev?.lifecycle ?? 'warm',      // keep old lifecycle if present
+            hasScreenshot: prev?.hasScreenshot ?? false, // keep screenshot flag
+          }
+
           flushBrowserState()
           emitNavHint(tabId)
         })
@@ -910,8 +948,15 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null): void {
         view.webContents.on('did-navigate-in-page', () => {
           if (!state) return
           safeReapply()
-          const currentUrl = view.webContents.getURL()
-          browserState[tabId] = { currentUrl, lastInteraction: Date.now() }
+          const currentUrl: string = view.webContents.getURL()
+          const prev: PersistedTabState | undefined = browserState[tabId]
+          browserState[tabId] = {
+            currentUrl,
+            lastInteraction: Date.now(),
+            lifecycle: prev?.lifecycle ?? 'warm',      // keep old lifecycle if present
+            hasScreenshot: prev?.hasScreenshot ?? false, // keep screenshot flag
+          }
+
           flushBrowserState()
           emitNavHint(tabId)
           emitNavFinished(tabId)
@@ -1317,6 +1362,78 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null): void {
     }
   )
 
+  ipcMain.handle(
+    'overlay:set-lifecycle',
+    (_event, payload: {
+      tabId: string;
+      lifecycle: LifecycleKind;
+      hasScreenshot: boolean;
+    }) => {
+      const { tabId, lifecycle, hasScreenshot } = payload;
+      const prev: PersistedTabState | undefined = browserState[tabId];
+
+      browserState[tabId] = {
+        currentUrl: prev?.currentUrl ?? 'about:blank',
+        lastInteraction: prev?.lastInteraction ?? Date.now(),
+        lifecycle,
+        hasScreenshot,
+      };
+
+      flushBrowserState();
+      return { ok: true as const };
+    }
+  );
+
+  ipcMain.handle('overlay:get-persisted-state', () => {
+    const tabs = Object.entries(browserState).map(([tabId, data]) => ({
+      tabId,
+      currentUrl: data.currentUrl,
+      lastInteraction: data.lastInteraction,
+      lifecycle: data.lifecycle ?? 'warm',
+      hasScreenshot: data.hasScreenshot ?? false,
+      thumbPath: data.thumbPath ?? null,   // <-- IMPORTANT
+    }));
+    return { ok: true as const, tabs };
+  });
+
+  ipcMain.handle(
+    'overlay:save-thumb',
+    async (
+      _event,
+      payload: { tabId: string; url: string; dataUrlWebp: string }
+    ): Promise<{ ok: true; thumbPath: string } | { ok: false }> => {
+      try {
+        ensureThumbsDir();
+
+        // data:image/webp;base64,xxxx
+        const commaIdx = payload.dataUrlWebp.indexOf(',');
+        if (commaIdx === -1) return { ok: false };
+        const b64 = payload.dataUrlWebp.slice(commaIdx + 1);
+        const buf = Buffer.from(b64, 'base64');
+
+        const safeId = payload.tabId.replace(/[^a-zA-Z0-9_-]/g, '_');
+        const fileName = `${safeId}.webp`;
+        const fullPath = path.join(THUMBS_DIR, fileName);
+
+        fs.writeFileSync(fullPath, buf);
+
+        const prev = browserState[payload.tabId];
+
+        browserState[payload.tabId] = {
+          currentUrl: prev?.currentUrl ?? payload.url,
+          lastInteraction: prev?.lastInteraction ?? Date.now(),
+          lifecycle: prev?.lifecycle ?? 'warm',
+          hasScreenshot: true,
+          thumbPath: fullPath,
+        };
+
+        flushBrowserState();
+        return { ok: true, thumbPath: fullPath };
+      } catch {
+        return { ok: false };
+      }
+    }
+  );
 
 
   ipcMain.handle(
@@ -1394,100 +1511,135 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null): void {
   )
 
   ipcMain.handle('overlay:freeze', async (_e, { tabId }: { tabId: string }): Promise<void> => {
-    const { state } = S.resolve(tabId);
+    const resolved = S.resolve(tabId);
+    const state = resolved?.state;
     if (!state) return;
-    await setLifecycle(state.view.webContents, 'frozen');
-  });
+    const view: WebContentsView = state.view;
+    const wc: WebContents = view.webContents;
+    await setLifecycle(wc, 'frozen');
+    const win = getWindow();
+    if (win && state.attached) {
+      try {
+        S.detach(win, state);
+      } catch {
+        /* noop */
+      }
+    }
+    try {
+      view.setBounds({ x: -10_000, y: -10_000, width: 32, height: 32 });
+    } catch {
+      /* noop */
+    }
+    try {
+      const dbg: ElectronDebugger = wc.debugger;
+      if (!dbg.isAttached()) {
+        dbg.attach('1.3');
+      }
+      await dbg.sendCommand('Memory.simulatePressureNotification', { level: 'critical' });
+    } catch {
+      try {
+        const dbg: ElectronDebugger = wc.debugger;
+        if (!dbg.isAttached()) {
+          dbg.attach('1.3');
+        }
+        await dbg.sendCommand('Memory.prepareForLeakDetection');
+      } catch {
+        /* noop */
+      }
+    }
+    try {
+      await wc.session.clearCache();
+    } catch {
+      /* noop */
+    }
+    try {
+      wc.setBackgroundThrottling(true);
+    } catch {
+      /* noop */
+    }
+  })
 
   ipcMain.handle('overlay:thaw', async (_e, { tabId }: { tabId: string }): Promise<void> => {
     const { state } = S.resolve(tabId);
     if (!state) return;
     await setLifecycle(state.view.webContents, 'active');
-  });
+  })
 
-ipcMain.handle(
-  'overlay:snapshot',
-  async (
-    _e,
-    payload: { tabId: string; maxWidth?: number }
-  ): Promise<
-    | { ok: true; dataUrl: string; width: number; height: number }
-    | {
+  ipcMain.handle(
+    'overlay:snapshot',
+    async (
+      _e,
+      payload: { tabId: string; maxWidth?: number }
+    ): Promise<
+      | { ok: true; dataUrl: string; width: number; height: number }
+      | {
         ok: false;
         error:
-          | 'tab-destroying'
-          | 'webcontents-destroyed'
-          | 'snapshot-failed'
-          | 'no-view';
+        | 'tab-destroying'
+        | 'webcontents-destroyed'
+        | 'snapshot-failed'
+        | 'no-view';
       }
-  > => {
-    const tabId: string | undefined = payload?.tabId;
-    if (!tabId) return { ok: false, error: 'no-view' };
-    if (destroying.has(tabId)) return { ok: false, error: 'tab-destroying' };
+    > => {
+      const tabId: string | undefined = payload?.tabId;
+      if (!tabId) return { ok: false, error: 'no-view' };
+      if (destroying.has(tabId)) return { ok: false, error: 'tab-destroying' };
 
-    const { state } = S.resolve(tabId);
-    const view = state?.view ?? null;
-    const wc = view?.webContents ?? null;
+      const { state } = S.resolve(tabId);
+      const view = state?.view ?? null;
+      const wc = view?.webContents ?? null;
 
-    if (!state || !view || !wc || (typeof wc.isDestroyed === 'function' && wc.isDestroyed())) {
-      return { ok: false, error: 'webcontents-destroyed' };
+      if (!state || !view || !wc || (typeof wc.isDestroyed === 'function' && wc.isDestroyed())) {
+        return { ok: false, error: 'webcontents-destroyed' };
+      }
+
+      try {
+        const { width: vw, height: vh } = view.getBounds();
+        const rect = { x: 0, y: 0, width: Math.max(1, vw), height: Math.max(1, vh) };
+
+        // allow one frame to present before readback (avoids flash)
+        await new Promise<void>((r) => setTimeout(r, 0));
+
+        const img = await wc.capturePage(rect);
+        const { width: srcW, height: srcH } = img.getSize();
+
+        // ---- single downscale to reduce KB, keep text crisp ----
+        const MAX_TARGET_W: number = Math.max(512, Math.min(payload?.maxWidth ?? 1400, 1600));
+        const scale: number = srcW > MAX_TARGET_W ? MAX_TARGET_W / srcW : 1;
+
+        const targetW: number = Math.max(1, Math.round(srcW * scale));
+        const targetH: number = Math.max(1, Math.round(srcH * scale));
+
+        const pngBuf: Buffer = img.toPNG();
+
+        // WebP lossy: smaller than PNG, still sharp for UI text
+        const outBuf: Buffer = await sharp(pngBuf)
+          .resize({
+            width: targetW,
+            height: targetH,
+            fit: 'inside',
+            withoutEnlargement: true,
+            kernel: sharp.kernel.lanczos3,
+          })
+          // smartSubsample reduces color bleeding on small text/edges
+          .webp({
+            quality: 96,          // adjust 80–90 to trade size vs. sharpness
+            alphaQuality: 100,
+            nearLossless: false,  // keep file size down
+            effort: 5,            // better compression without huge CPU hit
+            smartSubsample: true,
+          })
+          .toBuffer();
+
+        const dataUrl: string = `data:image/webp;base64,${outBuf.toString('base64')}`;
+
+        return { ok: true as const, dataUrl, width: targetW, height: targetH };
+      } catch (err) {
+        console.error('snapshot failed:', err);
+        return { ok: false as const, error: 'snapshot-failed' };
+      }
     }
-
-    try {
-      const downscale: number = chooseDownscale(state);
-
-      // OPTION 1: Capture with explicit rect (prevents full window capture)
-      const bounds = view.getBounds();
-      const captureRect = {
-        x: 0,
-        y: 0,
-        width: bounds.width,
-        height: bounds.height
-      };
-
-      // Capture ONLY this view's rectangle - no settling delay needed
-      const img = await wc.capturePage(captureRect);
-      
-      const src = img.getSize();
-      const srcW: number = Math.max(1, src.width);
-      const srcH: number = Math.max(1, src.height);
-
-      const baseW: number = Math.max(1, Math.floor(srcW * downscale));
-      const baseH: number = Math.max(1, Math.floor(srcH * downscale));
-
-      const maxW: number = Math.max(64, Math.min(payload?.maxWidth ?? baseW, 4096));
-      const clampScale: number = baseW > maxW ? maxW / baseW : 1;
-
-      const targetW: number = Math.max(1, Math.floor(baseW * clampScale));
-      const targetH: number = Math.max(1, Math.floor(baseH * clampScale));
-
-      const input: Buffer = img.toPNG();
-
-      const outBuf: Buffer = await sharp(input)
-        .resize({
-          width: targetW,
-          height: targetH,
-          fit: 'inside',
-          withoutEnlargement: true,
-          kernel: sharp.kernel.lanczos3,
-        })
-        .sharpen({ sigma: 0.22, m1: 1.4, m2: 0, x1: 2 })
-        .webp({
-          quality: 94,
-          effort: 4,
-          nearLossless: false,
-        })
-        .toBuffer();
-
-      const dataUrl: string = `data:image/webp;base64,${outBuf.toString('base64')}`;
-
-      return { ok: true, dataUrl, width: targetW, height: targetH };
-    } catch (err) {
-      console.error('snapshot failed:', err);
-      return { ok: false, error: 'snapshot-failed' };
-    }
-  }
-);
+  );
 
 
   ipcMain.handle('overlay:destroy', async (_e, { tabId }: { tabId: string }): Promise<void> => {
@@ -1514,15 +1666,20 @@ ipcMain.handle(
 
       // Remove from tracking first to prevent new work racing in
       try {
-        views.delete(tabId)
-        clearForChild(tabId)
-        delete browserState[tabId]
-        clearForOpener?.(tabId)
+        views.delete(tabId);
+        clearForChild(tabId);
+        clearForOpener?.(tabId);
       } catch (e) {
-        console.warn(`[overlay] Error clearing maps for ${tabId}:`, e)
+        console.warn(`[overlay] Error clearing maps for ${tabId}:`, e);
       }
 
-      // Stop activity early (only if wc exists)
+      try {
+        delete browserState[tabId]
+      } catch (e) {
+        console.warn(`[overlay] Error deleting persisted state for ${tabId}:`, e)
+      }
+
+
       try {
         if (wc && !wc.isDestroyed()) {
           wc.stop()

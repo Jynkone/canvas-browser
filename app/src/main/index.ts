@@ -91,7 +91,7 @@ function createWindow(): void {
       contextIsolation: true,
       zoomFactor: 1.0, // start at 100%
     },
-    
+
   });
 
   mainWindow.webContents.openDevTools({ mode: "detach" });
