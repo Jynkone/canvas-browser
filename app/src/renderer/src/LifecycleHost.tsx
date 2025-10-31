@@ -86,58 +86,7 @@ export default function LifecycleHost({ editorRef }: Props) {
   }
 
 
-useEffect(() => {
-  const ed = editorRef.current;
-  if (!ed) return;
-
-  let prev = JSON.stringify(ed.getSelectedShapeIds());
-
-  const t = setInterval(() => {
-    const ids = ed.getSelectedShapeIds();
-    const sig = JSON.stringify(ids);
-
-    if (sig !== prev) {
-      const now = performance.now();
-
-      for (const id of ids) {
-        // 1) mark shape touched
-        lastInteraction.current.set(id, now);
-
-        // 2) read url off the shape
-        const info = readTabInfoFromShape(ed, id);
-        if (!info) continue;
-        const { url } = info;
-
-        // 🔴 shapeId IS the tabId in main
-        const tabId = id;
-
-        // 3) tell the lifecycle system we touched this tab
-        bumpInteractionByTabId(tabId);
-
-        // 4) if it was frozen/discarded → recreate + thaw + show
-        const current = window.__tabState?.get(tabId);
-        if (current === "frozen") {
-          void (async () => {
-            try {
-              await window.overlay.createTab({ shapeId: id, url });
-              await window.overlay.thaw({ tabId });
-              await window.overlay.show({ tabId });
-              window.__tabState!.set(tabId, "hot");
-            } catch (err) {
-              console.warn("[LifecycleHost] revive failed for", tabId, err);
-            }
-          })();
-        }
-      }
-
-      prev = sig;
-    }
-  }, 150);
-
-  return () => clearInterval(t);
-}, [editorRef]);
-
-const flagsByTab = useRef(
+  const flagsByTab = useRef(
     new Map<string, { audible: boolean; capturing: boolean; devtools: boolean; downloads: boolean; pinned: boolean }>()
   )
 
@@ -189,12 +138,6 @@ const flagsByTab = useRef(
         return readTabInfoFromShape(ed, shapeId)
       },
 
-      // Treat “under cursor” as “selected”
-      isShapeUnderCursor: (shapeId: TLShapeId) => {
-        const ed = editorRef.current
-        return ed ? ed.getSelectedShapeIds().includes(shapeId) : false
-      },
-
       now: () => performance.now(),
 
       // Make unknown shapes “recent” so something becomes HOT on first pass
@@ -210,104 +153,89 @@ const flagsByTab = useRef(
         return flagsByTab.current.get(info.tabId) ?? { audible: false, capturing: false, devtools: false, downloads: false, pinned: false }
       },
 
-      // Overlay controls (attach/detach & lifecycle)
-      show: async (tabId: string) => { await window.overlay.show({ tabId }) },
-      hide: async (tabId: string) => { await window.overlay.hide({ tabId }) },
-      freeze: async (tabId: string) => { await window.overlay.freeze({ tabId }) },
-      thaw: async (tabId: string) => { await window.overlay.thaw({ tabId }) },
-      destroy: async (tabId: string) => { await window.overlay.destroy({ tabId }) },
-
       // Thumbnails: capture (main returns PNG), convert to WebP, store once
-      snapshot: async (tabId: string, maxWidth = 640): Promise<string | null> => {
-        // 1) get current URL from overlay
-        const nav = await window.overlay.getNavigationState({ tabId });
-        const currentUrl: string =
-          'ok' in nav && nav.ok ? nav.currentUrl ?? 'about:blank' : 'about:blank';
-
-        // 2) capture from overlay
-        const res = await window.overlay.snapshot({ tabId, maxWidth });
-        if (!('ok' in res) || !res.ok) return null;
-
-        const webp: string = res.dataUrl;
-
-        // 3) store locally
-        window.__tabThumbs!.set(tabId, {
-          url: currentUrl,
-          dataUrlWebp: webp,
-        });
-
-        // 4) persist to main as a file
+      snapshot: async (tabId: string, maxWidth = 896): Promise<string | null> => {
         try {
-          await window.overlay.saveThumb({
-            tabId,
-            url: currentUrl,
-            dataUrlWebp: webp,
-          });
-        } catch {
-          // ignore
-        }
+          // 1) Get current URL & loading state
+          const nav = await window.overlay.getNavigationState({ tabId });
+          if (!('ok' in nav) || !nav.ok) return null;
+          if (nav.isLoading) return null; // skip capture mid-navigation (try later)
 
-        return webp;
+          const currentUrl: string = nav.currentUrl ?? 'about:blank';
+
+          // 2) Ask overlay to capture
+          const res = await window.overlay.snapshot({ tabId, maxWidth });
+          if (!('ok' in res) || !res.ok || typeof res.dataUrl !== 'string' || res.dataUrl.length === 0) {
+            return null;
+          }
+
+          const webp: string = res.dataUrl;
+
+          // 3) Store locally (guard if map missing)
+          window.__tabThumbs?.set(tabId, { url: currentUrl, dataUrlWebp: webp });
+
+          // 4) Persist to main (don’t block caller)
+          void window.overlay
+            .saveThumb({ tabId, url: currentUrl, dataUrlWebp: webp })
+            .catch(() => { /* ignore */ });
+
+          return webp;
+        } catch {
+          return null;
+        }
       },
 
     }
   }, [editorRef])
 
+  const opChainByTab = useRef(new Map<string, Promise<void>>())
+  const chain = (tabId: string, fn: () => Promise<void>): Promise<void> => {
+    const prev = opChainByTab.current.get(tabId) ?? Promise.resolve()
+    const next = prev.then(fn).catch(() => { }) // keep chain alive
+    opChainByTab.current.set(tabId, next)
+    return next
+  }
+
   const outputs = useMemo(() => {
     return {
-      setLifecycle: async (
-        shapeId: TLShapeId,
-        state: 'hot' | 'warm' | 'frozen' 
-      ): Promise<void> => {
-        const ed = editorRef.current;
-        if (!ed) return;
+      setLifecycle: async (shapeId: TLShapeId, state: 'hot' | 'warm' | 'frozen'): Promise<void> => {
+        const ed = editorRef.current
+        if (!ed) return
+        const info = readTabInfoFromShape(ed, shapeId)
+        if (!info) return
 
-        const info = readTabInfoFromShape(ed, shapeId);
-        if (!info) return;
+        const { tabId, url } = info
+        window.__tabState?.set(tabId, state)
 
-        const { tabId, url } = info;
+        const hasScreenshot = !!window.__tabThumbs?.get(tabId)?.dataUrlWebp
+        try { await window.overlay.setLifecycle({ tabId, lifecycle: state, hasScreenshot }) } catch { }
 
-        // --- Local state update ---
-        window.__tabState!.set(tabId, state);
-
-        // --- Screenshot presence ---
-        const hasScreenshot: boolean =
-          !!window.__tabThumbs?.has(tabId) &&
-          typeof window.__tabThumbs.get(tabId)?.dataUrlWebp === 'string';
-
-        try {
-          await window.overlay?.setLifecycle?.({
-            tabId,
-            lifecycle: state,
-            hasScreenshot,
-          });
-        } catch (err) {
-          console.error('[LifecycleHost] setLifecycle IPC failed', err);
-        }
-
-        // --- HOT tabs: ensure live view is present ---
-        if (state === 'hot') {
-          try {
-            // overlay expects { shapeId, url } → create if missing
-            await window.overlay.createTab({ shapeId, url });
-          } catch {
-            // ignore "already exists"
+        await chain(tabId, async () => {
+          if (state === 'hot') {
+            try { await window.overlay.createTab({ shapeId, url }) } catch { }
+            await window.overlay.thaw({ tabId })
+            await window.overlay.show({ tabId })
+            return
           }
 
-          await window.overlay.thaw({ tabId });
-          await window.overlay.show({ tabId });
-        }
+          if (state === 'warm') {
+            // snapshots are eventual — do not block the demotion
+            if (!hasScreenshot) { void inputs.snapshot(tabId, 896) }
+            await window.overlay.hide({ tabId })
+            return
+          }
+
+          // frozen
+          await window.overlay.freeze({ tabId })
+        })
       },
-    };
-  }, [editorRef]);
+    }
+  }, [editorRef, inputs])
 
   const MIN = 60_000;
-  // Conservative but reasonable defaults
   const limits = useMemo(() => ({
-    hotCapOverview: 6,    
-    liveCap: 34,
-    warmIdleMs: 1 * MIN,                // 2 s
-    freezeHiddenMs: 5 * MIN,    
+    hotCapOverview: 8,
+    freezeHiddenMs: 6 * MIN,
     tinyPxFloor: 48_000,
   }), [])
 

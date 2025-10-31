@@ -42,14 +42,6 @@ export interface Inputs {
   /** last user interaction time for this shape (ms since epoch) */
   readonly getLastInteractionMs: (shapeId: TLShapeId) => number | undefined
 
-  /** IPC to main – fire-and-forget (never await on hot path) */
-  readonly show: (tabId: TabId) => Promise<void>
-  readonly hide: (tabId: TabId) => Promise<void>
-  readonly freeze: (tabId: TabId) => Promise<void>
-  readonly thaw: (tabId: TabId) => Promise<void>
-  readonly destroy: (tabId: TabId) => Promise<void>
-  readonly snapshot: (tabId: TabId, maxWidth?: number) => Promise<string | null>
-
 }
 
 export interface Outputs {
@@ -139,66 +131,38 @@ export function useLifecycleManager(inputs: Inputs, outputs: Outputs, limits: Li
     }
 
     const promoteToHot = (shapeId: TLShapeId, tabId: TabId): void => {
-  // Preserve createdAt if this tab was warm/hot before
-  const existingWarm = st.current.warm.get(tabId)
-  const existingHot = st.current.hot.get(tabId)
-  const createdAt = existingWarm?.createdAt ?? existingHot?.createdAt ?? inputs.now()
-  
-  st.current.warm.delete(tabId)
-  st.current.frozen.delete(tabId)
-  st.current.hot.set(tabId, { tabId, shapeId, createdAt })
-  setLife(shapeId, 'hot')
-  void inputs.thaw(tabId)
-  void inputs.show(tabId)
-  st.current.hidden.delete(tabId)
-}
+      // Preserve createdAt if this tab was warm/hot before
+      const existingWarm = st.current.warm.get(tabId)
+      const existingHot = st.current.hot.get(tabId)
+      const createdAt = existingWarm?.createdAt ?? existingHot?.createdAt ?? inputs.now()
+
+      st.current.warm.delete(tabId)
+      st.current.frozen.delete(tabId)
+      st.current.hot.set(tabId, { tabId, shapeId, createdAt })
+      setLife(shapeId, 'hot')
+      st.current.hidden.delete(tabId)
+    }
 
     const demoteToWarm = (shapeId: TLShapeId, tabId: TabId): void => {
-  if (!st.current.hot.has(tabId)) return
+      if (!st.current.hot.has(tabId)) return
 
-  const hotRec = st.current.hot.get(tabId)!
-  st.current.hot.delete(tabId)
-  st.current.warm.set(tabId, {
-    tabId,
-    shapeId,
-    createdAt: hotRec.createdAt,  // ← Preserve birth time
-  })
+      const hotRec = st.current.hot.get(tabId)!
+      st.current.hot.delete(tabId)
+      st.current.warm.set(tabId, { tabId, shapeId, createdAt: hotRec.createdAt })
 
-  const thumbs: Map<string, { url: string; dataUrlWebp: string }> | undefined =
-    (window as unknown as {
-      __tabThumbs?: Map<string, { url: string; dataUrlWebp: string }>
-    }).__tabThumbs
-
-  const hasThumb: boolean =
-    !!thumbs &&
-    thumbs.has(tabId) &&
-    typeof thumbs.get(tabId)?.dataUrlWebp === 'string'
-
-  // If no local thumb, take one NOW (before hide)
-  void (async () => {
-    try {
-      if (!hasThumb) {
-        // width to match your nav-finished capture
-        await inputs.snapshot(tabId, 896)
-      }
-      await inputs.hide(tabId)
+      setLife(shapeId, 'warm')          // ← tell bridge to snapshot (eventual) + hide
       st.current.hidden.set(tabId, { hiddenSince: inputs.now() })
-    } catch {
-      /* noop */
     }
-  })()
-
-  setLife(shapeId, 'warm')
-}
 
 
     const freezeWarm = (tabId: TabId): void => {
       const rec = st.current.warm.get(tabId)
       if (!rec) return
+
       st.current.warm.delete(tabId)
       st.current.frozen.add(tabId)
-      setLife(rec.shapeId, 'frozen')
-      void inputs.freeze(tabId)
+
+      setLife(rec.shapeId, 'frozen')    // ← tell bridge to freeze
     }
 
 
@@ -217,32 +181,33 @@ export function useLifecycleManager(inputs: Inputs, outputs: Outputs, limits: Li
     }
 
     /** Build locked HOT = elevated ∪ top-N MRU (by lastInteraction), across all tracked shapes */
+    /** Build locked HOT = elevated ∪ top-N MRU (MRU count does NOT shrink when elevated exist) */
     const rebuildLockedHot = (): void => {
-      const next = new Set<TabId>()
-      // 1) elevated (across ALL tracked shapes)
+      const elevated = new Set<TabId>();
       for (const [shapeId, tabId] of st.current.byShape) {
-        const flags = inputs.getFlags(shapeId)
-        if (isElevated(flags)) next.add(tabId)
+        const flags = inputs.getFlags(shapeId);
+        // elevated always included
+        if (flags.audible || flags.capturing || flags.devtools || flags.downloads || flags.pinned) {
+          elevated.add(tabId);
+        }
       }
-      // 2) non-elevated top-N MRU
-      const nonElev: Array<{ tabId: TabId; shapeId: TLShapeId; last: number }> = []
-      for (const [shapeId, tabId] of st.current.byShape) {
-        const flags = inputs.getFlags(shapeId)
-        if (isElevated(flags)) continue
-        const last = inputs.getLastInteractionMs(shapeId) ?? 0
-        nonElev.push({ tabId, shapeId, last })
-      }
-      nonElev.sort((a, b) => b.last - a.last)
-      const toTake = Math.max(0, limits.hotCapOverview - next.size)
-      for (let i = 0, taken = 0; i < nonElev.length && taken < toTake; i++) {
-        const tid = nonElev[i]!.tabId
-        if (next.has(tid)) continue
-        next.add(tid)
-        taken++
-      }
-      st.current.lockedHot = next
-    }
 
+      // MRU pool of non-elevated across ALL tracked shapes (not just visible)
+      const mruPool: Array<{ tabId: TabId; shapeId: TLShapeId; last: number }> = [];
+      for (const [shapeId, tabId] of st.current.byShape) {
+        if (elevated.has(tabId)) continue;
+        const last = inputs.getLastInteractionMs(shapeId) ?? 0; // include zeros; they sort to the end
+        mruPool.push({ tabId, shapeId, last });
+      }
+      mruPool.sort((a, b) => b.last - a.last);
+
+      // Take exactly limits.hotCapOverview non-elevated MRU, regardless of #elevated
+      const next = new Set<TabId>(elevated);
+      const take = Math.min(limits.hotCapOverview, mruPool.length);
+      for (let i = 0; i < take; i++) next.add(mruPool[i]!.tabId);
+
+      st.current.lockedHot = next;
+    };
     /** Enforce the locked set: keep locked (or elevated) HOT, everyone else non-elevated → WARM */
     const enforceLockedHot = (): void => {
       // Demote any non-elevated HOT not in locked set
@@ -261,27 +226,27 @@ export function useLifecycleManager(inputs: Inputs, outputs: Outputs, limits: Li
       }
     }
 
-const runInteractionTimers = (nowMs: number): void => {
-  for (const [tid, wr] of st.current.warm) {
-    const shapeId = wr.shapeId
-    const last = inputs.getLastInteractionMs(shapeId)
+    const runInteractionTimers = (nowMs: number): void => {
+      for (const [tid, wr] of st.current.warm) {
+        const shapeId = wr.shapeId
+        const last = inputs.getLastInteractionMs(shapeId)
 
-    // 👇 ONLY real interaction keeps it alive
-    if (typeof last === 'number' && last > 0) {
-      const idleFor = nowMs - last
-      if (idleFor >= limits.freezeHiddenMs) {
-        freezeWarm(tid)
+        // 👇 ONLY real interaction keeps it alive
+        if (typeof last === 'number' && last > 0) {
+          const idleFor = nowMs - last
+          if (idleFor >= limits.freezeHiddenMs) {
+            freezeWarm(tid)
+          }
+          continue
+        }
+
+        // 👇 NO real interaction ever → age from creation time
+        const idleFor = nowMs - wr.createdAt
+        if (idleFor >= limits.freezeHiddenMs) {
+          freezeWarm(tid)
+        }
       }
-      continue
     }
-
-    // 👇 NO real interaction ever → age from creation time
-    const idleFor = nowMs - wr.createdAt
-    if (idleFor >= limits.freezeHiddenMs) {
-      freezeWarm(tid)
-    }
-  }
-}
 
 
     /** Track interaction changes and refresh lock if an MRU bump happened */
@@ -415,16 +380,15 @@ const runInteractionTimers = (nowMs: number): void => {
           // STRICT overview: fill with top-N MRU across all tracked shapes (not just visible)
           const nonElev: Array<{ tabId: TabId; shapeId: TLShapeId; last: number }> = []
           for (const [shapeId, tabId] of st.current.byShape) {
-            if (desiredHot.has(tabId)) continue // already elevated
+            if (desiredHot.has(tabId)) continue
             const flags = inputs.getFlags(shapeId)
             if (isElevated(flags)) continue
-            const last = inputs.getLastInteractionMs(shapeId) ?? 0
-            if (last > 0) nonElev.push({ tabId, shapeId, last })
+            const last = inputs.getLastInteractionMs(shapeId) ?? 0   // include zeros
+            nonElev.push({ tabId, shapeId, last })
           }
           nonElev.sort((a, b) => b.last - a.last)
           for (let i = 0; i < nonElev.length && desiredHot.size < limits.hotCapOverview; i++) {
-            const tid = nonElev[i]!.tabId
-            if (!desiredHot.has(tid)) desiredHot.add(tid)
+            desiredHot.add(nonElev[i]!.tabId)
           }
         } else {
           // Normal zoom: all visible non-elevated are hot

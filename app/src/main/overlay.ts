@@ -1559,11 +1559,36 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null): void {
     }
   })
 
-  ipcMain.handle('overlay:thaw', async (_e, { tabId }: { tabId: string }): Promise<void> => {
-    const { state } = S.resolve(tabId);
+ipcMain.handle(
+  'overlay:thaw',
+  async (_e, { tabId }: { tabId: string }): Promise<void> => {
+    const resolved = S.resolve(tabId);
+    const state = resolved?.state;
     if (!state) return;
-    await setLifecycle(state.view.webContents, 'active');
-  })
+
+    const view: WebContentsView = state.view;
+    const wc: WebContents = view.webContents;
+
+    // (a) Unfreeze lifecycle first
+    await setLifecycle(wc, 'active');
+
+    // (b) Ensure no throttling while hot
+    try { wc.setBackgroundThrottling(false); } catch { /* noop */ }
+
+    // (c) Restore last known bounds BEFORE attach to avoid a pop
+    const b = state.lastBounds; // maintained by set-bounds
+    try { view.setBounds({ x: b.x, y: b.y, width: b.w, height: b.h }); } catch { /* noop */ }
+
+    // (d) Reapply zoom / emulation overrides we may have cleared during freeze
+    try { await S.reapply(state); } catch { /* noop */ }
+
+    // (e) Attach if not already; show handler can skip if it's already attached
+    const win = getWindow();
+    if (win && !state.attached) {
+      try { S.attach(win, state); } catch { /* noop */ }
+    }
+  }
+);
 
 ipcMain.handle(
     'overlay:snapshot',
