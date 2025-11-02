@@ -1,439 +1,205 @@
 import { useEffect, useRef } from 'react'
 import type { TLShapeId } from 'tldraw'
 
-/* ====================== Types ====================== */
+export type LifecycleState = 'live' | 'frozen' | 'discarded'
+export type PlacementState = 'active' | 'background'
 
-export type LifecycleState = 'hot' | 'warm' | 'frozen'
-
-export interface ShapeGeom {
-  readonly id: TLShapeId
-  readonly w: number
-  readonly h: number
-  /** 0..1 fraction of the shape’s area that is within the viewport */
-  readonly overlap: number
-}
-
-export interface Flags {
-  readonly audible: boolean
-  readonly capturing: boolean
-  readonly devtools: boolean
-  readonly downloads: boolean
-  readonly pinned: boolean
-}
-
-export type TabId = string
-
-export interface TabInfo {
-  readonly tabId: TabId
-  readonly url: string
-}
+export interface ShapeGeom { readonly id: TLShapeId; readonly w: number; readonly h: number; readonly overlap: number }
+export interface TabInfo { readonly tabId: string; readonly url: string }
 
 export interface Inputs {
-  /** Visible shapes in the current viewport (with overlap 0..1) */
   readonly getVisibleShapes: () => ReadonlyArray<ShapeGeom>
-  /** Camera info; only zoom is needed here */
   readonly getCamera: () => { zoom: number }
-  /** Shape → tab mapping (null if not a browser shape) */
   readonly getTabInfo: (shapeId: TLShapeId) => TabInfo | null
-  /** Current flags for a shape (audible, pinned, etc.) */
-  readonly getFlags: (shapeId: TLShapeId) => Flags
-  /** ms since epoch; monotonic enough for timers/MRU */
   readonly now: () => number
-  /** last user interaction time for this shape (ms since epoch) */
   readonly getLastInteractionMs: (shapeId: TLShapeId) => number | undefined
-
+  readonly hasThumb: (shapeId: TLShapeId) => boolean
 }
 
 export interface Outputs {
   readonly setLifecycle: (shapeId: TLShapeId, state: LifecycleState) => void
+  readonly setPlacement: (shapeId: TLShapeId, placement: PlacementState, needThumb: boolean) => void
 }
 
-/** Tunables supplied by caller */
 export interface Limits {
-  /** Hot cap when zoom is in overview mode (≤ overviewCutoff), e.g., 6 */
   readonly hotCapOverview: number
-  /** Minimum visible pixels to treat a shape as visible */
   readonly tinyPxFloor: number
-  /** After being hidden for this long, warm → frozen */
-  readonly freezeHiddenMs: number
+  readonly freezeHiddenMs: number      // live → frozen
+  readonly discardFrozenMs: number     // frozen → discarded
 }
 
-/* ====================== Local constants ====================== */
+const OVERVIEW_ZOOM_CUTOFF = 0.3
+const ZOOM_SETTLE_MS = 90
+const PAN_SETTLE_MS = 60
 
-/** Strict overview pivot: below/equal this, we DO NOT swap by visibility while panning. */
-const OVERVIEW_ZOOM_CUTOFF = 0.30 // 30%
-/** Polling cadence for reconciliation (~33 FPS) */
-const TICK_MS = 30
-/** Motion idleness thresholds */
-const PAN_IDLE_MS = 60
-const ZOOM_IDLE_MS = 90
-const ZOOM_EPS = 0.0005
-
-/* ====================== Internal state ====================== */
-
-type HotRec = { readonly tabId: TabId; readonly shapeId: TLShapeId; readonly createdAt: number }
-type WarmRec = { readonly tabId: TabId; readonly shapeId: TLShapeId; readonly createdAt: number }
-type HiddenInfo = { hiddenSince: number }
+type Life = 'live' | 'frozen' | 'discarded'
+type Tracked = {
+  readonly tabId: string
+  shapeId: TLShapeId
+  life: Life
+  lastInteractionAt: number
+  lastLifecycleSent: Life | null
+  lastPlacementSent: PlacementState | null
+}
 
 export function useLifecycleManager(inputs: Inputs, outputs: Outputs, limits: Limits): void {
   const st = useRef<{
-    hot: Map<TabId, HotRec>
-    warm: Map<TabId, WarmRec>
-    frozen: Set<TabId>
-    hidden: Map<TabId, HiddenInfo>
-    byShape: Map<TLShapeId, TabId>
-    // motion tracking
-    lastPanSig: number
-    lastPanTs: number
-    wasPanIdle: boolean
+    byTab: Map<string, Tracked>
+    byShape: Map<TLShapeId, string>
     lastZoom: number
-    lastZoomTs: number
-    ticking: boolean
-    // overview pan lock
-    lockedHot: Set<TabId>
-    // MRU tracking (last seen interaction timestamps per tab)
-    lastInteractionByTab: Map<TabId, number>
+    lastZoomAt: number
+    lastVisSig: string
+    lastPanAt: number
   }>({
-    hot: new Map(),
-    warm: new Map(),
-    frozen: new Set(),
-    hidden: new Map(),
+    byTab: new Map(),
     byShape: new Map(),
-    lastPanSig: 0,
-    lastPanTs: 0,
-    wasPanIdle: true,
     lastZoom: 1,
-    lastZoomTs: 0,
-    ticking: false,
-    lockedHot: new Set<TabId>(),
-    lastInteractionByTab: new Map<TabId, number>(),
+    lastZoomAt: 0,
+    lastVisSig: '',
+    lastPanAt: 0,
   })
 
+  // ---- 1. life timers ----
   useEffect(() => {
-    const isElevated = (f: Flags): boolean =>
-      f.audible || f.capturing || f.devtools || f.downloads || f.pinned
+    const timer = window.setInterval(() => {
+      const now = inputs.now()
 
-    const visiblePixels = (g: ShapeGeom): number => {
-      const ov = g.overlap <= 0 ? 0 : g.overlap >= 1 ? 1 : g.overlap
-      return g.w * g.h * ov
-    }
-    const setLife = (shapeId: TLShapeId, state: LifecycleState): void => {
-      outputs.setLifecycle(shapeId, state)
-    }
-    const trackShapeTab = (shapeId: TLShapeId, tabId: TabId): void => {
-      st.current.byShape.set(shapeId, tabId)
-    }
-    const shapeIdForTab = (tabId: TabId): TLShapeId | undefined => {
-      for (const [sid, tid] of st.current.byShape) {
-        if (tid === tabId) return sid
-      }
-      return undefined
-    }
-
-    const promoteToHot = (shapeId: TLShapeId, tabId: TabId): void => {
-      // Preserve createdAt if this tab was warm/hot before
-      const existingWarm = st.current.warm.get(tabId)
-      const existingHot = st.current.hot.get(tabId)
-      const createdAt = existingWarm?.createdAt ?? existingHot?.createdAt ?? inputs.now()
-
-      st.current.warm.delete(tabId)
-      st.current.frozen.delete(tabId)
-      st.current.hot.set(tabId, { tabId, shapeId, createdAt })
-      setLife(shapeId, 'hot')
-      st.current.hidden.delete(tabId)
-    }
-
-    const demoteToWarm = (shapeId: TLShapeId, tabId: TabId): void => {
-      if (!st.current.hot.has(tabId)) return
-
-      const hotRec = st.current.hot.get(tabId)!
-      st.current.hot.delete(tabId)
-      st.current.warm.set(tabId, { tabId, shapeId, createdAt: hotRec.createdAt })
-
-      setLife(shapeId, 'warm')          // ← tell bridge to snapshot (eventual) + hide
-      st.current.hidden.set(tabId, { hiddenSince: inputs.now() })
-    }
-
-
-    const freezeWarm = (tabId: TabId): void => {
-      const rec = st.current.warm.get(tabId)
-      if (!rec) return
-
-      st.current.warm.delete(tabId)
-      st.current.frozen.add(tabId)
-
-      setLife(rec.shapeId, 'frozen')    // ← tell bridge to freeze
-    }
-
-
-    const panSignature = (geoms: ReadonlyArray<ShapeGeom>): number => {
-      // Deterministic signature that shifts when the viewport pans
-      let acc = 0
-      for (let i = 0; i < geoms.length; i++) {
-        const g = geoms[i]!
-        // tiny stable hash of id
-        let h = 0
-        const s = String(g.id)
-        for (let j = 0; j < s.length; j++) h = ((h << 5) - h + s.charCodeAt(j) | 0) >>> 0
-        acc += (h % 9973) * g.overlap
-      }
-      return acc
-    }
-
-    /** Build locked HOT = elevated ∪ top-N MRU (by lastInteraction), across all tracked shapes */
-    /** Build locked HOT = elevated ∪ top-N MRU (MRU count does NOT shrink when elevated exist) */
-    const rebuildLockedHot = (): void => {
-      const elevated = new Set<TabId>();
+      // interaction → wake
       for (const [shapeId, tabId] of st.current.byShape) {
-        const flags = inputs.getFlags(shapeId);
-        // elevated always included
-        if (flags.audible || flags.capturing || flags.devtools || flags.downloads || flags.pinned) {
-          elevated.add(tabId);
-        }
-      }
-
-      // MRU pool of non-elevated across ALL tracked shapes (not just visible)
-      const mruPool: Array<{ tabId: TabId; shapeId: TLShapeId; last: number }> = [];
-      for (const [shapeId, tabId] of st.current.byShape) {
-        if (elevated.has(tabId)) continue;
-        const last = inputs.getLastInteractionMs(shapeId) ?? 0; // include zeros; they sort to the end
-        mruPool.push({ tabId, shapeId, last });
-      }
-      mruPool.sort((a, b) => b.last - a.last);
-
-      // Take exactly limits.hotCapOverview non-elevated MRU, regardless of #elevated
-      const next = new Set<TabId>(elevated);
-      const take = Math.min(limits.hotCapOverview, mruPool.length);
-      for (let i = 0; i < take; i++) next.add(mruPool[i]!.tabId);
-
-      st.current.lockedHot = next;
-    };
-    /** Enforce the locked set: keep locked (or elevated) HOT, everyone else non-elevated → WARM */
-    const enforceLockedHot = (): void => {
-      // Demote any non-elevated HOT not in locked set
-      for (const [tid, rec] of st.current.hot) {
-        // If it's locked or elevated, keep hot
-        const flags = inputs.getFlags(rec.shapeId)
-        if (st.current.lockedHot.has(tid) || isElevated(flags)) continue
-        demoteToWarm(rec.shapeId, tid)
-      }
-      // Promote all locked that are not hot yet
-      for (const tid of st.current.lockedHot) {
-        if (st.current.hot.has(tid)) continue
-        const sid = shapeIdForTab(tid)
-        if (!sid) continue
-        promoteToHot(sid, tid)
-      }
-    }
-
-    const runInteractionTimers = (nowMs: number): void => {
-      for (const [tid, wr] of st.current.warm) {
-        const shapeId = wr.shapeId
+        const tracked = st.current.byTab.get(tabId)
+        if (!tracked) continue
         const last = inputs.getLastInteractionMs(shapeId)
-
-        // 👇 ONLY real interaction keeps it alive
-        if (typeof last === 'number' && last > 0) {
-          const idleFor = nowMs - last
-          if (idleFor >= limits.freezeHiddenMs) {
-            freezeWarm(tid)
-          }
-          continue
-        }
-
-        // 👇 NO real interaction ever → age from creation time
-        const idleFor = nowMs - wr.createdAt
-        if (idleFor >= limits.freezeHiddenMs) {
-          freezeWarm(tid)
+        if (typeof last === 'number' && last > tracked.lastInteractionAt) {
+          tracked.lastInteractionAt = last
+          if (tracked.life !== 'live') tracked.life = 'live'
         }
       }
-    }
 
-
-    /** Track interaction changes and refresh lock if an MRU bump happened */
-    const maybeRefreshLockOnInteraction = (inOverviewAndPanning: boolean): void => {
-      if (!inOverviewAndPanning) return
-      let changed = false
-      for (const [shapeId, tabId] of st.current.byShape) {
-        const last = inputs.getLastInteractionMs(shapeId) ?? 0
-        const prev = st.current.lastInteractionByTab.get(tabId) ?? 0
-        if (last !== prev) {
-          changed = true
-        }
-        st.current.lastInteractionByTab.set(tabId, last)
-      }
-      if (changed) {
-        rebuildLockedHot()
-      }
-    }
-
-    /* ---------- main reconcile ---------- */
-
-    const tick = (): void => {
-      if (st.current.ticking) return
-      st.current.ticking = true
-      try {
-        const now = inputs.now()
-        const zoom = inputs.getCamera().zoom
-
-        // Zoom motion tracking
-        if (Math.abs(zoom - st.current.lastZoom) > ZOOM_EPS) {
-          st.current.lastZoom = zoom
-          st.current.lastZoomTs = now
-        }
-
-        // Build visible list + pan signature
-        const geoms = inputs.getVisibleShapes()
-        const sig = panSignature(geoms)
-        if (sig !== st.current.lastPanSig) {
-          st.current.lastPanSig = sig
-          st.current.lastPanTs = now
-        }
-
-        const panIdle = (now - st.current.lastPanTs) >= PAN_IDLE_MS
-        const zoomIdle = (now - st.current.lastZoomTs) >= ZOOM_IDLE_MS
-        const overviewMode = zoom <= OVERVIEW_ZOOM_CUTOFF
-
-        const visible: Array<{ shapeId: TLShapeId; tabId: TabId; flags: Flags; px: number; lastInteraction: number }> = []
-        for (let i = 0; i < geoms.length; i++) {
-          const g = geoms[i]!
-          const px = visiblePixels(g)
-          if (px < limits.tinyPxFloor) continue
-          const info = inputs.getTabInfo(g.id); if (!info) continue
-          const flags = inputs.getFlags(g.id)
-          const lastInteraction = inputs.getLastInteractionMs(g.id) ?? 0
-          visible.push({ shapeId: g.id, tabId: info.tabId, flags, px, lastInteraction })
-          trackShapeTab(g.id, info.tabId)
-          // keep MRU cache up-to-date
-          st.current.lastInteractionByTab.set(info.tabId, lastInteraction)
-        }
-        const visibleSet = new Set<TabId>(visible.map(v => v.tabId))
-
-        // Detect pan state transition
-        const panBecameActive = st.current.wasPanIdle && !panIdle
-        const isOverviewAndPanning = overviewMode && !panIdle
-        st.current.wasPanIdle = panIdle
-
-        /* ---------- NOTHING mutational during zoom motion ---------- */
-        if (!zoomIdle) {
-          runInteractionTimers(now)
-          // Do not promote, do not demote (even off-screen), do not run timers.
-          return
-        }
-
-        /* ---------- OVERVIEW (≤ 30%) + PANNING: LOCKED HOT ---------- */
-        if (isOverviewAndPanning) {
-          if (panBecameActive) {
-            // Latch the lock when panning starts in overview
-            rebuildLockedHot()
-          } else {
-            // If any MRU changed, rebuild the lock so interaction can reshuffle while panning
-            maybeRefreshLockOnInteraction(true)
+      // age down
+      for (const tracked of st.current.byTab.values()) {
+        const idle = now - tracked.lastInteractionAt
+        if (tracked.life === 'live') {
+          if (idle >= limits.freezeHiddenMs) {
+            tracked.life = 'frozen'
           }
-          // Enforce the lock: no visibility-based swapping here
-          enforceLockedHot()
-          runInteractionTimers(now)
-          // Skip timers during active pan to minimize work
-          return
+        } else if (tracked.life === 'frozen') {
+          if (idle >= limits.freezeHiddenMs + limits.discardFrozenMs) {
+            tracked.life = 'discarded'
+          }
         }
 
-        /* ---------- DETAIL (> 30%) + PANNING: fast follow visibility ---------- */
-        if (!panIdle) {
-          // Instant off-screen demote for non-elevated hots
-          for (const [tid, rec] of st.current.hot) {
-            if (visibleSet.has(tid)) continue
-            const flags = inputs.getFlags(rec.shapeId)
-            if (isElevated(flags)) continue
-            demoteToWarm(rec.shapeId, tid)
-          }
+        if (tracked.life !== tracked.lastLifecycleSent) {
+          outputs.setLifecycle(tracked.shapeId, tracked.life)
+          tracked.lastLifecycleSent = tracked.life
+        }
+      }
+    }, 1_000)
+    return () => window.clearInterval(timer)
+  }, [inputs, outputs, limits])
 
-          // Allow at most one safe promotion per tick
-          const strongPx = limits.tinyPxFloor * 8
-          let chosen: { shapeId: TLShapeId; tabId: TabId } | null = null
-          const ordered = [...visible]
-            .filter(v => !st.current.hot.has(v.tabId))
-            .sort((a, b) => (b.px - a.px))
-          for (let i = 0; i < ordered.length; i++) {
-            const v = ordered[i]!
-            if (isElevated(v.flags) || v.px >= strongPx) {
-              chosen = { shapeId: v.shapeId, tabId: v.tabId }
-              break
+  // ---- 2. camera / placement ----
+  useEffect(() => {
+    let raf = 0
+    const loop = (): void => {
+      raf = requestAnimationFrame(loop)
+
+      const now = inputs.now()
+      const { zoom } = inputs.getCamera()
+      const vis = inputs.getVisibleShapes()
+
+      // track zoom changes
+      if (Math.abs(zoom - st.current.lastZoom) > 0.0005) {
+        st.current.lastZoom = zoom
+        st.current.lastZoomAt = now
+      }
+
+      // discover visible tabs
+      const sig: Array<string> = []
+      const visibleTabs: Array<{ tabId: string; shapeId: TLShapeId; px: number }> = []
+      for (const g of vis) {
+        const ov = g.overlap < 0 ? 0 : g.overlap > 1 ? 1 : g.overlap
+        const px = g.w * g.h * ov
+        if (px < limits.tinyPxFloor) continue
+        const info = inputs.getTabInfo(g.id)
+        if (!info) continue
+
+        sig.push(info.tabId)
+        visibleTabs.push({ tabId: info.tabId, shapeId: g.id, px })
+        st.current.byShape.set(g.id, info.tabId)
+
+        const existing = st.current.byTab.get(info.tabId)
+        if (!existing) {
+          st.current.byTab.set(info.tabId, {
+            tabId: info.tabId,
+            shapeId: g.id,
+            life: 'live',
+            lastInteractionAt: now,
+            lastLifecycleSent: null,
+            lastPlacementSent: null,
+          })
+        } else {
+          existing.shapeId = g.id
+        }
+      }
+
+      const visSig = sig.sort().join('|')
+      if (visSig !== st.current.lastVisSig) {
+        st.current.lastVisSig = visSig
+        st.current.lastPanAt = now
+      }
+
+      // wait for camera to settle
+      if (now - st.current.lastZoomAt < ZOOM_SETTLE_MS) return
+      if (now - st.current.lastPanAt < PAN_SETTLE_MS) return
+
+      // placement only for live tabs
+      const liveTabs = Array.from(st.current.byTab.values()).filter((t) => t.life === 'live')
+      if (liveTabs.length === 0) return
+
+      if (zoom >= OVERVIEW_ZOOM_CUTOFF) {
+        // detail → actual visibility
+        const visSet = new Set<string>(visibleTabs.map((v) => v.tabId))
+        for (const t of liveTabs) {
+          const placement: PlacementState = visSet.has(t.tabId) ? 'active' : 'background'
+          if (placement !== t.lastPlacementSent) {
+            const needThumb = placement === 'background' && !inputs.hasThumb(t.shapeId)
+            outputs.setPlacement(t.shapeId, placement, needThumb)
+            t.lastPlacementSent = placement
+          } else if (placement === 'background') {
+            const needThumb = !inputs.hasThumb(t.shapeId)
+            if (needThumb) outputs.setPlacement(t.shapeId, placement, true)
+          }
+        }
+      } else {
+        // overview → NEW RULE:
+        // if total live ≤ cap → everybody active
+        if (liveTabs.length <= limits.hotCapOverview) {
+          for (const t of liveTabs) {
+            if (t.lastPlacementSent !== 'active') {
+              outputs.setPlacement(t.shapeId, 'active', false)
+              t.lastPlacementSent = 'active'
             }
           }
-          if (chosen) promoteToHot(chosen.shapeId, chosen.tabId)
-
-          runInteractionTimers(now)
-          return
-        }
-
-        /* ---------- FULL IDLE reconcile (no zoom, no pan) ---------- */
-
-        // 1) Elevated tabs always hot (visible or not)
-        const desiredHot = new Set<TabId>()
-        // Use all tracked shapes to keep elevated hot even if not visible
-        for (const [shapeId, tabId] of st.current.byShape) {
-          const flags = inputs.getFlags(shapeId)
-          if (isElevated(flags)) desiredHot.add(tabId)
-        }
-
-        // 2) Non-elevated selection
-        if (overviewMode) {
-          // STRICT overview: fill with top-N MRU across all tracked shapes (not just visible)
-          const nonElev: Array<{ tabId: TabId; shapeId: TLShapeId; last: number }> = []
-          for (const [shapeId, tabId] of st.current.byShape) {
-            if (desiredHot.has(tabId)) continue
-            const flags = inputs.getFlags(shapeId)
-            if (isElevated(flags)) continue
-            const last = inputs.getLastInteractionMs(shapeId) ?? 0   // include zeros
-            nonElev.push({ tabId, shapeId, last })
-          }
-          nonElev.sort((a, b) => b.last - a.last)
-          for (let i = 0; i < nonElev.length && desiredHot.size < limits.hotCapOverview; i++) {
-            desiredHot.add(nonElev[i]!.tabId)
-          }
         } else {
-          // Normal zoom: all visible non-elevated are hot
-          for (let i = 0; i < visible.length; i++) {
-            const v = visible[i]!
-            if (!isElevated(v.flags)) desiredHot.add(v.tabId)
+          // else fall back to top-N by interaction
+          const sorted = liveTabs.slice().sort((a, b) => b.lastInteractionAt - a.lastInteractionAt)
+          const keep = new Set<string>(sorted.slice(0, limits.hotCapOverview).map((t) => t.tabId))
+          for (const t of liveTabs) {
+            const placement: PlacementState = keep.has(t.tabId) ? 'active' : 'background'
+            if (placement !== t.lastPlacementSent) {
+              const needThumb = placement === 'background' && !inputs.hasThumb(t.shapeId)
+              outputs.setPlacement(t.shapeId, placement, needThumb)
+              t.lastPlacementSent = placement
+            } else if (placement === 'background') {
+              const needThumb = !inputs.hasThumb(t.shapeId)
+              if (needThumb) outputs.setPlacement(t.shapeId, placement, true)
+            }
           }
         }
-
-        // Demote any non-elevated hots not desired
-        for (const [tid, rec] of st.current.hot) {
-          if (desiredHot.has(tid)) continue
-          const flags = inputs.getFlags(rec.shapeId)
-          if (isElevated(flags)) continue
-          demoteToWarm(rec.shapeId, tid)
-        }
-
-        // Promote desired that aren’t hot yet
-        // For overview idle, promote both visible and offscreen desired (since they're MRU/elevated picks)
-        const promoteList: Array<{ tabId: TabId; shapeId: TLShapeId }> = []
-        if (overviewMode) {
-          for (const tid of desiredHot) {
-            if (st.current.hot.has(tid)) continue
-            const sid = shapeIdForTab(tid)
-            if (sid) promoteList.push({ tabId: tid, shapeId: sid })
-          }
-        } else {
-          for (let i = 0; i < visible.length; i++) {
-            const v = visible[i]!
-            if (!desiredHot.has(v.tabId)) continue
-            if (!st.current.hot.has(v.tabId)) promoteList.push({ tabId: v.tabId, shapeId: v.shapeId })
-          }
-        }
-        for (let i = 0; i < promoteList.length; i++) {
-          const p = promoteList[i]!
-          promoteToHot(p.shapeId, p.tabId)
-        }
-
-      } finally {
-        st.current.ticking = false
       }
     }
 
-    const iv = window.setInterval(tick, TICK_MS)
-    return () => window.clearInterval(iv)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    raf = requestAnimationFrame(loop)
+    return () => cancelAnimationFrame(raf)
   }, [inputs, outputs, limits])
 }

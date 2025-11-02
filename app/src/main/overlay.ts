@@ -683,7 +683,7 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null): void {
 
 
   // -------------------- IPC handlers ---------------------------------------
-  ipcMain.handle('overlay:create-tab', async (_e, payload?: { url?: string; shapeId?: string }): Promise<CreateTabResponse> => {
+  ipcMain.handle('overlay:create-tab', async (_e, payload?: { url?: string; shapeId?: string; restore?: boolean }): Promise<CreateTabResponse> => {
     const win = getWindow()
     if (!win || win.isDestroyed()) return { ok: false, error: 'No window' }
     if (views.size >= MAX_VIEWS) {
@@ -697,39 +697,28 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null): void {
     }
 
     return enqueue<Ok<{ tabId: string }>>(async () => {
-      const tabId: string = payload?.shapeId!;
-      const incomingUrl: string | undefined = payload?.url;
-      const hasIncoming: boolean = typeof incomingUrl === 'string' && incomingUrl.trim().length > 0;
+      const tabId = payload?.shapeId!
+      const wantsRestore: boolean = payload?.restore === true;
+      let savedUrl = payload?.url || 'https://google.com/'
+      let delayMs = 0
 
-      let savedUrl: string;
-      let delayMs = 0;
-
-      // Case 1: During app startup, if this tab is in the startup queue, restore EXACTLY what we persisted.
-      const isStartupRestoreForThisTab: boolean =
+      const isStartupRestore: boolean =
         startupQueue.length > 0 && !!startupBrowserState[tabId];
-
-      if (isStartupRestoreForThisTab) {
-        const restoredUrl: string | undefined = startupBrowserState[tabId]?.currentUrl;
-        savedUrl = (restoredUrl && restoredUrl.trim().length > 0)
-          ? restoredUrl
-          : (hasIncoming ? incomingUrl!.trim() : 'https://google.com/');
-
-        const queueIndex = startupQueue.findIndex(item => item.shapeId === tabId);
+      if (isStartupRestore) {
+        savedUrl = startupBrowserState[tabId].currentUrl || savedUrl;
+        const queueIndex = startupQueue.findIndex((item) => item.shapeId === tabId);
         if (queueIndex >= 0) {
           delayMs = queueIndex * STARTUP_DELAY_MS;
           startupQueue.splice(queueIndex, 1);
         }
-      } else {
-        // After startup:
-        // Case 3 (Revive): if renderer sent a URL, use it.
-        if (hasIncoming) {
-          savedUrl = incomingUrl!.trim();
-        } else {
-          // Case 2 (New tab) or revive without url: try last known, else default.
-          const lastUrl: string | undefined = browserState[tabId]?.currentUrl;
-          savedUrl = (lastUrl && lastUrl.trim().length > 0) ? lastUrl : 'https://google.com/';
+      } else if (wantsRestore) {
+        // 2) explicit restore: look in the json (browserState) for this shape id
+        const persisted: PersistedTabState | undefined = browserState[tabId];
+        if (persisted?.currentUrl && persisted.currentUrl.length > 0) {
+          savedUrl = persisted.currentUrl;
         }
       }
+
 
       if (delayMs > 0) await new Promise(r => setTimeout(r, delayMs))
 
@@ -1300,88 +1289,77 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null): void {
   )
 
 
-
   ipcMain.handle('overlay:get-zoom', async (): Promise<number> => canvasZoom)
 
-  ipcMain.handle(
-    'overlay:show',
-    async (_e, payload: { tabId: string; rect?: Rect }): Promise<void> => {
-      const win = getWindow()
-      const { state } = S.resolve(payload.tabId)
-      if (!win || !state) return
+  ipcMain.handle('overlay:show', async (_e, payload: { tabId: string; rect?: Rect }): Promise<void> => {
+    const win = getWindow()
+    const { state } = S.resolve(payload.tabId)
+    if (!win || !state) return
 
-      const baseRect: Rect =
-        payload.rect ??
-        (state.lastBounds
-          ? { x: state.lastBounds.x, y: state.lastBounds.y, width: state.lastBounds.w, height: state.lastBounds.h }
-          : { x: 0, y: 0, width: 1, height: 1 })
+    const baseRect: Rect =
+      payload.rect ??
+      (state.lastBounds
+        ? { x: state.lastBounds.x, y: state.lastBounds.y, width: state.lastBounds.w, height: state.lastBounds.h }
+        : { x: 0, y: 0, width: 1, height: 1 })
 
-      const { x, y, w, h } = S.roundRect(baseRect)
+    const { x, y, w, h } = S.roundRect(baseRect)
+    state.lastBounds = { x, y, w, h }
+
+    S.attach(win, state)
+
+    try {
+      state.view.setBounds({
+        x: x + BORDER,
+        y: y + BORDER,
+        width: w - 2 * BORDER,
+        height: h - 2 * BORDER,
+      })
+    } catch {
+      // optional: log
+    }
+  }
+  )
+
+  ipcMain.handle('overlay:set-bounds', async (_e, { tabId, rect }: { tabId: string; rect: Rect }) => {
+    const { state } = S.resolve(tabId)
+    if (!state) return
+
+    const { x, y, w, h } = S.roundRect(rect)
+    const b = state.lastBounds
+
+    if (!b || x !== b.x || y !== b.y || w !== b.w || h !== b.h) {
       state.lastBounds = { x, y, w, h }
-
-      S.attach(win, state)
-
       try {
         state.view.setBounds({
           x: x + BORDER,
           y: y + BORDER,
           width: w - 2 * BORDER,
           height: h - 2 * BORDER,
-        })
-      } catch {
-        // optional: log
-      }
+        });
+      } catch { }
     }
+
+    // If we’re under 25% and a bucket is pending, (re)schedule the single apply
+    if (S.currentEff() < CHROME_MIN && state.pendingBucket != null) {
+      S.scheduleEmu(state)
+    }
+  }
   )
 
-  ipcMain.handle(
-    'overlay:set-bounds',
-    async (_e, { tabId, rect }: { tabId: string; rect: Rect }) => {
-      const { state } = S.resolve(tabId)
-      if (!state) return
+  ipcMain.handle('overlay:set-lifecycle', (_event, payload: { tabId: string; lifecycle: LifecycleKind; hasScreenshot: boolean; }) => {
+    const { tabId, lifecycle, hasScreenshot } = payload;
+    const prev: PersistedTabState | undefined = browserState[tabId];
 
-      const { x, y, w, h } = S.roundRect(rect)
-      const b = state.lastBounds
+    browserState[tabId] = {
+      currentUrl: prev?.currentUrl ?? 'about:blank',
+      lastInteraction: prev?.lastInteraction ?? Date.now(),
+      lifecycle,
+      hasScreenshot,
+    };
 
-      if (!b || x !== b.x || y !== b.y || w !== b.w || h !== b.h) {
-        state.lastBounds = { x, y, w, h }
-        try {
-          state.view.setBounds({
-            x: x + BORDER,
-            y: y + BORDER,
-            width: w - 2 * BORDER,
-            height: h - 2 * BORDER,
-          });
-        } catch { }
-      }
-
-      // If we’re under 25% and a bucket is pending, (re)schedule the single apply
-      if (S.currentEff() < CHROME_MIN && state.pendingBucket != null) {
-        S.scheduleEmu(state)
-      }
-    }
-  )
-
-  ipcMain.handle(
-    'overlay:set-lifecycle',
-    (_event, payload: {
-      tabId: string;
-      lifecycle: LifecycleKind;
-      hasScreenshot: boolean;
-    }) => {
-      const { tabId, lifecycle, hasScreenshot } = payload;
-      const prev: PersistedTabState | undefined = browserState[tabId];
-
-      browserState[tabId] = {
-        currentUrl: prev?.currentUrl ?? 'about:blank',
-        lastInteraction: prev?.lastInteraction ?? Date.now(),
-        lifecycle,
-        hasScreenshot,
-      };
-
-      flushBrowserState();
-      return { ok: true as const };
-    }
+    flushBrowserState();
+    return { ok: true as const };
+  }
   );
 
   ipcMain.handle('overlay:get-persisted-state', () => {
@@ -1396,75 +1374,69 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null): void {
     return { ok: true as const, tabs };
   });
 
-  ipcMain.handle(
-    'overlay:save-thumb',
-    async (
-      _event,
-      payload: { tabId: string; url: string; dataUrlWebp: string }
-    ): Promise<{ ok: true; thumbPath: string } | { ok: false }> => {
-      try {
-        ensureThumbsDir();
+  ipcMain.handle('overlay:save-thumb', async (_event, payload: { tabId: string; url: string; dataUrlWebp: string }
+  ): Promise<{ ok: true; thumbPath: string } | { ok: false }> => {
+    try {
+      ensureThumbsDir();
 
-        // data:image/webp;base64,xxxx
-        const commaIdx = payload.dataUrlWebp.indexOf(',');
-        if (commaIdx === -1) return { ok: false };
-        const b64 = payload.dataUrlWebp.slice(commaIdx + 1);
-        const buf = Buffer.from(b64, 'base64');
+      // data:image/webp;base64,xxxx
+      const commaIdx = payload.dataUrlWebp.indexOf(',');
+      if (commaIdx === -1) return { ok: false };
+      const b64 = payload.dataUrlWebp.slice(commaIdx + 1);
+      const buf = Buffer.from(b64, 'base64');
 
-        const safeId = payload.tabId.replace(/[^a-zA-Z0-9_-]/g, '_');
-        const fileName = `${safeId}.webp`;
-        const fullPath = path.join(THUMBS_DIR, fileName);
+      const safeId = payload.tabId.replace(/[^a-zA-Z0-9_-]/g, '_');
+      const fileName = `${safeId}.webp`;
+      const fullPath = path.join(THUMBS_DIR, fileName);
 
-        fs.writeFileSync(fullPath, buf);
+      fs.writeFileSync(fullPath, buf);
 
-        const prev = browserState[payload.tabId];
+      const prev = browserState[payload.tabId];
 
-        browserState[payload.tabId] = {
-          currentUrl: prev?.currentUrl ?? payload.url,
-          lastInteraction: prev?.lastInteraction ?? Date.now(),
-          lifecycle: prev?.lifecycle ?? 'warm',
-          hasScreenshot: true,
-          thumbPath: fullPath,
-        };
+      browserState[payload.tabId] = {
+        currentUrl: prev?.currentUrl ?? payload.url,
+        lastInteraction: prev?.lastInteraction ?? Date.now(),
+        lifecycle: prev?.lifecycle ?? 'warm',
+        hasScreenshot: true,
+        thumbPath: fullPath,
+      };
 
-        flushBrowserState();
-        return { ok: true, thumbPath: fullPath };
-      } catch {
-        return { ok: false };
-      }
+      flushBrowserState();
+      return { ok: true, thumbPath: fullPath };
+    } catch {
+      return { ok: false };
     }
+  }
   );
 
 
-  ipcMain.handle(
-    'overlay:set-zoom',
-    async (_e, { tabId, factor }: { tabId?: string; factor: number }): Promise<void> => {
-      canvasZoom = factor || 1
-      const eff = S.currentEff()
+  ipcMain.handle('overlay:set-zoom', async (_e, { tabId, factor }: { tabId?: string; factor: number }): Promise<void> => {
+    canvasZoom = factor || 1
+    const eff = S.currentEff()
 
-      const apply = (state: ViewState) => {
-        if (eff >= CHROME_MIN) {
-          // Native zoom: clear any pending emu and apply once
-          state.pendingBucket = null
-          if (state.emuTimer) { clearTimeout(state.emuTimer); state.emuTimer = null }
-          S.setEff(state.view, eff, state)
-          return
-        }
-        // Emulation path: compute bucket and coalesce
-        const bucket = effToBucketKey(eff)
-        if (state.lastAppliedZoomKey === bucket || state.pendingBucket === bucket) return
-        state.pendingBucket = bucket
-        S.scheduleEmu(state) // ← will apply once, using latest bounds
+    const apply = (state: ViewState) => {
+      if (eff >= CHROME_MIN) {
+        // Native zoom: clear any pending emu and apply once
+        state.pendingBucket = null
+        if (state.emuTimer) { clearTimeout(state.emuTimer); state.emuTimer = null }
+        S.setEff(state.view, eff, state)
+        return
       }
-
-      if (tabId) {
-        const { state } = S.resolve(tabId)
-        if (!state) return
-        apply(state)
-      } else {
-        for (const [, s] of views) apply(s)
-      }
+      // Emulation path: compute bucket and coalesce
+      const bucket = effToBucketKey(eff)
+      if (state.lastAppliedZoomKey === bucket || state.pendingBucket === bucket) return
+      state.pendingBucket = bucket
+      S.scheduleEmu(state) // ← will apply once, using latest bounds
     }
+
+    if (tabId) {
+      const { state } = S.resolve(tabId)
+      if (!state) return
+      apply(state)
+    } else {
+      for (const [, s] of views) apply(s)
+    }
+  }
   )
 
   ipcMain.handle('overlay:hide', async (_e, p?: { tabId?: string }): Promise<void> => {
@@ -1480,34 +1452,32 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null): void {
     }
   })
 
-  ipcMain.handle(
-    'overlay:navigate',
-    async (_e, { tabId, url }: { tabId: string; url: string }): Promise<SimpleResponse> => {
-      const { state } = S.resolve(tabId)
-      if (!state) return { ok: false, error: 'No view' }
+  ipcMain.handle('overlay:navigate', async (_e, { tabId, url }: { tabId: string; url: string }): Promise<SimpleResponse> => {
+    const { state } = S.resolve(tabId)
+    if (!state) return { ok: false, error: 'No view' }
 
-      // Normalize input (accepts bare hostnames)
-      const raw = url.trim()
-      const target =
-        raw.startsWith('http://') || raw.startsWith('https://') ? raw : `https://${raw}`
+    // Normalize input (accepts bare hostnames)
+    const raw = url.trim()
+    const target =
+      raw.startsWith('http://') || raw.startsWith('https://') ? raw : `https://${raw}`
 
-      try {
-        await state.view.webContents.loadURL(target)
+    try {
+      await state.view.webContents.loadURL(target)
 
-        // Refresh nav state & persist (uses your existing helpers/structures)
-        S.updateNav(state)
-        browserState[tabId] = {
-          ...(browserState[tabId] ?? {}),
-          currentUrl: state.view.webContents.getURL(),
-          lastInteraction: Date.now(),
-        }
-        flushBrowserState()
-
-        return { ok: true }
-      } catch {
-        return { ok: false, error: 'Navigate failed' }
+      // Refresh nav state & persist (uses your existing helpers/structures)
+      S.updateNav(state)
+      browserState[tabId] = {
+        ...(browserState[tabId] ?? {}),
+        currentUrl: state.view.webContents.getURL(),
+        lastInteraction: Date.now(),
       }
+      flushBrowserState()
+
+      return { ok: true }
+    } catch {
+      return { ok: false, error: 'Navigate failed' }
     }
+  }
   )
 
   ipcMain.handle('overlay:freeze', async (_e, { tabId }: { tabId: string }): Promise<void> => {
@@ -1559,9 +1529,7 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null): void {
     }
   })
 
-ipcMain.handle(
-  'overlay:thaw',
-  async (_e, { tabId }: { tabId: string }): Promise<void> => {
+  ipcMain.handle('overlay:thaw', async (_e, { tabId }: { tabId: string }): Promise<void> => {
     const resolved = S.resolve(tabId);
     const state = resolved?.state;
     if (!state) return;
@@ -1584,268 +1552,185 @@ ipcMain.handle(
       try { S.attach(win, state); } catch { /* noop */ }
     }
   }
-);
-
-ipcMain.handle(
-    'overlay:snapshot',
-    async (
-      _e,
-      payload: { tabId: string; maxWidth?: number }
-    ): Promise<
-      | { ok: true; dataUrl: string; width: number; height: number }
-      | {
-        ok: false;
-        error:
-        | 'tab-destroying'
-        | 'webcontents-destroyed'
-        | 'snapshot-failed'
-        | 'no-view'
-        | 'not-ready';
-      }
-    > => {
-      const tabId: string | undefined = payload?.tabId;
-      if (!tabId) return { ok: false, error: 'no-view' };
-      if (destroying.has(tabId)) return { ok: false, error: 'tab-destroying' };
-
-      const { state } = S.resolve(tabId);
-      const view = state?.view ?? null;
-      const wc = view?.webContents ?? null;
-
-      if (!state || !view || !wc || (typeof wc.isDestroyed === 'function' && wc.isDestroyed())) {
-        return { ok: false, error: 'webcontents-destroyed' };
-      }
-
-      try {
-        // ✅ Check 1: URL must be real
-        const url = wc.getURL();
-        if (!url || url === 'about:blank' || url.length === 0) {
-          return { ok: false, error: 'not-ready' };
-        }
-
-        // ✅ Check 2: Must not be actively loading
-        if (wc.isLoading()) {
-          return { ok: false, error: 'not-ready' };
-        }
-
-        // ✅ Check 3: Must have valid bounds (view is sized and placed)
-        const { width: vw, height: vh } = view.getBounds();
-        if (vw <= 0 || vh <= 0) {
-          return { ok: false, error: 'not-ready' };
-        }
-
-        // ✅ Check 4: DOM must be ready (via executeJavaScript - cheap and fast)
-        try {
-          const domReady = await wc.executeJavaScript(
-            'document.readyState === "complete" || document.readyState === "interactive"',
-            true
-          );
-          if (!domReady) {
-            return { ok: false, error: 'not-ready' };
-          }
-        } catch {
-          // If we can't even run JS, definitely not ready
-          return { ok: false, error: 'not-ready' };
-        }
-
-        // All checks passed - capture immediately
-        const rect = { x: 0, y: 0, width: Math.max(1, vw), height: Math.max(1, vh) };
-        const img = await wc.capturePage(rect);
-        const { width: srcW, height: srcH } = img.getSize();
-
-        // Sanity check: if we got a 0x0 image despite passing checks, something's wrong
-        if (srcW === 0 || srcH === 0) {
-          return { ok: false, error: 'snapshot-failed' };
-        }
-
-        // ---- Downscale and compress ----
-        const MAX_TARGET_W: number = Math.max(512, Math.min(payload?.maxWidth ?? 1400, 1600));
-        const scale: number = srcW > MAX_TARGET_W ? MAX_TARGET_W / srcW : 1;
-
-        const targetW: number = Math.max(1, Math.round(srcW * scale));
-        const targetH: number = Math.max(1, Math.round(srcH * scale));
-
-        const pngBuf: Buffer = img.toPNG();
-
-        const outBuf: Buffer = await sharp(pngBuf)
-          .resize({
-            width: targetW,
-            height: targetH,
-            fit: 'inside',
-            withoutEnlargement: true,
-            kernel: sharp.kernel.lanczos3,
-          })
-          .webp({
-            quality: 96,
-            alphaQuality: 100,
-            nearLossless: false,
-            effort: 5,
-            smartSubsample: true,
-          })
-          .toBuffer();
-
-        const dataUrl: string = `data:image/webp;base64,${outBuf.toString('base64')}`;
-
-        return { ok: true as const, dataUrl, width: targetW, height: targetH };
-      } catch (err) {
-        console.error('snapshot failed:', err);
-        return { ok: false as const, error: 'snapshot-failed' };
-      }
-    }
   );
 
-  ipcMain.handle('overlay:destroy', async (_e, { tabId }: { tabId: string }): Promise<void> => {
-    // Make it safe to call destroy multiple times
-    if (destroying.has(tabId)) {
-      console.warn(`[overlay] destroy already in progress for ${tabId}`)
-      return
+  ipcMain.handle('overlay:snapshot', async (_e, payload: { tabId: string; maxWidth?: number }): Promise<| { ok: true; dataUrl: string; width: number; height: number }
+    | { ok: false; error: | 'tab-destroying' | 'webcontents-destroyed' | 'snapshot-failed' | 'no-view' | 'not-ready'; }> => {
+    const tabId: string | undefined = payload?.tabId;
+    if (!tabId) return { ok: false, error: 'no-view' };
+    if (destroying.has(tabId)) return { ok: false, error: 'tab-destroying' };
+
+    const { state } = S.resolve(tabId);
+    const view = state?.view ?? null;
+    const wc = view?.webContents ?? null;
+
+    if (!state || !view || !wc || (typeof wc.isDestroyed === 'function' && wc.isDestroyed())) {
+      return { ok: false, error: 'webcontents-destroyed' };
     }
-    destroying.add(tabId)
 
     try {
-      const resolved = S.resolve(tabId)
-      const state = resolved?.state
-      if (!state) {
-        console.warn(`[overlay] destroy: no state for ${tabId} (already removed)`)
-        return
+      // ✅ Check 1: URL must be real
+      const url = wc.getURL();
+      if (!url || url === 'about:blank' || url.length === 0) {
+        return { ok: false, error: 'not-ready' };
       }
 
-      console.log(`[overlay] Starting destroy for tabId: ${tabId}`)
+      // ✅ Check 2: Must not be actively loading
+      if (wc.isLoading()) {
+        return { ok: false, error: 'not-ready' };
+      }
 
-      const win: BrowserWindow | null = getWindow() ?? null
-      const view = state.view
-      const wc: WebContents | undefined = view?.webContents
+      // ✅ Check 3: Must have valid bounds (view is sized and placed)
+      const { width: vw, height: vh } = view.getBounds();
+      if (vw <= 0 || vh <= 0) {
+        return { ok: false, error: 'not-ready' };
+      }
 
-      // Remove from tracking first to prevent new work racing in
+      // ✅ Check 4: DOM must be ready (via executeJavaScript - cheap and fast)
+      try {
+        const domReady = await wc.executeJavaScript(
+          'document.readyState === "complete" || document.readyState === "interactive"',
+          true
+        );
+        if (!domReady) {
+          return { ok: false, error: 'not-ready' };
+        }
+      } catch {
+        // If we can't even run JS, definitely not ready
+        return { ok: false, error: 'not-ready' };
+      }
+
+      // All checks passed - capture immediately
+      const rect = { x: 0, y: 0, width: Math.max(1, vw), height: Math.max(1, vh) };
+      const img = await wc.capturePage(rect);
+      const { width: srcW, height: srcH } = img.getSize();
+
+      // Sanity check: if we got a 0x0 image despite passing checks, something's wrong
+      if (srcW === 0 || srcH === 0) {
+        return { ok: false, error: 'snapshot-failed' };
+      }
+
+      // ---- Downscale and compress ----
+      const MAX_TARGET_W: number = Math.max(512, Math.min(payload?.maxWidth ?? 1400, 1600));
+      const scale: number = srcW > MAX_TARGET_W ? MAX_TARGET_W / srcW : 1;
+
+      const targetW: number = Math.max(1, Math.round(srcW * scale));
+      const targetH: number = Math.max(1, Math.round(srcH * scale));
+
+      const pngBuf: Buffer = img.toPNG();
+
+      const outBuf: Buffer = await sharp(pngBuf)
+        .resize({
+          width: targetW,
+          height: targetH,
+          fit: 'inside',
+          withoutEnlargement: true,
+          kernel: sharp.kernel.lanczos3,
+        })
+        .webp({
+          quality: 96,
+          alphaQuality: 100,
+          nearLossless: false,
+          effort: 5,
+          smartSubsample: true,
+        })
+        .toBuffer();
+
+      const dataUrl: string = `data:image/webp;base64,${outBuf.toString('base64')}`;
+
+      return { ok: true as const, dataUrl, width: targetW, height: targetH };
+    } catch (err) {
+      console.error('snapshot failed:', err);
+      return { ok: false as const, error: 'snapshot-failed' };
+    }
+  }
+  );
+
+  ipcMain.handle('overlay:destroy', async (_e, { tabId, discard = false }: { tabId: string; discard?: boolean }): Promise<void> => {
+    if (destroying.has(tabId)) { console.warn(`[overlay] destroy already in progress for ${tabId}`); return; }
+    destroying.add(tabId);
+    try {
+      const resolved = S.resolve(tabId); const state = resolved?.state;
+      if (!state) { console.warn(`[overlay] destroy: no state for ${tabId} (already removed)`); return; }
+
+      console.log(`[overlay] Starting ${discard ? 'discard' : 'destroy'} for tabId: ${tabId}`);
+
+      const win: BrowserWindow | null = getWindow() ?? null;
+      const view = state.view;
+      const wc: WebContents | undefined = view?.webContents;
+
+      // 1) tracking
       try {
         views.delete(tabId);
-        clearForChild(tabId);
-        clearForOpener?.(tabId);
-      } catch (e) {
-        console.warn(`[overlay] Error clearing maps for ${tabId}:`, e);
+        if (!discard) { clearForChild(tabId); clearForOpener?.(tabId); }
+      } catch (e) { console.warn(`[overlay] Error clearing maps for ${tabId}:`, e); }
+
+      // 2) persistence
+      if (!discard) {
+        try { delete browserState[tabId]; } catch (e) { console.warn(`[overlay] Error deleting persisted state for ${tabId}:`, e); }
+      } else {
+        const prev = browserState[tabId];
+        browserState[tabId] = {
+          currentUrl: prev?.currentUrl ?? state.navState.currentUrl ?? 'about:blank',
+          lastInteraction: Date.now(),
+          lifecycle: 'frozen',
+          hasScreenshot: prev?.hasScreenshot ?? false,
+          thumbPath: prev?.thumbPath,
+        };
       }
 
-      try {
-        delete browserState[tabId]
-      } catch (e) {
-        console.warn(`[overlay] Error deleting persisted state for ${tabId}:`, e)
-      }
+      // 3) stop + detach
+      try { if (wc && !wc.isDestroyed()) { wc.stop(); wc.setAudioMuted(true); } } catch (e) { console.warn(`[overlay] Error stopping webcontents for ${tabId}:`, e); }
+      try { if (win && !win.isDestroyed() && state.attached) S.detach(win, state); } catch (e) { console.warn(`[overlay] Error detaching view for ${tabId}:`, e); }
 
-
-      try {
-        if (wc && !wc.isDestroyed()) {
-          wc.stop()
-          wc.setAudioMuted(true)
-        }
-      } catch (e) {
-        console.warn(`[overlay] Error stopping webcontents for ${tabId}:`, e)
-      }
-
-      // Detach from window if attached
-      try {
-        if (win && !win.isDestroyed() && state.attached) {
-          S.detach(win, state)
-        }
-      } catch (e) {
-        console.warn(`[overlay] Error detaching view for ${tabId}:`, e)
-      }
-
-      // Clean up devtools/debugger
+      // 4) debugger/devtools
       try {
         if (wc && !wc.isDestroyed()) {
-          if (typeof wc.isDevToolsOpened === 'function' && wc.isDevToolsOpened()) {
-            wc.closeDevTools()
-          }
-          if (wc.debugger && typeof wc.debugger.isAttached === 'function' && wc.debugger.isAttached()) {
-            // Clear any emulation overrides defensively, ignore failures
-            try {
-              await wc.debugger.sendCommand?.('Emulation.clearDeviceMetricsOverride', {})
-            } catch { }
-            try {
-              wc.debugger.detach()
-            } catch { }
+          if (wc.isDevToolsOpened?.()) wc.closeDevTools();
+          if (wc.debugger?.isAttached?.()) {
+            try { await wc.debugger.sendCommand?.('Emulation.clearDeviceMetricsOverride', {}); } catch { }
+            try { wc.debugger.detach(); } catch { }
           }
         }
-      } catch (e) {
-        console.warn(`[overlay] Error cleaning up debugger for ${tabId}:`, e)
-      }
+      } catch (e) { console.warn(`[overlay] Error cleaning up debugger for ${tabId}:`, e); }
 
-      // Remove listeners we added (best-effort)
-      try {
-        if (wc && !wc.isDestroyed()) {
-          wc.removeAllListeners() // if you prefer, list specific events instead
-        }
-      } catch (e) {
-        console.warn(`[overlay] Error removing listeners for ${tabId}:`, e)
-      }
+      // 5) 🔴 this was missing in your edit
+      try { if (wc && !wc.isDestroyed()) wc.removeAllListeners(); } catch (e) { console.warn(`[overlay] Error removing listeners for ${tabId}:`, e); }
 
-      // Close/destroy sequence (guarded, with timeout fallback)
+      // 6) destroy renderer (same as file)
       if (wc && !wc.isDestroyed()) {
         const done = new Promise<void>((resolve) => {
-          let settled = false
-          const cleanup = (): void => {
-            if (settled) return
-            settled = true
-            try { wc.off('destroyed', onDestroyed) } catch { }
-            clearTimeout(to)
-            resolve()
-          }
-          const onDestroyed = (): void => {
-            console.log(`[overlay] WebContents destroyed for ${tabId}`)
-            cleanup()
-          }
+          let settled = false;
+          const cleanup = (): void => { if (settled) return; settled = true; try { wc.off('destroyed', onDestroyed); } catch { } clearTimeout(to); resolve(); };
+          const onDestroyed = (): void => { console.log(`[overlay] WebContents destroyed for ${tabId}`); cleanup(); };
           const to = setTimeout(() => {
-            // If we timed out but wc still isn’t destroyed, attempt hard destroy if available
             if (!wc.isDestroyed()) {
-              try {
-                // Cast without any: extend at runtime if method exists
-                (wc as WebContents & { destroy?: () => void }).destroy?.()
-                console.log(`[overlay] Called destroy() fallback for ${tabId} after timeout`)
-              } catch (err) {
-                console.warn(`[overlay] destroy() fallback failed for ${tabId}:`, err)
-              }
+              try { (wc as WebContents & { destroy?: () => void }).destroy?.(); console.log(`[overlay] Called destroy() fallback for ${tabId} after timeout`); }
+              catch (err) { console.warn(`[overlay] destroy() fallback failed for ${tabId}:`, err); }
             }
-            cleanup()
-          }, 1500) // 1.5s safety
-
-          wc.once('destroyed', onDestroyed)
-
-          try {
-            wc.close()
-            console.log(`[overlay] Called close() for ${tabId}`)
-          } catch (closeErr) {
-            console.warn(`[overlay] close() failed for ${tabId}, trying destroy():`, closeErr)
-            try {
-              (wc as WebContents & { destroy?: () => void }).destroy?.()
-              console.log(`[overlay] Called destroy() for ${tabId}`)
-            } catch (destroyErr) {
-              console.error(`[overlay] Both close() and destroy() failed for ${tabId}:`, destroyErr)
-              cleanup()
-            }
+            cleanup();
+          }, 1500);
+          wc.once('destroyed', onDestroyed);
+          try { wc.close(); console.log(`[overlay] Called close() for ${tabId}`); }
+          catch (closeErr) {
+            console.warn(`[overlay] close() failed for ${tabId}, trying destroy():`, closeErr);
+            try { (wc as WebContents & { destroy?: () => void }).destroy?.(); console.log(`[overlay] Called destroy() for ${tabId}`); }
+            catch (destroyErr) { console.error(`[overlay] Both close() and destroy() failed for ${tabId}:`, destroyErr); cleanup(); }
           }
-        })
-
-        try {
-          await done
-        } catch (e) {
-          console.error(`[overlay] Error in cleanup sequence for ${tabId}:`, e)
-        }
+        });
+        try { await done; } catch (e) { console.error(`[overlay] Error in cleanup sequence for ${tabId}:`, e); }
       } else {
-        // wc is already gone or never created — nothing to close
-        console.log(`[overlay] No webContents for ${tabId}, destroy is a no-op`)
+        console.log(`[overlay] No webContents for ${tabId}, destroy is a no-op`);
       }
 
-      // Flush state to disk (best-effort)
-      try {
-        flushBrowserState()
-      } catch (e) {
-        console.warn('[overlay] Error flushing browser state:', e)
-      }
+      // 7) flush
+      try { flushBrowserState(); } catch (e) { console.warn('[overlay] Error flushing browser state:', e); }
 
-      console.log(`[overlay] Destroy completed for tabId: ${tabId}`)
+      console.log(`[overlay] ${discard ? 'Discard' : 'Destroy'} completed for tabId: ${tabId}`);
     } finally {
-      destroying.delete(tabId)
+      destroying.delete(tabId);
     }
-  })
+  });
 
 
 

@@ -26,32 +26,39 @@ export type Flags = {
   pinned: boolean
 }
 
-export type LifecycleState = 'hot' | 'warm' | 'frozen' 
+
 
 export type NavigationStateResult =
-  | ({ ok: true } & NavigationState & { /** surfaced from main via isLoading() */ isLoading: boolean })
+  | ({ ok: true } & NavigationState & { isLoading: boolean })
   | { ok: false; error: string }
 
 export type CaptureResult =
   | { ok: true; dataUrl: string }
   | { ok: false; error: string }
 
-// --- Payloads
-/** Creating a tab is keyed to the TLDraw shape.id you pass in. */
-export interface CreateTabPayload {
-  /** Optional initial URL to load. */
-  url?: string
-  /** REQUIRED: the TLDraw BrowserShape's id (tldraw-style, e.g. "shape:..."). */
-  shapeId: string
+// 👇👇 THIS is the lifecycle we’re using everywhere now
+export type LifecycleState = 'live' | 'frozen' | 'discarded'
+
+// --- payloads
+
+// create has two shapes now: normal + restore
+export type CreateTabPayload =
+  | { shapeId: string; url: string }
+  | { shapeId: string; restore: true }
+
+// for most calls (show/hide/goBack/...) this stays simple
+export interface TabIdPayload {
+  tabId: string
 }
 
-export interface TabIdPayload { tabId: string }
+// destroy is the only one that can carry discard: true
+export type DestroyTabPayload =
+  | { tabId: string }
+  | { tabId: string; discard: true }
 
-/** Screen-space rect for the WebContentsView; optional shapeSize for main’s heuristics. */
 export interface BoundsPayload {
   tabId: string
   rect: Rect
-  /** Optional logical size of the TL shape (helps main with zoom/fit choices). */
   shapeSize?: { w: number; h: number }
 }
 
@@ -61,40 +68,49 @@ export interface ZoomPayload {
   factor: number
 }
 
-export interface NavigatePayload { tabId: string; url: string }
+export interface NavigatePayload {
+  tabId: string
+  url: string
+}
 
 // --- Popup contracts
 export interface PopupRequestPayload {
   eventId: string
   url: string
-  /** Some code paths emit openerTabId; others emit parentTabId. Support both. */
   openerTabId?: string
   parentTabId?: string
 }
 
-export interface FreezePayload { tabId: string }
-export interface ThawPayload { tabId: string }
+export interface FreezePayload {
+  tabId: string
+}
+export interface ThawPayload {
+  tabId: string
+}
 
-export interface SnapshotRequest { tabId: string; maxWidth?: number }
+export interface SnapshotRequest {
+  tabId: string
+  maxWidth?: number
+}
 
 export interface SetLifecyclePayload {
-  tabId: string;
-  lifecycle: LifecycleState;
-  hasScreenshot: boolean;
+  tabId: string
+  lifecycle: LifecycleState
+  hasScreenshot: boolean
 }
 
 export interface PersistedTabInfo {
-  tabId: string;
-  currentUrl: string;
-  lastInteraction: number;
-  lifecycle: LifecycleState;
-  hasScreenshot: boolean;
-  thumbPath: string | null;
+  tabId: string
+  currentUrl: string
+  lastInteraction: number
+  lifecycle: LifecycleState
+  hasScreenshot: boolean
+  thumbPath: string | null
 }
 
 export type PersistedStateResult =
   | { ok: true; tabs: PersistedTabInfo[] }
-  | { ok: false; error: string };
+  | { ok: false; error: string }
 
 export type SnapshotResult =
   | { ok: true; dataUrl: string; width: number; height: number }
@@ -113,7 +129,6 @@ export type OverlayNotice =
 export interface PopupAckPayload {
   openerTabId: string
   url: string
-  /** The newly created BrowserShape id (TLShapeId) in the renderer, if available. */
   childTabId?: string
 }
 
@@ -123,7 +138,8 @@ export interface OverlayAPI {
   createTab(payload: CreateTabPayload): Promise<TabResult>
   show(payload: BoundsPayload | TabIdPayload): Promise<void>
   hide(payload: TabIdPayload): Promise<void>
-  destroy(payload: TabIdPayload): Promise<void>
+  // 👇 this is the important change
+  destroy(payload: DestroyTabPayload): Promise<void>
   setBounds(payload: BoundsPayload): Promise<void>
   setZoom(payload: ZoomPayload): Promise<void>
 
@@ -133,15 +149,9 @@ export interface OverlayAPI {
 
   // events
   onUrlUpdate(callback: (data: { tabId: string; url?: string }) => void): () => void
-  onPressure(
-    cb: (p: { level: 'normal' | 'elevated' | 'critical'; freeMB: number; totalMB: number }) => void
-  ): () => void
+  onPressure(cb: (p: { level: 'normal' | 'elevated' | 'critical'; freeMB: number; totalMB: number }) => void): () => void
 
-
-  /** Emits when main wants the renderer to create a BrowserShape. */
   onPopupRequest(callback: (data: PopupRequestPayload) => void): () => void
-
-  /** Renderer ACK that it materialized the shape for {openerTabId,url}. */
   popupAck(payload: PopupAckPayload): void
 
   freeze(payload: FreezePayload): Promise<void>
@@ -159,53 +169,22 @@ export interface OverlayAPI {
   setLifecycle(payload: SetLifecyclePayload): Promise<SimpleResult>
   getPersistedState(): Promise<PersistedStateResult>
 
-  saveThumb(
-    payload: { tabId: string; url: string; dataUrlWebp: string }
-  ): Promise<{ ok: true; thumbPath: string } | { ok: false }>;
-
+  saveThumb(payload: { tabId: string; url: string; dataUrlWebp: string }): Promise<{ ok: true; thumbPath: string } | { ok: false }>
 }
 
+// electron augmentation stays the same …
 import 'electron'
-
 declare module 'electron' {
   interface WebContents {
     on(event: 'media-started-playing', listener: (event: Electron.Event) => void): this
     on(event: 'media-paused', listener: (event: Electron.Event) => void): this
     on(event: 'devtools-opened', listener: (event: Electron.Event) => void): this
     on(event: 'devtools-closed', listener: (event: Electron.Event) => void): this
-
-    on(
-      event: 'did-navigate-in-page',
-      listener: (
-        event: Electron.Event,
-        url: string,
-        isMainFrame: boolean,
-        frameProcessId: number,
-        frameRoutingId: number
-      ) => void
-    ): this
-
-    on(
-      event: 'did-navigate',
-      listener: (
-        event: Electron.Event,
-        url: string,
-        httpResponseCode: number,
-        httpStatusText: string
-      ) => void
-    ): this
+    on(event: 'did-navigate-in-page', listener: (event: Electron.Event, url: string, isMainFrame: boolean, frameProcessId: number, frameRoutingId: number) => void): this
+    on(event: 'did-navigate', listener: (event: Electron.Event, url: string, httpResponseCode: number, httpStatusText: string) => void): this
   }
-
   interface Session {
-    on(
-      event: 'will-download',
-      listener: (
-        event: Electron.Event,
-        item: Electron.DownloadItem,
-        webContents: Electron.WebContents
-      ) => void
-    ): this
-
+    on(event: 'will-download', listener: (event: Electron.Event, item: Electron.DownloadItem, webContents: Electron.WebContents) => void): this
     listenerCount(eventName: string): number
     setMaxListeners(n: number): this
   }
