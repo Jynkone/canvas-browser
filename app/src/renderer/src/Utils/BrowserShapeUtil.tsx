@@ -215,65 +215,80 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
     }, [api])
 
 
-useEffect(() => {
-  if (!api) return
+    useEffect(() => {
+      if (!api) return
 
-  let raf = 0
-  let lastRect: Rect = { x: -1, y: -1, width: -1, height: -1 }
-  let lastFactor = -1
-  const ZOOM_EPS = 0.0125
+      let raf = 0
+      let lastRect: Rect = { x: -1, y: -1, width: -1, height: -1 }
+      let lastFactor = -1
+      const ZOOM_EPS = 0.0125
+      let wasActive = false // 👈 track active→inactive→active transitions
 
-  const loop = (): void => {
-    raf = requestAnimationFrame(loop)
+      const loop = (): void => {
+        raf = requestAnimationFrame(loop)
 
-    const id = tabIdRef.current
-    if (!id) return
+        const id = tabIdRef.current
+        if (!id) return
 
-    if (suspendTabRef.current) return
+        if (suspendTabRef.current) {
+          wasActive = false
+          return
+        }
 
-    // NEW: obey lifecycle first
-    const life = window.__tabState?.get(id)
-    if (life && life !== 'live') return
+        // lifecycle gate
+        const life = window.__tabState?.get(id)
+        if (life && life !== 'live') {
+          wasActive = false
+          return
+        }
 
-    // NEW: obey placement
-    const activeSet = window.__activeTabs
-    const isActive = activeSet ? activeSet.has(id) : true
-    if (!isActive) return
+        // placement gate
+        const activeSet = window.__activeTabs
+        const isActive = activeSet ? activeSet.has(id) : true
+        if (!isActive) {
+          wasActive = false
+          return
+        }
 
-    const shapeRecord = editor.getShape<BrowserShape>(shape.id)
-    if (!shapeRecord || shapeRecord.type !== 'browser-shape') return
+        // past this point → active frame
+        const shapeRecord = editor.getShape<BrowserShape>(shape.id)
+        if (!shapeRecord || shapeRecord.type !== 'browser-shape') return
 
-    const pb = editor.getShapePageBounds(shapeRecord.id)
-    if (!pb) return
+        const pb = editor.getShapePageBounds(shapeRecord.id)
+        if (!pb) return
 
-    const zoom = editor.getZoomLevel()
-    const screenPos = editor.pageToScreen({ x: pb.x, y: pb.y })
-    const shapeSize = { w: shapeRecord.props.w, h: shapeRecord.props.h }
+        const zoom = editor.getZoomLevel()
+        const screenPos = editor.pageToScreen({ x: pb.x, y: pb.y })
+        const shapeSize = { w: shapeRecord.props.w, h: shapeRecord.props.h }
 
-    const rect: Rect = {
-      x: Math.round(screenPos.x),
-      y: Math.round(screenPos.y + NAV_BAR_HEIGHT * zoom),
-      width: Math.round(shapeSize.w * zoom),
-      height: Math.round((shapeSize.h - NAV_BAR_HEIGHT) * zoom),
-    }
+        const rect: Rect = {
+          x: Math.round(screenPos.x),
+          y: Math.round(screenPos.y + NAV_BAR_HEIGHT * zoom),
+          width: Math.round(shapeSize.w * zoom),
+          height: Math.round((shapeSize.h - NAV_BAR_HEIGHT) * zoom),
+        }
 
-    const positionChanged = rect.x !== lastRect.x || rect.y !== lastRect.y
-    const sizeChanged = rect.width !== lastRect.width || rect.height !== lastRect.height
-    const zoomChanged = Math.abs(zoom - lastFactor) > ZOOM_EPS
+        const positionChanged = rect.x !== lastRect.x || rect.y !== lastRect.y
+        const sizeChanged = rect.width !== lastRect.width || rect.height !== lastRect.height
+        const zoomChanged = Math.abs(zoom - lastFactor) > ZOOM_EPS
 
-    if (positionChanged || sizeChanged) {
-      void api.setBounds({ tabId: id, rect, shapeSize })
-      lastRect = rect
-    }
-    if (zoomChanged) {
-      void api.setZoom({ tabId: id, factor: zoom })
-      lastFactor = zoom
-    }
-  }
+        // 👇 force one bounds push on first active frame after inactivity
+        const force = !wasActive
+        wasActive = true
 
-  raf = requestAnimationFrame(loop)
-  return () => cancelAnimationFrame(raf)
-}, [api, editor, shape.id])
+        if (force || positionChanged || sizeChanged) {
+          void api.setBounds({ tabId: id, rect, shapeSize })
+          lastRect = rect
+        }
+        if (zoomChanged) {
+          void api.setZoom({ tabId: id, factor: zoom })
+          lastFactor = zoom
+        }
+      }
+
+      raf = requestAnimationFrame(loop)
+      return () => cancelAnimationFrame(raf)
+    }, [api, editor, shape.id])
 
     // Treat typing in the nav bar and clicking its controls as interaction
     // Replace your current "Treat typing in the nav bar..." effect with this:

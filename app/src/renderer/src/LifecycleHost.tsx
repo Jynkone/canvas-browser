@@ -18,7 +18,7 @@ const NEW_TAB_EVENT = 'paper:new-tab' as const
 type TabActivityDetail = Readonly<{ tabId: string }>
 type NewTabDetail = Readonly<{ tabId: string; shapeId: TLShapeId }>
 
-type Props = { editorRef: React.MutableRefObject<Editor | null> }
+type Props = { editorRef: React.RefObject<Editor | null> }
 
 type Bounds = { x: number; y: number; w: number; h: number }
 
@@ -68,19 +68,10 @@ if (!window.__activeTabs) window.__activeTabs = new Set()
 export default function LifecycleHost({ editorRef }: Props) {
   const lastInteraction = useRef<Map<TLShapeId, number>>(new Map())
   const tabToShape = useRef(new Map<string, TLShapeId>())
-  const discardedTabs = useRef<Set<string>>(new Set())
-  const refreshOnNavFinish = useRef<Map<string, number>>(new Map())
+
   const flagsByTab = useRef(
     new Map<string, { audible: boolean; capturing: boolean; devtools: boolean; downloads: boolean; pinned: boolean }>()
   )
-  const opChainByTab = useRef(new Map<string, Promise<void>>())
-
-  const chain = (tabId: string, fn: () => Promise<void>): Promise<void> => {
-    const prev = opChainByTab.current.get(tabId) ?? Promise.resolve()
-    const next = prev.then(fn).catch(() => { /* keep chain alive */ })
-    opChainByTab.current.set(tabId, next)
-    return next
-  }
 
   const bumpInteractionByShapeId = (shapeId: TLShapeId): void => {
     lastInteraction.current.set(shapeId, performance.now())
@@ -162,78 +153,112 @@ export default function LifecycleHost({ editorRef }: Props) {
   }, [])
 
   const outputs = useMemo(() => {
+    // ---- revive ONLY if frozen/discarded; never touches __activeTabs ----
+    const revive = async (shapeId: TLShapeId): Promise<void> => {
+      const ed = editorRef.current
+      if (!ed) return
+      const info = readTabInfoFromShape(ed, shapeId)
+      if (!info) return
+
+      const { tabId } = info
+      const tag = window.__tabState?.get(tabId) as 'live' | 'frozen' | 'discarded' | undefined
+      if (tag === 'live') return
+
+      if (tag === 'frozen') {
+        await window.overlay.thaw({ tabId })
+        await window.overlay.show({ tabId })
+      } else if (tag === 'discarded') {
+        await window.overlay.createTab({ shapeId, restore: true })
+        await window.overlay.show({ tabId })
+      } else {
+        return
+      }
+
+      window.__tabState!.set(tabId, 'live')
+      lastInteraction.current.set(shapeId, performance.now())
+      tabToShape.current.set(tabId, shapeId)
+      window.dispatchEvent(new CustomEvent('paper:tab-activity', { detail: { tabId } }))
+    }
+
     return {
-
-      setLifecycle: (shapeId: TLShapeId, state: 'live' | 'frozen' | 'discarded'): void => {
-        const ed = editorRef.current
-        if (!ed) return
-        const info = readTabInfoFromShape(ed, shapeId)
-        if (!info) return
-        const { tabId, url } = info
-
-        window.__tabState!.set(tabId, state)
-
-        if (state === 'live') {
-          // 👇 tell the manager “this was just used”
-          lastInteraction.current.set(shapeId, performance.now())
-          tabToShape.current.set(tabId, shapeId) // keep mapping fresh
-
-          window.__activeTabs!.add(tabId)
-
-          if (discardedTabs.current.has(tabId)) {
-            void chain(tabId, async () => {
-              try {
-                await window.overlay.createTab({ shapeId, restore: true })
-              } catch { }
-              await window.overlay.show({ tabId })
-            })
-            discardedTabs.current.delete(tabId)
-          } else {
-            void chain(tabId, async () => {
-              try {
-                await window.overlay.createTab({ shapeId, url })
-              } catch { }
-              await window.overlay.thaw({ tabId })
-              await window.overlay.show({ tabId })
-            })
-          }
-          return
-        }
-
-        if (state === 'frozen') {
-          window.__activeTabs!.delete(tabId)
-          void chain(tabId, async () => { await window.overlay.freeze({ tabId }) })
-          return
-        }
-
-        window.__activeTabs!.delete(tabId)
-        void chain(tabId, async () => { await window.overlay.destroy({ tabId, discard: true }) })
-        discardedTabs.current.add(tabId)
-      },
-
-
-      setPlacement: (shapeId, placement, needThumb) => {
+      // ---- downward-only lifecycle ----
+      setLifecycle: (shapeId, state): void => {
         const ed = editorRef.current
         if (!ed) return
         const info = readTabInfoFromShape(ed, shapeId)
         if (!info) return
         const { tabId } = info
 
-        if (placement === 'active') {
-          window.__activeTabs!.add(tabId)
-          void chain(tabId, async () => {
-            await window.overlay.show({ tabId })
-          })
-        } else {
-          window.__activeTabs!.delete(tabId)
-          void chain(tabId, async () => {
-            await window.overlay.hide({ tabId })
-            if (needThumb) await snapshot(tabId, 896)
-          })
+        if (state === 'live') {
+          // note-only; do NOT revive here
+          lastInteraction.current.set(shapeId, performance.now())
+          if (window.__tabState?.get(tabId) !== 'live') {
+            window.__tabState!.set(tabId, 'live')
+          }
+          return
         }
+
+        if (state === 'frozen') {
+          ; (async () => {
+            await window.overlay.hide({ tabId })
+            await window.overlay.freeze({ tabId })
+            window.__activeTabs!.delete(tabId)
+            window.__tabState!.set(tabId, 'frozen')
+          })()
+          return
+        }
+
+        // state === 'discarded'
+        ; (async () => {
+          await window.overlay.destroy({ tabId, discard: true })
+          window.__activeTabs!.delete(tabId)
+          window.__tabState!.set(tabId, 'discarded')
+        })()
       },
+
+      // ---- placement with revive-on-demand + pre-hide screenshot ----
+      setPlacement: (
+        shapeId: TLShapeId,
+        placement: 'active' | 'background',
+        needThumb: boolean
+      ): void => {
+        const ed = editorRef.current
+        if (!ed) return
+        const info = readTabInfoFromShape(ed, shapeId)
+        if (!info) return
+
+        const { tabId } = info
+        const tag = window.__tabState?.get(tabId)
+
+        if (placement === 'active') {
+          ; (async () => {
+            if (tag !== 'live') {
+              await revive(shapeId)              // ensure truly live first (thaw/restore + show)
+            }
+            await window.overlay.show({ tabId }) // idempotent if revive already showed
+            window.__activeTabs!.add(tabId)
+          })()
+          return
+        }
+
+        // placement === 'background' (only meaningful for live tabs)
+        if (tag !== 'live') return
+        const wasActive = window.__activeTabs!.has(tabId)
+
+          ; (async () => {
+            if (needThumb && wasActive) {
+              await snapshot(tabId, 896)          // pre-hide screenshot
+            }
+            await window.overlay.hide({ tabId })
+            window.__activeTabs!.delete(tabId)
+          })()
+      },
+
+      // ---- explicit hook for user-driven revive (no placement change) ----
+      reviveIfDormant: (shapeId: TLShapeId): void => { void revive(shapeId) },
     }
   }, [editorRef, snapshot])
+
 
   const MIN = 60_000
   const limits = useMemo(
@@ -241,7 +266,7 @@ export default function LifecycleHost({ editorRef }: Props) {
       hotCapOverview: 8,
       tinyPxFloor: 48_000,
       freezeHiddenMs: 0.2 * MIN,
-      discardFrozenMs: 0.5 * MIN,
+      discardFrozenMs: 9 * MIN,
     }),
     []
   )
@@ -270,17 +295,6 @@ export default function LifecycleHost({ editorRef }: Props) {
       offNav()
     }
   }, [])
-
-  // if you still want “take thumb when hot finished nav”, keep this:
-  useEffect(() => {
-    const off = window.overlay.onNavFinished(async ({ tabId }: { tabId: string; at: number }) => {
-      if (window.__tabState?.get(tabId) !== 'live') return
-      const maxWidth = refreshOnNavFinish.current.get(tabId)
-      if (maxWidth === undefined) return
-      setTimeout(() => { void snapshot(tabId, maxWidth) })
-    })
-    return () => off()
-  }, [snapshot])
 
   useLifecycleManager(inputs, outputs, limits)
   return null
