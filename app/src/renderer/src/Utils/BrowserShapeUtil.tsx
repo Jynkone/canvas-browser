@@ -611,43 +611,43 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
       dragRef.current = null
     }
 
-    type TabThumb = { dataUrlWebp?: string }
+type TabThumb = { dataUrlWebp?: string }
 
-    function SnapshotImage(
-      { tabIdRef, liveActive }: {
-        tabIdRef: React.RefObject<string | null>
-        liveActive: boolean
-      }
-    ) {
-      if (liveActive) return null
-      const id = tabIdRef.current
-      if (!id) return null
+function SnapshotImage(
+  { tabIdRef, liveActive }: {
+    tabIdRef: React.RefObject<string | null>
+    liveActive: boolean
+  }
+) {
+  if (liveActive) return null
+  const id = tabIdRef.current
+  if (!id) return null
 
-      const rec = window.__tabThumbs?.get(id) as TabThumb | undefined
-      const src = rec?.dataUrlWebp ?? null
-      if (!src) return null
+  const rec = window.__tabThumbs?.get(id) as TabThumb | undefined
+  const src = rec?.dataUrlWebp ?? null
+  if (!src) return null
 
-      return (
-        <img
-          src={src}
-          alt=""
-          style={{
-            position: 'absolute',
-            inset: 0,
-            width: '100%',
-            height: '100%',
-            // we capture at the display size; don't ask the browser to resample:
-            objectFit: 'fill',
-            pointerEvents: 'none',
-            willChange: 'transform',
-            contain: 'paint',
-            transform: 'translateZ(0)',
-          }}
-          decoding="async"
-          draggable={false}
-        />
-      )
-    }
+  return (
+    <img
+      src={src}
+      alt=""
+      style={{
+        position: 'absolute',
+        inset: 0,
+        width: '100%',
+        height: '100%',
+        // we capture at the display size; don't ask the browser to resample:
+        objectFit: 'fill',
+        pointerEvents: 'none',
+        willChange: 'transform',
+        contain: 'paint',
+        transform: 'translateZ(0)',
+      }}
+      decoding="async"
+      draggable={false}
+    />
+  )
+}
 
 
 
@@ -756,7 +756,7 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
             }}
           >
 
-            <SnapshotImage tabIdRef={tabIdRef} liveActive={liveActive} />
+                         <SnapshotImage tabIdRef={tabIdRef} liveActive={liveActive}/>
 
             {/* Live web content: inset by BORDER so the blue outline is never covered */}
             <div
