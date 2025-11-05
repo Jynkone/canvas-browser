@@ -44,7 +44,6 @@ const ZOOM_SETTLE_MS = 90
 const PAN_SETTLE_MS = 60
 const ZOOM_EPS = 0.0005
 const MODE_SETTLE_MS = 150
-const STARTUP_GRACE_MS = 500
 
 type Life = 'live' | 'frozen' | 'discarded'
 
@@ -55,8 +54,6 @@ type Tracked = {
   lastInteractionAt: number
   lastLifecycleSent: Life | null
   lastPlacementSent: PlacementState | null
-  thumbRequestedForBg: boolean
-  lastVisiblePx: number
 }
 
 export function useLifecycleManager(
@@ -91,6 +88,50 @@ export function useLifecycleManager(
   /* =========================================================
    * 1. lifecycle timer: live → frozen → discarded
    * ======================================================= */
+useEffect(() => {
+  const onActivity = (e: Event): void => {
+    const { tabId } = (e as CustomEvent<{ tabId: string }>).detail
+    if (!tabId) return
+    let tracked = st.current.byTab.get(tabId)
+    // If not tracked yet, resolve the shape now and materialize a record.
+    if (!tracked) {
+      const now = inputs.now()
+      const geoms = inputs.getVisibleShapes()
+      for (const g of geoms) {
+        const info = inputs.getTabInfo(g.id)
+        if (!info || info.tabId !== tabId) continue
+        tracked = {
+          tabId,
+          shapeId: g.id,
+          life: 'live',
+          lastInteractionAt: now,
+          lastLifecycleSent: null,
+          lastPlacementSent: null,
+        }
+        st.current.byTab.set(tabId, tracked)
+        st.current.byShape.set(g.id, tabId)
+        break
+      }
+      if (!tracked) return // still nothing to act on
+    }
+    const now = inputs.now()
+    tracked.life = 'live'
+    tracked.lastInteractionAt = now
+    if (tracked.lastLifecycleSent !== 'live') {
+      outputs.setLifecycle(tracked.shapeId, 'live')
+      tracked.lastLifecycleSent = 'live'
+    }
+    if (tracked.lastPlacementSent !== 'active') {
+      outputs.setPlacement(tracked.shapeId, 'active', false)
+      tracked.lastPlacementSent = 'active'
+    }
+  }
+  window.addEventListener('paper:tab-activity', onActivity as EventListener)
+  return () => window.removeEventListener('paper:tab-activity', onActivity as EventListener)
+}, [inputs, outputs])
+
+
+
   useEffect(() => {
     const iv = window.setInterval(() => {
       if (st.current.tickingLifecycle) return
@@ -133,235 +174,185 @@ export function useLifecycleManager(
     return () => window.clearInterval(iv)
   }, [inputs, outputs, limits])
 
-  /* =========================================================
-   * 2. placement (detail behaves like old script)
-   * ======================================================= */
-  useEffect(() => {
-    let raf = 0
+useEffect(() => {
+  const OVERLAP_VISIBLE = 0.25;
 
-    const loop = (): void => {
-      raf = requestAnimationFrame(loop)
+  let raf = 0;
 
-      const now = inputs.now()
-      const { zoom } = inputs.getCamera()
-      const geoms = inputs.getVisibleShapes()
+  const loop = (): void => {
+    raf = requestAnimationFrame(loop);
 
-      // zoom motion tracking
-      if (Math.abs(zoom - st.current.lastZoom) > ZOOM_EPS) {
-        st.current.lastZoom = zoom
-        st.current.lastZoomAt = now
+    const now = inputs.now();
+    const { zoom } = inputs.getCamera();
+    const geoms = inputs.getVisibleShapes();
+
+    // --- zoom motion tracking ---
+    if (Math.abs(zoom - st.current.lastZoom) > ZOOM_EPS) {
+      st.current.lastZoom = zoom;
+      st.current.lastZoomAt = now;
+    }
+
+    // --- mode with hysteresis ---
+    let nextMode = st.current.mode;
+    if (st.current.mode === "detail" && zoom <= OVERVIEW_ENTER_ZOOM) {
+      nextMode = "overview";
+    } else if (st.current.mode === "overview" && zoom > OVERVIEW_EXIT_ZOOM) {
+      nextMode = "detail";
+    }
+    if (nextMode !== st.current.mode) {
+      st.current.mode = nextMode;
+      st.current.modeChangedAt = now;
+      return; // no mutations on the same frame as a mode flip
+    }
+    if (now - st.current.modeChangedAt < MODE_SETTLE_MS) return;
+
+    // --- pan signature (detect camera motion) ---
+    let sig = 0;
+    for (let i = 0; i < geoms.length; i++) {
+      const g = geoms[i]!;
+      sig = (sig + (g.id as string).length * g.overlap * 1000) | 0;
+    }
+    if (sig !== st.current.lastPanSig) {
+      st.current.lastPanSig = sig;
+      st.current.lastPanAt = now;
+    }
+
+    // --- collect visible candidates (percentage-only) ---
+    const visibleTabs: Array<{ tabId: string; shapeId: TLShapeId; overlap: number }> = [];
+    for (const g of geoms) {
+      const info = inputs.getTabInfo(g.id);
+      if (!info) continue;
+
+      const ov = g.overlap <= 0 ? 0 : g.overlap >= 1 ? 1 : g.overlap;
+
+      // map shape -> tab and keep minimal tracking
+      st.current.byShape.set(g.id, info.tabId);
+      const tracked = st.current.byTab.get(info.tabId);
+      if (!tracked) {
+        st.current.byTab.set(info.tabId, {
+          tabId: info.tabId,
+          shapeId: g.id,
+          life: "live",
+          lastInteractionAt: now,
+          lastLifecycleSent: null,
+          lastPlacementSent: null,
+        });
+      } else {
+        tracked.shapeId = g.id;
       }
 
-      // -------- Stable mode with hysteresis --------
-      let nextMode = st.current.mode
-      if (st.current.mode === 'detail' && zoom <= OVERVIEW_ENTER_ZOOM) {
-        nextMode = 'overview'
-      } else if (st.current.mode === 'overview' && zoom > OVERVIEW_EXIT_ZOOM) {
-        nextMode = 'detail'
-      }
-      if (nextMode !== st.current.mode) {
-        st.current.mode = nextMode
-        st.current.modeChangedAt = now
-        // Don't do placement mutations on the same frame as a mode change
-        return
-      }
-      // brief grace period after mode change to avoid churn
-      if (now - st.current.modeChangedAt < MODE_SETTLE_MS) {
-        return
-      }
-
-      // pan signature like old manager
-      let sig = 0
-      for (let i = 0; i < geoms.length; i++) {
-        const g = geoms[i]!
-        // simple signature
-        sig = (sig + (g.id as string).length * g.overlap * 1000) | 0
-      }
-      if (sig !== st.current.lastPanSig) {
-        st.current.lastPanSig = sig
-        st.current.lastPanAt = now
-      }
-
-      // collect visible tabs with px
-      const visibleTabs: Array<{ tabId: string; shapeId: TLShapeId; px: number }> = []
-      for (const g of geoms) {
-        const info = inputs.getTabInfo(g.id)
-        if (info == null) continue
-        const ov = g.overlap <= 0 ? 0 : g.overlap >= 1 ? 1 : g.overlap
-        const px = g.w * g.h * ov
-        st.current.byShape.set(g.id, info.tabId)
-        const tracked = st.current.byTab.get(info.tabId)
-        if (tracked == null) {
-          st.current.byTab.set(info.tabId, {
-            tabId: info.tabId,
-            shapeId: g.id,
-            life: 'live',
-            lastInteractionAt: now,
-            lastLifecycleSent: null,
-            lastPlacementSent: null,
-            thumbRequestedForBg: false,
-            lastVisiblePx: px,
-          })
-        } else {
-          tracked.shapeId = g.id
-          tracked.lastVisiblePx = px
-        }
-        if (px >= limits.tinyPxFloor) {
-          visibleTabs.push({ tabId: info.tabId, shapeId: g.id, px })
-        }
-      }
-
-      const zoomIdle = now - st.current.lastZoomAt >= ZOOM_SETTLE_MS
-      const panIdle = now - st.current.lastPanAt >= PAN_SETTLE_MS
-      const overviewMode = st.current.mode === 'overview'
-
-      // active live tabs
-      const liveTabs = Array.from(st.current.byTab.values()).filter((t) => t.life === 'live')
-      if (liveTabs.length === 0) return
-      // allow first paint(s) after startup before demotions
-      if (now - st.current.startedAt < STARTUP_GRACE_MS) {
-        if (liveTabs.length <= limits.hotCapOverview) {
-          for (const t of liveTabs) {
-            if (t.lastPlacementSent !== 'active') {
-              outputs.setPlacement(t.shapeId, 'active', false)
-              t.lastPlacementSent = 'active'
-              t.thumbRequestedForBg = false
-            }
-          }
-        }
-        return
-      }
-
-      /* -----------------------------------------------------
-       * NOTHING mutational during zoom motion (old behaviour)
-       * --------------------------------------------------- */
-      if (!zoomIdle) {
-        return
-      }
-
-      /* -----------------------------------------------------
-       * DETAIL (> 30%) — replicate old behaviour
-       * --------------------------------------------------- */
-      if (!overviewMode) {
-        // visible set (only hard-visible, no soft)
-        const visibleSet = new Set<string>(visibleTabs.map((v) => v.tabId))
-
-        // if we are panning in detail:
-        if (!panIdle) {
-          // 1) instant off-screen demote for all live tabs
-          for (const t of liveTabs) {
-            if (visibleSet.has(t.tabId)) continue
-            if (t.lastPlacementSent !== 'background') {
-              const needThumb = !inputs.hasThumb(t.shapeId)
-              outputs.setPlacement(t.shapeId, 'background', needThumb)
-              t.lastPlacementSent = 'background'
-              t.thumbRequestedForBg = needThumb
-            } else if (!t.thumbRequestedForBg) {
-              const needThumb = !inputs.hasThumb(t.shapeId)
-              if (needThumb) {
-                outputs.setPlacement(t.shapeId, 'background', true)
-                t.thumbRequestedForBg = true
-              }
-            }
-          }
-
-          // 2) allow at most one safe promotion per frame, highest px first
-          const strongPx = limits.tinyPxFloor * 8
-          const ordered = visibleTabs
-            .filter((v) => {
-              const tracked = st.current.byTab.get(v.tabId)
-              return tracked == null ? true : tracked.lastPlacementSent !== 'active'
-            })
-            .sort((a, b) => b.px - a.px)
-
-          let promoted = false
-          for (const v of ordered) {
-            if (promoted) break
-            if (v.px < strongPx) break
-            const tracked = st.current.byTab.get(v.tabId)
-            if (tracked == null) continue
-            outputs.setPlacement(v.shapeId, 'active', false)
-            tracked.lastPlacementSent = 'active'
-            tracked.thumbRequestedForBg = false
-            promoted = true
-          }
-
-          return
-        }
-
-        // DETAIL idle (no pan): everyone visible = active, everyone else = background
-        for (const t of liveTabs) {
-          const isVis = visibleSet.has(t.tabId)
-          const nextPlacement: PlacementState = isVis ? 'active' : 'background'
-          if (nextPlacement !== t.lastPlacementSent) {
-            if (nextPlacement === 'background') {
-              const needThumb = !inputs.hasThumb(t.shapeId)
-              outputs.setPlacement(t.shapeId, 'background', needThumb)
-              t.lastPlacementSent = 'background'
-              t.thumbRequestedForBg = needThumb
-            } else {
-              outputs.setPlacement(t.shapeId, 'active', false)
-              t.lastPlacementSent = 'active'
-              t.thumbRequestedForBg = false
-            }
-          } else if (nextPlacement === 'background' && !t.thumbRequestedForBg) {
-            const needThumb = !inputs.hasThumb(t.shapeId)
-            if (needThumb) {
-              outputs.setPlacement(t.shapeId, 'background', true)
-              t.thumbRequestedForBg = true
-            }
-          }
-        }
-
-        return
-      }
-
-      /* -----------------------------------------------------
-       * OVERVIEW (≤ 30%) — cap-based by interaction recency
-       * --------------------------------------------------- */
-      if (!panIdle) return
-
-      if (liveTabs.length <= limits.hotCapOverview) {
-        for (const t of liveTabs) {
-          if (t.lastPlacementSent !== 'active') {
-            outputs.setPlacement(t.shapeId, 'active', false)
-            t.lastPlacementSent = 'active'
-            t.thumbRequestedForBg = false
-          }
-        }
-        return
-      }
-
-      const sortedByInteraction = liveTabs
-        .slice()
-        .sort((a, b) => b.lastInteractionAt - a.lastInteractionAt)
-      const keep = new Set<string>(sortedByInteraction.slice(0, limits.hotCapOverview).map((t) => t.tabId))
-
-      for (const t of liveTabs) {
-        const shouldBeActive = keep.has(t.tabId)
-        const nextPlacement: PlacementState = shouldBeActive ? 'active' : 'background'
-        if (nextPlacement !== t.lastPlacementSent) {
-          if (nextPlacement === 'background') {
-            const needThumb = !inputs.hasThumb(t.shapeId)
-            outputs.setPlacement(t.shapeId, 'background', needThumb)
-            t.lastPlacementSent = 'background'
-            t.thumbRequestedForBg = needThumb
-          } else {
-            outputs.setPlacement(t.shapeId, 'active', false)
-            t.lastPlacementSent = 'active'
-            t.thumbRequestedForBg = false
-          }
-        } else if (nextPlacement === 'background' && !t.thumbRequestedForBg) {
-          const needThumb = !inputs.hasThumb(t.shapeId)
-          if (needThumb) {
-            outputs.setPlacement(t.shapeId, 'background', true)
-            t.thumbRequestedForBg = true
-          }
-        }
+      if (ov >= OVERLAP_VISIBLE) {
+        visibleTabs.push({ tabId: info.tabId, shapeId: g.id, overlap: ov });
       }
     }
 
-    raf = requestAnimationFrame(loop)
-    return () => cancelAnimationFrame(raf)
-  }, [inputs, outputs, limits])
+    // --- idleness flags ---
+    const zoomIdle = now - st.current.lastZoomAt >= ZOOM_SETTLE_MS;
+    const panIdle = now - st.current.lastPanAt >= PAN_SETTLE_MS;
+    const overviewMode = st.current.mode === "overview";
+    if (!zoomIdle) return;
+
+    // --- live tabs only ---
+    const liveTabs = Array.from(st.current.byTab.values()).filter((t) => t.life === "live");
+    if (liveTabs.length === 0) return;
+
+    /* =====================================================
+     * DETAIL (> 30%) — percentage-only visibility
+     * =================================================== */
+    if (!overviewMode) {
+      const visibleSet = new Set<string>(visibleTabs.map((v) => v.tabId));
+
+      if (!panIdle) {
+        // 1) instant off-screen demote for all live tabs
+        for (const t of liveTabs) {
+          if (visibleSet.has(t.tabId)) continue;
+          // thumbnail only when transitioning active -> background, once
+          const needThumb = t.lastPlacementSent === "active";
+          if (t.lastPlacementSent !== "background") {
+            outputs.setPlacement(t.shapeId, "background", needThumb);
+            t.lastPlacementSent = "background";
+          }
+        }
+
+        // 2) at most one promotion per frame, chosen by highest overlap%
+        const ordered = visibleTabs
+          .filter((v) => {
+            const tracked = st.current.byTab.get(v.tabId);
+            return tracked == null ? true : tracked.lastPlacementSent !== "active";
+          })
+          .sort((a, b) => b.overlap - a.overlap);
+
+        const candidate = ordered[0];
+        if (candidate) {
+          const tracked = st.current.byTab.get(candidate.tabId);
+          if (tracked && tracked.lastPlacementSent !== "active") {
+            outputs.setPlacement(candidate.shapeId, "active", false);
+            tracked.lastPlacementSent = "active";
+          }
+        }
+        return;
+      }
+
+      // DETAIL idle: all visible are active; others background
+      for (const t of liveTabs) {
+        const isVis = visibleSet.has(t.tabId);
+        const nextPlacement: PlacementState = isVis ? "active" : "background";
+        if (nextPlacement === t.lastPlacementSent) continue;
+
+        if (nextPlacement === "background") {
+          const needThumb = t.lastPlacementSent === "active";
+          outputs.setPlacement(t.shapeId, "background", needThumb);
+          t.lastPlacementSent = "background";
+        } else {
+          outputs.setPlacement(t.shapeId, "active", false);
+          t.lastPlacementSent = "active";
+        }
+      }
+      return;
+    }
+
+    /* =====================================================
+     * OVERVIEW (≤ 30%) — cap by interaction recency
+     * =================================================== */
+    if (!panIdle) return;
+
+    if (liveTabs.length <= limits.hotCapOverview) {
+      for (const t of liveTabs) {
+        if (t.lastPlacementSent !== "active") {
+          outputs.setPlacement(t.shapeId, "active", false);
+          t.lastPlacementSent = "active";
+        }
+      }
+      return;
+    }
+
+    const sortedByInteraction = liveTabs
+      .slice()
+      .sort((a, b) => b.lastInteractionAt - a.lastInteractionAt);
+
+    const keep = new Set<string>(
+      sortedByInteraction.slice(0, limits.hotCapOverview).map((t) => t.tabId)
+    );
+
+    for (const t of liveTabs) {
+      const shouldBeActive = keep.has(t.tabId);
+      const nextPlacement: PlacementState = shouldBeActive ? "active" : "background";
+      if (nextPlacement === t.lastPlacementSent) continue;
+
+      if (nextPlacement === "background") {
+        // overview demotions do NOT snapshot (only snapshot on active->background in detail)
+        outputs.setPlacement(t.shapeId, "background", false);
+        t.lastPlacementSent = "background";
+      } else {
+        outputs.setPlacement(t.shapeId, "active", false);
+        t.lastPlacementSent = "active";
+      }
+    }
+  };
+
+  raf = requestAnimationFrame(loop);
+  return () => cancelAnimationFrame(raf);
+}, [inputs, outputs, limits]);
+
+
 }

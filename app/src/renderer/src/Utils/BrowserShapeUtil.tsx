@@ -214,6 +214,9 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
       }
     }, [api])
 
+    // add these near the component top
+    const [liveActive, setLiveActive] = useState<boolean>(false)
+    const liveActiveRef = useRef<boolean>(false)
 
     useEffect(() => {
       if (!api) return
@@ -222,35 +225,38 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
       let lastRect: Rect = { x: -1, y: -1, width: -1, height: -1 }
       let lastFactor = -1
       const ZOOM_EPS = 0.0125
-      let wasActive = false // 👈 track active→inactive→active transitions
+      let wasActive = false // track active→inactive→active transitions
+
+      const setInactive = (): void => {
+        if (liveActiveRef.current) {
+          liveActiveRef.current = false
+          setLiveActive(false)          // ← triggers one render when the loop bails
+        }
+        wasActive = false
+      }
 
       const loop = (): void => {
         raf = requestAnimationFrame(loop)
 
         const id = tabIdRef.current
-        if (!id) return
+        if (!id) { setInactive(); return }
 
-        if (suspendTabRef.current) {
-          wasActive = false
-          return
-        }
+        if (suspendTabRef.current) { setInactive(); return }
 
         // lifecycle gate
-        const life = window.__tabState?.get(id)
-        if (life && life !== 'live') {
-          wasActive = false
-          return
-        }
+        const life = window.__tabState?.get(id) as 'live' | 'frozen' | 'discarded' | undefined
+        if (life && life !== 'live') { setInactive(); return }
 
         // placement gate
-        const activeSet = window.__activeTabs
-        const isActive = activeSet ? activeSet.has(id) : true
-        if (!isActive) {
-          wasActive = false
-          return
+        const isActive = window.__activeTabs ? window.__activeTabs.has(id) : true
+        if (!isActive) { setInactive(); return }
+
+        // past this point → ACTIVE frame
+        if (!liveActiveRef.current) {
+          liveActiveRef.current = true
+          setLiveActive(true)           // ← triggers one render when the loop becomes active
         }
 
-        // past this point → active frame
         const shapeRecord = editor.getShape<BrowserShape>(shape.id)
         if (!shapeRecord || shapeRecord.type !== 'browser-shape') return
 
@@ -272,7 +278,7 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
         const sizeChanged = rect.width !== lastRect.width || rect.height !== lastRect.height
         const zoomChanged = Math.abs(zoom - lastFactor) > ZOOM_EPS
 
-        // 👇 force one bounds push on first active frame after inactivity
+        // force one bounds push on first active frame after inactivity
         const force = !wasActive
         wasActive = true
 
@@ -288,7 +294,7 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
 
       raf = requestAnimationFrame(loop)
       return () => cancelAnimationFrame(raf)
-    }, [api, editor, shape.id])
+    }, [api, editor, shape.id, tabIdRef, suspendTabRef])
 
     // Treat typing in the nav bar and clicking its controls as interaction
     // Replace your current "Treat typing in the nav bar..." effect with this:
@@ -605,52 +611,39 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
       dragRef.current = null
     }
 
-    function SnapshotImage({ tabIdRef }: { tabIdRef: React.RefObject<string | null> }) {
-      const [src, setSrc] = useState<string | null>(null)
-      const [show, setShow] = useState<boolean>(false)
+    type TabThumb = { dataUrlWebp?: string }
 
-      useEffect(() => {
-        let t = 0
-        const tick = () => {
-          t = window.setTimeout(tick, 250)
+    function SnapshotImage(
+      { tabIdRef, liveActive }: {
+        tabIdRef: React.RefObject<string | null>
+        liveActive: boolean
+      }
+    ) {
+      if (liveActive) return null
+      const id = tabIdRef.current
+      if (!id) return null
 
-          const id = tabIdRef.current
-          if (!id) {
-            setShow(false)
-            return
-          }
+      const rec = window.__tabThumbs?.get(id) as TabThumb | undefined
+      const src = rec?.dataUrlWebp ?? null
+      if (!src) return null
 
-          const st = window.__tabState?.get(id) as 'live' | 'frozen' | 'discarded' | undefined
-          const isActive = window.__activeTabs?.has(id) ?? true
-          const rec = window.__tabThumbs?.get(id)
-
-          // show snapshot when:
-          //  - lifecycle is NOT live (frozen, discarded)
-          //  - OR tab is live but NOT active (background in overview)
-          const shouldShow = st !== 'live' || !isActive
-
-          setShow(shouldShow)
-          setSrc(rec?.dataUrlWebp ?? null)
-        }
-        tick()
-        return () => window.clearTimeout(t)
-      }, [])
-
-
-      if (!show || !src) return null
       return (
         <img
           src={src}
           alt=""
           style={{
             position: 'absolute',
-            inset: 0,             // top/left/right/bottom = 0
+            inset: 0,
             width: '100%',
             height: '100%',
-            objectFit: 'cover',
+            // we capture at the display size; don't ask the browser to resample:
+            objectFit: 'fill',
             pointerEvents: 'none',
-
+            willChange: 'transform',
+            contain: 'paint',
+            transform: 'translateZ(0)',
           }}
+          decoding="async"
           draggable={false}
         />
       )
@@ -762,6 +755,9 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
               background: 'transparent',
             }}
           >
+
+            <SnapshotImage tabIdRef={tabIdRef} liveActive={liveActive} />
+
             {/* Live web content: inset by BORDER so the blue outline is never covered */}
             <div
               ref={hostRef}
@@ -774,7 +770,6 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
                 pointerEvents: 'none', // OS plane below; we never rely on DOM here
               }}
             />
-            <SnapshotImage tabIdRef={tabIdRef} />
           </div>
         </div>
 

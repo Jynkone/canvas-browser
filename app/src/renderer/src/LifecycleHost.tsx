@@ -68,19 +68,6 @@ if (!window.__activeTabs) window.__activeTabs = new Set()
 export default function LifecycleHost({ editorRef }: Props) {
   const lastInteraction = useRef<Map<TLShapeId, number>>(new Map())
   const tabToShape = useRef(new Map<string, TLShapeId>())
-
-  const flagsByTab = useRef(
-    new Map<string, { audible: boolean; capturing: boolean; devtools: boolean; downloads: boolean; pinned: boolean }>()
-  )
-
-  const bumpInteractionByShapeId = (shapeId: TLShapeId): void => {
-    lastInteraction.current.set(shapeId, performance.now())
-  }
-  const bumpInteractionByTabId = (tabId: string): void => {
-    const shapeId = tabToShape.current.get(tabId)
-    if (shapeId) bumpInteractionByShapeId(shapeId)
-  }
-
   useEffect(() => {
     const off = window.overlay.onNotice((n) => {
       if ((n as { kind?: unknown }).kind === 'flags') {
@@ -94,6 +81,70 @@ export default function LifecycleHost({ editorRef }: Props) {
     })
     return () => off()
   }, [])
+
+  useEffect(() => {
+    const api = window.overlay
+    const onActivity = (e: Event): void => {
+      const detail = (e as CustomEvent<TabActivityDetail>).detail
+      const tabId = detail?.tabId
+      if (!tabId) return
+      bumpInteractionByTabId(tabId)
+      const shapeId = tabToShape.current.get(tabId)
+      if (shapeId) { void revive(shapeId) }
+    }
+    const onNewTab = (e: Event): void => {
+      const detail = (e as CustomEvent<NewTabDetail>).detail
+      if (detail?.tabId && detail?.shapeId) {
+        tabToShape.current.set(detail.tabId, detail.shapeId)
+        bumpInteractionByShapeId(detail.shapeId)
+      }
+    }
+    window.addEventListener(TAB_ACTIVITY_EVENT, onActivity as EventListener, { capture: true })
+    window.addEventListener(NEW_TAB_EVENT, onNewTab as EventListener, { capture: true })
+    const offUrl = api.onUrlUpdate(({ tabId }) => bumpInteractionByTabId(tabId))
+    const offNav = api.onNavFinished(({ tabId }) => bumpInteractionByTabId(tabId))
+    return () => {
+      window.removeEventListener(TAB_ACTIVITY_EVENT, onActivity as EventListener, { capture: true } as AddEventListenerOptions)
+      window.removeEventListener(NEW_TAB_EVENT, onNewTab as EventListener, { capture: true } as AddEventListenerOptions)
+      offUrl()
+      offNav()
+    }
+  }, [])
+  const flagsByTab = useRef(
+    new Map<string, { audible: boolean; capturing: boolean; devtools: boolean; downloads: boolean; pinned: boolean }>()
+  )
+  const bumpInteractionByShapeId = (shapeId: TLShapeId): void => {
+    lastInteraction.current.set(shapeId, performance.now())
+  }
+  const bumpInteractionByTabId = (tabId: string): void => {
+    const shapeId = tabToShape.current.get(tabId)
+    if (shapeId) bumpInteractionByShapeId(shapeId)
+  }
+
+  const revive = async (shapeId: TLShapeId): Promise<void> => {
+    const ed = editorRef.current
+    if (!ed) return
+    const info = readTabInfoFromShape(ed, shapeId)
+    if (!info) return
+    const { tabId } = info
+    const tag = window.__tabState?.get(tabId)
+    if (tag === 'live') return
+    if (tag === 'frozen') {
+      await window.overlay.thaw({ tabId })
+      await window.overlay.show({ tabId })
+    } else if (tag === 'discarded') {
+      await window.overlay.createTab({ shapeId, restore: true })
+      await window.overlay.show({ tabId })
+    } else {
+      return
+    }
+    window.__tabState!.set(tabId, 'live')
+    lastInteraction.current.set(shapeId, performance.now())
+    tabToShape.current.set(tabId, shapeId)
+    window.dispatchEvent(
+      new CustomEvent('paper:tab-activity', { detail: { tabId } })
+    )
+  }
 
   const inputs = useMemo(() => {
     return {
@@ -153,51 +204,16 @@ export default function LifecycleHost({ editorRef }: Props) {
   }, [])
 
   const outputs = useMemo(() => {
-    // ---- revive ONLY if frozen/discarded; never touches __activeTabs ----
-    const revive = async (shapeId: TLShapeId): Promise<void> => {
-      const ed = editorRef.current
-      if (!ed) return
-      const info = readTabInfoFromShape(ed, shapeId)
-      if (!info) return
-
-      const { tabId } = info
-      const tag = window.__tabState?.get(tabId) as 'live' | 'frozen' | 'discarded' | undefined
-      if (tag === 'live') return
-
-      if (tag === 'frozen') {
-        await window.overlay.thaw({ tabId })
-        await window.overlay.show({ tabId })
-      } else if (tag === 'discarded') {
-        await window.overlay.createTab({ shapeId, restore: true })
-        await window.overlay.show({ tabId })
-      } else {
-        return
-      }
-
-      window.__tabState!.set(tabId, 'live')
-      lastInteraction.current.set(shapeId, performance.now())
-      tabToShape.current.set(tabId, shapeId)
-      window.dispatchEvent(new CustomEvent('paper:tab-activity', { detail: { tabId } }))
-    }
-
     return {
-      // ---- downward-only lifecycle ----
       setLifecycle: (shapeId, state): void => {
         const ed = editorRef.current
         if (!ed) return
         const info = readTabInfoFromShape(ed, shapeId)
         if (!info) return
         const { tabId } = info
-
         if (state === 'live') {
-          // note-only; do NOT revive here
-          lastInteraction.current.set(shapeId, performance.now())
-          if (window.__tabState?.get(tabId) !== 'live') {
-            window.__tabState!.set(tabId, 'live')
-          }
           return
         }
-
         if (state === 'frozen') {
           ; (async () => {
             await window.overlay.hide({ tabId })
@@ -207,8 +223,6 @@ export default function LifecycleHost({ editorRef }: Props) {
           })()
           return
         }
-
-        // state === 'discarded'
         ; (async () => {
           await window.overlay.destroy({ tabId, discard: true })
           window.__activeTabs!.delete(tabId)
@@ -216,7 +230,6 @@ export default function LifecycleHost({ editorRef }: Props) {
         })()
       },
 
-      // ---- placement with revive-on-demand + pre-hide screenshot ----
       setPlacement: (
         shapeId: TLShapeId,
         placement: 'active' | 'background',
@@ -226,39 +239,32 @@ export default function LifecycleHost({ editorRef }: Props) {
         if (!ed) return
         const info = readTabInfoFromShape(ed, shapeId)
         if (!info) return
-
         const { tabId } = info
-        const tag = window.__tabState?.get(tabId)
-
         if (placement === 'active') {
-          ; (async () => {
-            if (tag !== 'live') {
-              await revive(shapeId)              // ensure truly live first (thaw/restore + show)
-            }
-            await window.overlay.show({ tabId }) // idempotent if revive already showed
+          (async () => {
+            await window.overlay.show({ tabId })
             window.__activeTabs!.add(tabId)
           })()
           return
         }
-
-        // placement === 'background' (only meaningful for live tabs)
-        if (tag !== 'live') return
-        const wasActive = window.__activeTabs!.has(tabId)
-
-          ; (async () => {
-            if (needThumb && wasActive) {
-              await snapshot(tabId, 896)          // pre-hide screenshot
+        const wasActive = window.__activeTabs!.has(tabId);
+        (async () => {
+          if (needThumb && wasActive) {
+            const bounds = ed.getShapePageBounds(shapeId) // <- define it
+            if (bounds) {
+              const zoom = ed.getCamera().z || 1
+              const dpr = window.devicePixelRatio || 1
+              const widthPx = Math.round(bounds.w * zoom * dpr)
+              await snapshot(tabId, widthPx)             // forwards to payload.maxWidth
             }
-            await window.overlay.hide({ tabId })
-            window.__activeTabs!.delete(tabId)
-          })()
+            // if bounds is null this frame, just skip snapshot
+          }
+          await window.overlay.hide({ tabId })
+          window.__activeTabs!.delete(tabId)
+        })()
       },
-
-      // ---- explicit hook for user-driven revive (no placement change) ----
-      reviveIfDormant: (shapeId: TLShapeId): void => { void revive(shapeId) },
     }
   }, [editorRef, snapshot])
-
 
   const MIN = 60_000
   const limits = useMemo(
@@ -270,32 +276,6 @@ export default function LifecycleHost({ editorRef }: Props) {
     }),
     []
   )
-
-  useEffect(() => {
-    const onActivity = (e: Event): void => {
-      const detail = (e as CustomEvent<TabActivityDetail>).detail
-      if (detail?.tabId) bumpInteractionByTabId(detail.tabId)
-    }
-    const onNewTab = (e: Event): void => {
-      const detail = (e as CustomEvent<NewTabDetail>).detail
-      if (detail?.tabId && detail?.shapeId) {
-        tabToShape.current.set(detail.tabId, detail.shapeId)
-        bumpInteractionByShapeId(detail.shapeId)
-      }
-    }
-    window.addEventListener(TAB_ACTIVITY_EVENT, onActivity as EventListener, { capture: true })
-    window.addEventListener(NEW_TAB_EVENT, onNewTab as EventListener, { capture: true })
-    const api = window.overlay
-    const offUrl = api.onUrlUpdate(({ tabId }) => bumpInteractionByTabId(tabId))
-    const offNav = api.onNavFinished(({ tabId }) => bumpInteractionByTabId(tabId))
-    return () => {
-      window.removeEventListener(TAB_ACTIVITY_EVENT, onActivity as EventListener, { capture: true } as AddEventListenerOptions)
-      window.removeEventListener(NEW_TAB_EVENT, onNewTab as EventListener, { capture: true } as AddEventListenerOptions)
-      offUrl()
-      offNav()
-    }
-  }, [])
-
   useLifecycleManager(inputs, outputs, limits)
   return null
 }
