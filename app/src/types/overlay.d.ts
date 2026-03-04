@@ -140,8 +140,8 @@ export interface OverlayAPI {
   hide(payload: TabIdPayload): Promise<void>
   // 👇 this is the important change
   destroy(payload: DestroyTabPayload): Promise<void>
-  setBounds(payload: BoundsPayload): Promise<void>
-  setZoom(payload: ZoomPayload): Promise<void>
+  setBounds(payload: BoundsPayload | BoundsPayload[]): Promise<void>
+  setZoom(payload: ZoomPayload | ZoomPayload[]): Promise<void>
 
   // focus / capture (optional)
   focus(payload?: Partial<TabIdPayload>): Promise<void>

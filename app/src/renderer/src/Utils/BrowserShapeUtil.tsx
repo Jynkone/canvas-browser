@@ -23,6 +23,7 @@ export const browserTabSuspendRegistry = new Map<string, React.RefObject<boolean
 
 const TAB_ACTIVITY_EVENT = 'paper:tab-activity' as const
 const NEW_TAB_EVENT = 'paper:new-tab' as const
+const PLACEMENT_EVENT = 'paper:placement-changed' as const
 
 
 const DRAG_GUTTER = 60 // invisible move hit area (no longer affects visuals/geometry)
@@ -30,7 +31,6 @@ const MIN_W = 300
 // Geometry is tight now; don't bake gutters into visual min height.
 const MIN_H = 225 + NAV_BAR_HEIGHT
 
-type Rect = { x: number; y: number; width: number; height: number }
 type NavState = { currentUrl: string; canGoBack: boolean; canGoForward: boolean; title: string }
 // Pause all overlay sync + fit churn for this tab
 
@@ -214,87 +214,31 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
       }
     }, [api])
 
-    // add these near the component top
     const [liveActive, setLiveActive] = useState<boolean>(false)
     const liveActiveRef = useRef<boolean>(false)
 
     useEffect(() => {
-      if (!api) return
-
-      let raf = 0
-      let lastRect: Rect = { x: -1, y: -1, width: -1, height: -1 }
-      let lastFactor = -1
-      const ZOOM_EPS = 0.0125
-      let wasActive = false // track active→inactive→active transitions
-
-      const setInactive = (): void => {
-        if (liveActiveRef.current) {
-          liveActiveRef.current = false
-          setLiveActive(false)          // ← triggers one render when the loop bails
-        }
-        wasActive = false
-      }
-
-      const loop = (): void => {
-        raf = requestAnimationFrame(loop)
-
+      const update = () => {
         const id = tabIdRef.current
-        if (!id) { setInactive(); return }
-
-        if (suspendTabRef.current) { setInactive(); return }
-
-        // lifecycle gate
-        const life = window.__tabState?.get(id) as 'live' | 'frozen' | 'discarded' | undefined
-        if (life && life !== 'live') { setInactive(); return }
-
-        // placement gate
-        const isActive = window.__activeTabs ? window.__activeTabs.has(id) : true
-        if (!isActive) { setInactive(); return }
-
-        // past this point → ACTIVE frame
-        if (!liveActiveRef.current) {
-          liveActiveRef.current = true
-          setLiveActive(true)           // ← triggers one render when the loop becomes active
-        }
-
-        const shapeRecord = editor.getShape<BrowserShape>(shape.id)
-        if (!shapeRecord || shapeRecord.type !== 'browser-shape') return
-
-        const pb = editor.getShapePageBounds(shapeRecord.id)
-        if (!pb) return
-
-        const zoom = editor.getZoomLevel()
-        const screenPos = editor.pageToScreen({ x: pb.x, y: pb.y })
-        const shapeSize = { w: shapeRecord.props.w, h: shapeRecord.props.h }
-
-        const rect: Rect = {
-          x: Math.round(screenPos.x),
-          y: Math.round(screenPos.y + NAV_BAR_HEIGHT * zoom),
-          width: Math.round(shapeSize.w * zoom),
-          height: Math.round((shapeSize.h - NAV_BAR_HEIGHT) * zoom),
-        }
-
-        const positionChanged = rect.x !== lastRect.x || rect.y !== lastRect.y
-        const sizeChanged = rect.width !== lastRect.width || rect.height !== lastRect.height
-        const zoomChanged = Math.abs(zoom - lastFactor) > ZOOM_EPS
-
-        // force one bounds push on first active frame after inactivity
-        const force = !wasActive
-        wasActive = true
-
-        if (force || positionChanged || sizeChanged) {
-          void api.setBounds({ tabId: id, rect, shapeSize })
-          lastRect = rect
-        }
-        if (zoomChanged) {
-          void api.setZoom({ tabId: id, factor: zoom })
-          lastFactor = zoom
-        }
+        if (!id) return
+        const life = window.__tabState?.get(id)
+        const isActive = window.__activeTabs?.has(id) ?? false
+        const isLive = life === 'live' && isActive && !suspendTabRef.current
+        setLiveActive(isLive)
+        liveActiveRef.current = isLive
       }
 
-      raf = requestAnimationFrame(loop)
-      return () => cancelAnimationFrame(raf)
-    }, [api, editor, shape.id, tabIdRef, suspendTabRef])
+      update()
+      window.addEventListener(PLACEMENT_EVENT, update)
+      window.addEventListener(TAB_ACTIVITY_EVENT, update)
+      window.addEventListener(NEW_TAB_EVENT, update)
+
+      return () => {
+        window.removeEventListener(PLACEMENT_EVENT, update)
+        window.removeEventListener(TAB_ACTIVITY_EVENT, update)
+        window.removeEventListener(NEW_TAB_EVENT, update)
+      }
+    }, [suspendTabRef])
 
     // Treat typing in the nav bar and clicking its controls as interaction
     // Replace your current "Treat typing in the nav bar..." effect with this:

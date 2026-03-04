@@ -1,7 +1,9 @@
 import { useEffect, useMemo, useRef } from 'react'
 import type { Editor, TLShapeId } from 'tldraw'
 import { useLifecycleManager } from './useLifecycleManager'
-import type { OverlayAPI } from '../../types/overlay'
+import type { OverlayAPI, BoundsPayload } from '../../types/overlay'
+import { NAV_BAR_HEIGHT } from './components/NavigationBar'
+import { browserTabSuspendRegistry } from './Utils/BrowserShapeUtil'
 
 declare global {
   interface Window {
@@ -14,6 +16,7 @@ declare global {
 
 const TAB_ACTIVITY_EVENT = 'paper:tab-activity' as const
 const NEW_TAB_EVENT = 'paper:new-tab' as const
+const PLACEMENT_EVENT = 'paper:placement-changed' as const
 
 type TabActivityDetail = Readonly<{ tabId: string }>
 type NewTabDetail = Readonly<{ tabId: string; shapeId: TLShapeId }>
@@ -131,13 +134,9 @@ export default function LifecycleHost({ editorRef }: Props) {
     if (tag === 'live') return
     if (tag === 'frozen') {
       await window.overlay.thaw({ tabId })
-      await window.overlay.show({ tabId })
-    } else if (tag === 'discarded') {
-      await window.overlay.createTab({ shapeId, restore: true })
-      await window.overlay.show({ tabId })
-    } else {
-      return
     }
+    await window.overlay.show({ tabId })
+    window.__activeTabs!.add(tabId)
     window.__tabState!.set(tabId, 'live')
     lastInteraction.current.set(shapeId, performance.now())
     tabToShape.current.set(tabId, shapeId)
@@ -166,7 +165,12 @@ export default function LifecycleHost({ editorRef }: Props) {
       },
       getCamera: () => {
         const ed = editorRef.current
-        return { zoom: getZoom(ed) }
+        const cam = ed?.getCamera()
+        return {
+          x: cam?.x ?? 0,
+          y: cam?.y ?? 0,
+          zoom: getZoom(ed)
+        }
       },
       getTabInfo: (shapeId: TLShapeId) => {
         const ed = editorRef.current
@@ -244,6 +248,7 @@ export default function LifecycleHost({ editorRef }: Props) {
           (async () => {
             await window.overlay.show({ tabId })
             window.__activeTabs!.add(tabId)
+            window.dispatchEvent(new CustomEvent(PLACEMENT_EVENT, { detail: { tabId, placement: 'active' } }))
           })()
           return
         }
@@ -261,6 +266,7 @@ export default function LifecycleHost({ editorRef }: Props) {
           }
           await window.overlay.hide({ tabId })
           window.__activeTabs!.delete(tabId)
+          window.dispatchEvent(new CustomEvent(PLACEMENT_EVENT, { detail: { tabId, placement: 'background' } }))
         })()
       },
     }
@@ -271,11 +277,89 @@ export default function LifecycleHost({ editorRef }: Props) {
     () => ({
       hotCapOverview: 8,
       tinyPxFloor: 48_000,
-      freezeHiddenMs: 0.2 * MIN,
+      freezeHiddenMs: 3 * MIN,
       discardFrozenMs: 9 * MIN,
     }),
     []
   )
   useLifecycleManager(inputs, outputs, limits)
+
+  useEffect(() => {
+    let raf = 0
+    let previousActiveTabs = new Set<string>()
+    const lastSent = new Map<string, string>() // tabId -> json of last rect/size
+    const lastZoomSent = new Map<string, number>()
+    const ZOOM_EPS = 0.0125
+
+    const loop = () => {
+      raf = requestAnimationFrame(loop)
+      const ed = editorRef.current
+      if (!ed) return
+
+      const activeTabs = window.__activeTabs
+      if (!activeTabs || activeTabs.size === 0) {
+        previousActiveTabs.clear()
+        return
+      }
+
+      const newlyActive = new Set<string>()
+      for (const tabId of activeTabs) {
+        if (!previousActiveTabs.has(tabId)) newlyActive.add(tabId)
+      }
+      previousActiveTabs = new Set(activeTabs)
+
+      const batch: BoundsPayload[] = []
+      const zoomBatch: { tabId: string; factor: number }[] = []
+      const zoom = ed.getZoomLevel()
+
+      for (const tabId of activeTabs) {
+        const shapeId = tabToShape.current.get(tabId)
+        if (!shapeId) continue
+
+        if (browserTabSuspendRegistry.get(shapeId)?.current) continue
+        if (window.__tabState?.get(tabId) !== 'live') continue
+
+        const shape = ed.getShape(shapeId)
+        if (!shape || shape.type !== 'browser-shape') continue
+
+        const pb = ed.getShapePageBounds(shapeId)
+        if (!pb) continue
+
+        const screenPos = ed.pageToScreen({ x: pb.x, y: pb.y })
+        const shapeSize = { w: (shape as any).props.w, h: (shape as any).props.h }
+
+        const rect = {
+          x: Math.round(screenPos.x),
+          y: Math.round(screenPos.y + NAV_BAR_HEIGHT * zoom),
+          width: Math.round(shapeSize.w * zoom),
+          height: Math.round((shapeSize.h - NAV_BAR_HEIGHT) * zoom),
+        }
+
+        const force = newlyActive.has(tabId)
+
+        const key = JSON.stringify({ rect, shapeSize })
+        if (force || lastSent.get(tabId) !== key) {
+          lastSent.set(tabId, key)
+          batch.push({ tabId, rect, shapeSize })
+        }
+
+        if (force || Math.abs(zoom - (lastZoomSent.get(tabId) ?? -1)) > ZOOM_EPS) {
+          lastZoomSent.set(tabId, zoom)
+          zoomBatch.push({ tabId, factor: zoom })
+        }
+      }
+
+      if (batch.length > 0) {
+        void window.overlay.setBounds(batch)
+      }
+      if (zoomBatch.length > 0) {
+        void window.overlay.setZoom(zoomBatch)
+      }
+    }
+
+    raf = requestAnimationFrame(loop)
+    return () => cancelAnimationFrame(raf)
+  }, [editorRef])
+
   return null
 }

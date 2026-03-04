@@ -2,7 +2,7 @@ import { app, BrowserWindow, WebContentsView, ipcMain, Menu, desktopCapturer, di
 import type { Debugger as ElectronDebugger, Input, SystemMemoryInfo } from 'electron'
 import { writeFileSync, readFileSync, existsSync } from 'fs'
 import { join } from 'path'
-import type { OverlayNotice, Flags } from '../../src/types/overlay'
+import type { OverlayNotice, Flags, BoundsPayload, ZoomPayload } from '../../src/types/overlay'
 import sharp from 'sharp';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
@@ -1320,28 +1320,31 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null): void {
   }
   )
 
-  ipcMain.handle('overlay:set-bounds', async (_e, { tabId, rect }: { tabId: string; rect: Rect }) => {
-    const { state } = S.resolve(tabId)
-    if (!state) return
+  ipcMain.handle('overlay:set-bounds', async (_e, payload: BoundsPayload | BoundsPayload[]) => {
+    const list = Array.isArray(payload) ? payload : [payload]
+    for (const { tabId, rect } of list) {
+      const { state } = S.resolve(tabId)
+      if (!state) continue
 
-    const { x, y, w, h } = S.roundRect(rect)
-    const b = state.lastBounds
+      const { x, y, w, h } = S.roundRect(rect)
+      const b = state.lastBounds
 
-    if (!b || x !== b.x || y !== b.y || w !== b.w || h !== b.h) {
-      state.lastBounds = { x, y, w, h }
-      try {
-        state.view.setBounds({
-          x: x + BORDER,
-          y: y + BORDER,
-          width: w - 2 * BORDER,
-          height: h - 2 * BORDER,
-        });
-      } catch { }
-    }
+      if (!b || x !== b.x || y !== b.y || w !== b.w || h !== b.h) {
+        state.lastBounds = { x, y, w, h }
+        try {
+          state.view.setBounds({
+            x: x + BORDER,
+            y: y + BORDER,
+            width: w - 2 * BORDER,
+            height: h - 2 * BORDER,
+          });
+        } catch { }
+      }
 
-    // If we’re under 25% and a bucket is pending, (re)schedule the single apply
-    if (S.currentEff() < CHROME_MIN && state.pendingBucket != null) {
-      S.scheduleEmu(state)
+      // If we’re under 25% and a bucket is pending, (re)schedule the single apply
+      if (S.currentEff() < CHROME_MIN && state.pendingBucket != null) {
+        S.scheduleEmu(state)
+      }
     }
   }
   )
@@ -1410,31 +1413,34 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null): void {
   );
 
 
-  ipcMain.handle('overlay:set-zoom', async (_e, { tabId, factor }: { tabId?: string; factor: number }): Promise<void> => {
-    canvasZoom = factor || 1
-    const eff = S.currentEff()
+  ipcMain.handle('overlay:set-zoom', async (_e, payload: ZoomPayload | ZoomPayload[]): Promise<void> => {
+    const list = Array.isArray(payload) ? payload : [payload]
+    for (const { tabId, factor } of list) {
+      canvasZoom = factor || 1
+      const eff = S.currentEff()
 
-    const apply = (state: ViewState) => {
-      if (eff >= CHROME_MIN) {
-        // Native zoom: clear any pending emu and apply once
-        state.pendingBucket = null
-        if (state.emuTimer) { clearTimeout(state.emuTimer); state.emuTimer = null }
-        S.setEff(state.view, eff, state)
-        return
+      const apply = (state: ViewState) => {
+        if (eff >= CHROME_MIN) {
+          // Native zoom: clear any pending emu and apply once
+          state.pendingBucket = null
+          if (state.emuTimer) { clearTimeout(state.emuTimer); state.emuTimer = null }
+          S.setEff(state.view, eff, state)
+          return
+        }
+        // Emulation path: compute bucket and coalesce
+        const bucket = effToBucketKey(eff)
+        if (state.lastAppliedZoomKey === bucket || state.pendingBucket === bucket) return
+        state.pendingBucket = bucket
+        S.scheduleEmu(state) // ← will apply once, using latest bounds
       }
-      // Emulation path: compute bucket and coalesce
-      const bucket = effToBucketKey(eff)
-      if (state.lastAppliedZoomKey === bucket || state.pendingBucket === bucket) return
-      state.pendingBucket = bucket
-      S.scheduleEmu(state) // ← will apply once, using latest bounds
-    }
 
-    if (tabId) {
-      const { state } = S.resolve(tabId)
-      if (!state) return
-      apply(state)
-    } else {
-      for (const [, s] of views) apply(s)
+      if (tabId) {
+        const { state } = S.resolve(tabId)
+        if (!state) continue
+        apply(state)
+      } else {
+        for (const [, s] of views) apply(s)
+      }
     }
   }
   )
