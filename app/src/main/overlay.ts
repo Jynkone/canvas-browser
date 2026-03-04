@@ -131,6 +131,7 @@ function effToBucketKey(eff: number): ZoomBucket {
 export function setupOverlayIPC(getWindow: () => BrowserWindow | null): void {
   const views = new Map<string, ViewState>()
 
+
   const setLifecycle = async (wc: WebContents, target: 'frozen' | 'active'): Promise<void> => {
     const dbg: ElectronDebugger = wc.debugger;
     if (!dbg.isAttached()) dbg.attach('1.3');
@@ -318,57 +319,48 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null): void {
 
     // add force?: boolean
     setEff(view: WebContentsView, eff: number, state?: ViewState) {
-      // Native (>= 25%): clear emulation once and use Chrome zoom
       if (eff >= CHROME_MIN) {
         if (state?.lastAppliedZoomKey !== undefined) {
           try { S.clearEmuIfAny(view) } catch { }
           state.lastAppliedZoomKey = undefined
           if (state) state.lastAppliedEmu = undefined
         }
+
         try { view.webContents.setZoomFactor(eff) } catch { }
         return
       }
 
-      // ---- Emulation path (< 25%): exact 5 / 15 / 20 only ----
-      const bucket = effToBucketKey(eff) // 5 | 15 | 20
+      const bucket = effToBucketKey(eff)
 
-      // Current view bounds
-      let b: { width: number; height: number }
-      try { b = view.getBounds() } catch { return }
-      if (b.width <= 0 || b.height <= 0) return
+      const b = state?.lastBounds
+      if (!b || b.w <= 0 || b.h <= 0) return
 
-      // Compute emu dims using the *bottom of the bucket* so it still fits at 5/15/20
-      const bucketEff = bucket / 100                // 0.05, 0.15, 0.20
-      const currentEff = Math.max(0.001, Math.min(eff, CHROME_MIN)) // defensive clamp
-      const shrinkToBottom = Math.min(1, bucketEff / currentEff)    // <= 1
+      const bucketEff = bucket / 100
+      const currentEff = Math.max(0.001, Math.min(eff, CHROME_MIN))
+      const shrinkToBottom = Math.min(1, bucketEff / currentEff)
 
-      // Future minimal bounds at the bottom of this bucket
-      const targetW = Math.max(1, Math.floor(b.width * shrinkToBottom))
-      const targetH = Math.max(1, Math.floor(b.height * shrinkToBottom))
+      const targetW = Math.max(1, Math.round(b.w * shrinkToBottom))
+      const targetH = Math.max(1, Math.round(b.h * shrinkToBottom))
 
-      // Emulation scale to achieve bucketEff while Chrome is held at CHROME_MIN
-      const scale = bucketEff / CHROME_MIN          // e.g. 0.05 / 0.25 = 0.20 at 5%
-
-      // FLOOR so rendered content never exceeds (future) bounds — 5% always fits
+      const scale = bucketEff / CHROME_MIN
       const emuW = Math.max(1, Math.floor(targetW / scale))
       const emuH = Math.max(1, Math.floor(targetH / scale))
 
-      // Skip if nothing changes (same bucket AND same emu dims)
       const sameBucket = state?.lastAppliedZoomKey === bucket
       const sameDims = state?.lastAppliedEmu?.w === emuW && state?.lastAppliedEmu?.h === emuH
       if (sameBucket && sameDims) return
 
-      // Hold Chrome at its minimum native zoom while emulating below it
       try { view.webContents.setZoomFactor(CHROME_MIN) } catch { }
 
       try {
         const dbg: ElectronDebugger = view.webContents.debugger
-        if (!dbg.isAttached()) dbg.attach('1.3')
+        if (!dbg.isAttached()) {
+          try { dbg.attach('1.3') } catch { }
+        }
 
         void dbg.sendCommand('Emulation.setDeviceMetricsOverride', {
           width: emuW,
           height: emuH,
-          // Use 1 for determinism (0 = auto DPR, can cause “shifts” on HiDPI)
           deviceScaleFactor: 1,
           scale,
           mobile: false,
@@ -385,7 +377,6 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null): void {
         }
       } catch { }
     },
-
 
     reapply(state: ViewState) {
       try {
@@ -739,6 +730,7 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null): void {
           },
         })
         wireFlagsFor(tabId, view.webContents)
+        view.webContents.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
 
         // Auto-allow clipboard read & write for every tab, prompt only for media
         view.webContents.session.setPermissionRequestHandler(
@@ -932,7 +924,6 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null): void {
           flushBrowserState()
           emitNavHint(tabId)
         })
-        view.webContents.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
 
         view.webContents.on('did-navigate-in-page', () => {
           if (!state) return
@@ -1267,6 +1258,7 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null): void {
 
         })
 
+
         await S.reapply(state)
         try { await view.webContents.loadURL(savedUrl) } catch { }
 
@@ -1320,35 +1312,52 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null): void {
   }
   )
 
+
   ipcMain.handle('overlay:set-bounds', async (_e, payload: BoundsPayload | BoundsPayload[]) => {
     const list = Array.isArray(payload) ? payload : [payload]
+
     for (const { tabId, rect } of list) {
       const { state } = S.resolve(tabId)
       if (!state) continue
 
       const { x, y, w, h } = S.roundRect(rect)
+
+      const screenX = x + BORDER
+      const screenY = y + BORDER
+      const screenW = Math.max(1, w - 2 * BORDER)
+      const screenH = Math.max(1, h - 2 * BORDER)
+
       const b = state.lastBounds
 
-      if (!b || x !== b.x || y !== b.y || w !== b.w || h !== b.h) {
-        state.lastBounds = { x, y, w, h }
+      if (
+        !b ||
+        screenX !== b.x ||
+        screenY !== b.y ||
+        screenW !== b.w ||
+        screenH !== b.h
+      ) {
+        state.lastBounds = {
+          x: screenX,
+          y: screenY,
+          w: screenW,
+          h: screenH
+        }
+
         try {
           state.view.setBounds({
-            x: x + BORDER,
-            y: y + BORDER,
-            width: w - 2 * BORDER,
-            height: h - 2 * BORDER,
-          });
+            x: screenX,
+            y: screenY,
+            width: screenW,
+            height: screenH
+          })
         } catch { }
       }
 
-      // If we’re under 25% and a bucket is pending, (re)schedule the single apply
       if (S.currentEff() < CHROME_MIN && state.pendingBucket != null) {
         S.scheduleEmu(state)
       }
     }
-  }
-  )
-
+  })
   ipcMain.handle('overlay:set-lifecycle', (_event, payload: { tabId: string; lifecycle: LifecycleKind; hasScreenshot: boolean; }) => {
     const { tabId, lifecycle, hasScreenshot } = payload;
     const prev: PersistedTabState | undefined = browserState[tabId];
@@ -1415,23 +1424,37 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null): void {
 
   ipcMain.handle('overlay:set-zoom', async (_e, payload: ZoomPayload | ZoomPayload[]): Promise<void> => {
     const list = Array.isArray(payload) ? payload : [payload]
+
     for (const { tabId, factor } of list) {
       canvasZoom = factor || 1
       const eff = S.currentEff()
 
       const apply = (state: ViewState) => {
         if (eff >= CHROME_MIN) {
-          // Native zoom: clear any pending emu and apply once
           state.pendingBucket = null
-          if (state.emuTimer) { clearTimeout(state.emuTimer); state.emuTimer = null }
+
+          if (state.emuTimer) {
+            clearTimeout(state.emuTimer)
+            state.emuTimer = null
+          }
+
+          // Prevent redundant native zoom
+          if (state.lastAppliedZoomKey === eff) return
+
+          state.lastAppliedZoomKey = effToBucketKey(eff)
           S.setEff(state.view, eff, state)
           return
         }
-        // Emulation path: compute bucket and coalesce
+
         const bucket = effToBucketKey(eff)
-        if (state.lastAppliedZoomKey === bucket || state.pendingBucket === bucket) return
+
+        if (
+          state.lastAppliedZoomKey === bucket ||
+          state.pendingBucket === bucket
+        ) return
+
         state.pendingBucket = bucket
-        S.scheduleEmu(state) // ← will apply once, using latest bounds
+        S.scheduleEmu(state)
       }
 
       if (tabId) {
@@ -1442,9 +1465,7 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null): void {
         for (const [, s] of views) apply(s)
       }
     }
-  }
-  )
-
+  })
   ipcMain.handle('overlay:hide', async (_e, p?: { tabId?: string }): Promise<void> => {
     const win = getWindow()
     if (!win) return

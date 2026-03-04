@@ -254,18 +254,14 @@ export const NavigationBar: React.FC<NavigationBarProps> = ({
         pointerEvents: 'auto',
         zIndex: 1000,
       }}
-      onPointerDown={(e) => e.stopPropagation()}
-      onPointerUp={(e) => e.stopPropagation()}
+      // Allow pointer events to bubble so TLDRAW can drag the window from the navbar background
       onDoubleClick={(e) => e.stopPropagation()}
-      onMouseDown={(e) => e.stopPropagation()}
-      onMouseUp={(e) => e.stopPropagation()}
-      onClick={(e) => e.stopPropagation()}
     >
       {buttonConfigs.map((config) => (
         <button
           key={config.key}
           type="button"
-          onPointerDown={() => handleButtonPress(config)}
+          onPointerDown={(e) => { e.stopPropagation(); handleButtonPress(config); }}
           disabled={config.disabled}
           style={getButtonStyle(config)}
           title={config.title}
@@ -274,7 +270,7 @@ export const NavigationBar: React.FC<NavigationBarProps> = ({
         </button>
       ))}
 
-      <form onSubmit={handleSubmit} style={{ flex: 1, display: 'flex' }}>
+      <form onSubmit={handleSubmit} style={{ flex: 1, display: 'flex' }} onPointerDown={(e) => e.stopPropagation()}>
         <input
           type="text"
           value={urlInput}
@@ -310,15 +306,15 @@ export const NavigationBar: React.FC<NavigationBarProps> = ({
       </form>
 
       {/* Right side: Fit screen toggle */}
-<button
-  type="button"
-  aria-label={fitMode ? 'Exit fit' : 'Fit screen'}
-  title={fitMode ? 'Exit fit' : 'Fit screen'}
-  onPointerDown={onToggleFit}
-  style={getFitButtonStyle()}
->
-  {fitMode ? '⤡' : '⤢'}
-</button>
+      <button
+        type="button"
+        aria-label={fitMode ? 'Exit fit' : 'Fit screen'}
+        title={fitMode ? 'Exit fit' : 'Fit screen'}
+        onPointerDown={(e) => { e.stopPropagation(); onToggleFit(); }}
+        style={getFitButtonStyle()}
+      >
+        {fitMode ? '⤡' : '⤢'}
+      </button>
 
 
       {isLoading && (

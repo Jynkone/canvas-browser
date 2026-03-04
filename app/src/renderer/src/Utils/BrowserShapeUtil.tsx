@@ -10,8 +10,27 @@ import {
   resizeBox,
   useEditor,
   Box,
+  VecLike
 } from 'tldraw'
 import { NavigationBar, NAV_BAR_HEIGHT } from '../components/NavigationBar'
+
+// Custom geometry that has a tight bounding box but a large hit area
+class BrowserGrabGeometry extends Rectangle2d {
+  constructor(config: { x: number; y: number; width: number; height: number; isFilled: boolean }) {
+    super(config)
+  }
+
+  override hitTestPoint(point: VecLike, margin = 0, _hitInside = false): boolean {
+    const { bounds } = this
+    const m = margin + DRAG_GUTTER
+    return !(
+      point.x < bounds.minX - m ||
+      point.y < bounds.minY - m ||
+      point.x > bounds.maxX + m ||
+      point.y > bounds.maxY + m
+    )
+  }
+}
 
 
 export type BrowserShape = TLBaseShape<
@@ -26,9 +45,8 @@ const NEW_TAB_EVENT = 'paper:new-tab' as const
 const PLACEMENT_EVENT = 'paper:placement-changed' as const
 
 
-const DRAG_GUTTER = 60 // invisible move hit area (no longer affects visuals/geometry)
+const DRAG_GUTTER = 80 // Invisible grab margin around the window
 const MIN_W = 300
-// Geometry is tight now; don't bake gutters into visual min height.
 const MIN_H = 225 + NAV_BAR_HEIGHT
 
 type NavState = { currentUrl: string; canGoBack: boolean; canGoForward: boolean; title: string }
@@ -85,9 +103,8 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
     return { ...r, props: { ...r.props, w, h } }
   }
   override getGeometry(shape: BrowserShape) {
-    // Tight geometry == real box; keeps resize handles at true corners.
     const { w, h } = shape.props
-    return new Rectangle2d({
+    return new BrowserGrabGeometry({
       x: 0,
       y: 0,
       width: w,
@@ -314,12 +331,16 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
         { id: s.id, type: 'browser-shape', x, y, props: { ...s.props, w: targetW, h: targetH } },
       ])
     }
-
     /** Zoom to the true box (no gutter deflation). */
     const zoomToShapeNow = (s: BrowserShape): void => {
       const pb = editor.getShapePageBounds(s.id)
       if (!pb) return
-      editor.zoomToBounds(new Box(pb.x, pb.y, pb.w, pb.h), { inset: 0 })
+      editor.zoomToBounds(new Box(
+        pb.x,
+        pb.y,
+        Math.max(1, pb.w),
+        Math.max(1, pb.h)
+      ), { inset: 0 })
     }
 
     function startInputGuards(): () => void {
@@ -502,7 +523,13 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
           height: shape.props.h,
           position: 'relative',
           pointerEvents: 'auto',
-          cursor: 'default',
+          cursor: 'move',
+        }}
+        onPointerDown={() => {
+          if (!isAncestorSelected(editor, shape.id as TLShapeId)) {
+            editor.bringToFront([shape.id])
+            editor.select(shape.id)
+          }
         }}
       >
         {/* Column: navbar + content */}
@@ -513,6 +540,12 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
             display: 'flex',
             flexDirection: 'column',
             position: 'relative',
+            cursor: 'default',
+            boxShadow: '0 4px 20px rgba(0,0,0,0.15), 0 0 0 1px rgba(0,0,0,0.05)',
+            borderRadius: '6px',
+            background: '#fff',
+            overflow: 'visible', // allows borders to show cleanly
+            pointerEvents: 'auto',
           }}
         >
           {/* Navbar gets priority: raise this shape on hover/press so it beats neighbors */}
@@ -525,9 +558,8 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
                 editor.select(shape.id)
               }
             }}
-            onPointerDown={(e) => {
+            onPointerDown={() => {
               if (isAncestorSelected(editor, shape.id as TLShapeId)) {
-                e.stopPropagation()
                 return
               }
               editor.bringToFront([shape.id])
@@ -617,66 +649,28 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
           </div>
         </div>
 
-        {/* -------- Invisible OUTER drag gutters (effortless grabbing; no visuals) -------- */}
-        {/* Place gutters under the navbar (zIndex: 1) so the nav always wins */}
+        {/* -------- Invisible OUTER drag gutters (large invisible grab handle) -------- */}
+        {/* We place these absolutely outside the window and hook into TLDRAW selection manually */}
         <div
+          onPointerDown={() => {
+            if (!isAncestorSelected(editor, shape.id as TLShapeId)) {
+              editor.bringToFront([shape.id])
+              editor.select(shape.id)
+            }
+          }}
           style={{
             position: 'absolute',
             top: -DRAG_GUTTER,
             left: -DRAG_GUTTER,
             right: -DRAG_GUTTER,
-            height: DRAG_GUTTER,
+            bottom: -DRAG_GUTTER,
+            zIndex: -1, /* Behind the visual window */
             cursor: 'move',
             pointerEvents: 'auto',
             background: 'transparent',
-            zIndex: 1,
           }}
         />
 
-        {/* Bottom gutter */}
-        <div
-          style={{
-            position: 'absolute',
-            bottom: -DRAG_GUTTER,
-            left: -DRAG_GUTTER,
-            right: -DRAG_GUTTER,
-            height: DRAG_GUTTER,
-            cursor: 'move',
-            pointerEvents: 'auto',
-            background: 'transparent',
-            zIndex: 1,
-          }}
-        />
-
-        {/* Left gutter */}
-        <div
-          style={{
-            position: 'absolute',
-            top: -DRAG_GUTTER,
-            bottom: -DRAG_GUTTER,
-            left: -DRAG_GUTTER,
-            width: DRAG_GUTTER,
-            cursor: 'move',
-            pointerEvents: 'auto',
-            background: 'transparent',
-            zIndex: 1,
-          }}
-        />
-
-        {/* Right gutter */}
-        <div
-          style={{
-            position: 'absolute',
-            top: -DRAG_GUTTER,
-            bottom: -DRAG_GUTTER,
-            right: -DRAG_GUTTER,
-            width: DRAG_GUTTER,
-            cursor: 'move',
-            pointerEvents: 'auto',
-            background: 'transparent',
-            zIndex: 1,
-          }}
-        />
       </HTMLContainer>
     )
 

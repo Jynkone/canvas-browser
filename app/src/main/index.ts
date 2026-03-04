@@ -11,7 +11,10 @@ const __dirname = dirname(__filename);
 app.commandLine.appendSwitch("force_high_performance_gpu");
 app.commandLine.appendSwitch("disable-renderer-backgrounding");
 // Optional: also disable pinch zoom at Chromium level (belt + suspenders)
-app.commandLine.appendSwitch("disable-pinch");
+//app.commandLine.appendSwitch("disable-pinch");
+app.commandLine.appendSwitch("disable-site-isolation-trials");
+app.commandLine.appendSwitch("process-per-site");
+
 
 // Single instance lock
 if (!app.requestSingleInstanceLock()) {

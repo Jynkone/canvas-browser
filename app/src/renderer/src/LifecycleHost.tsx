@@ -255,14 +255,15 @@ export default function LifecycleHost({ editorRef }: Props) {
         const wasActive = window.__activeTabs!.has(tabId);
         (async () => {
           if (needThumb && wasActive) {
-            const bounds = ed.getShapePageBounds(shapeId) // <- define it
+            const bounds = ed.getShapePageBounds(shapeId)
             if (bounds) {
               const zoom = ed.getCamera().z || 1
               const dpr = window.devicePixelRatio || 1
-              const widthPx = Math.round(bounds.w * zoom * dpr)
+              const shapeType = ed.getShape(shapeId)
+              const shapeW = (shapeType as any)?.props?.w ?? bounds.w
+              const widthPx = Math.round(shapeW * zoom * dpr)
               await snapshot(tabId, widthPx)             // forwards to payload.maxWidth
             }
-            // if bounds is null this frame, just skip snapshot
           }
           await window.overlay.hide({ tabId })
           window.__activeTabs!.delete(tabId)
@@ -325,8 +326,11 @@ export default function LifecycleHost({ editorRef }: Props) {
         const pb = ed.getShapePageBounds(shapeId)
         if (!pb) continue
 
-        const screenPos = ed.pageToScreen({ x: pb.x, y: pb.y })
         const shapeSize = { w: (shape as any).props.w, h: (shape as any).props.h }
+        const dx = (pb.w - shapeSize.w) / 2
+        const dy = (pb.h - shapeSize.h) / 2
+
+        const screenPos = ed.pageToScreen({ x: pb.x + dx, y: pb.y + dy })
 
         const rect = {
           x: Math.round(screenPos.x),
