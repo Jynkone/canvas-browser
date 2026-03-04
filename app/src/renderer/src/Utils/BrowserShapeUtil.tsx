@@ -509,145 +509,45 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
     // ---- Render ------------------------------------------------------------
     const BORDER = 3 as const // keep tldraw blue outline visible without shrinking content
 
-    type DragState = {
-      pointerId: number
-      startPage: { x: number; y: number }
-      targetId: TLShapeId
-    }
-    const dragRef = useRef<DragState | null>(null)
 
-    /** Topmost group ancestor id (or null if none). */
-    const getTopGroupAncestorId = (ed: Editor, id: TLShapeId): TLShapeId | null => {
-      let parentId: TLParentId | null = ed.getShape(id)?.parentId ?? null
-      let topGroupId: TLShapeId | null = null
-      while (parentId) {
-        const parentShapeId = parentId as unknown as TLShapeId
-        const parent = ed.getShape(parentShapeId)
-        if (parent?.type === 'group') topGroupId = parentShapeId
-        parentId = parent?.parentId ?? null
+
+    type TabThumb = { dataUrlWebp?: string }
+
+    function SnapshotImage(
+      { tabIdRef, liveActive }: {
+        tabIdRef: React.RefObject<string | null>
+        liveActive: boolean
       }
-      return topGroupId
+    ) {
+      if (liveActive) return null
+      const id = tabIdRef.current
+      if (!id) return null
+
+      const rec = window.__tabThumbs?.get(id) as TabThumb | undefined
+      const src = rec?.dataUrlWebp ?? null
+      if (!src) return null
+
+      return (
+        <img
+          src={src}
+          alt=""
+          style={{
+            position: 'absolute',
+            inset: 0,
+            width: '100%',
+            height: '100%',
+            // we capture at the display size; don't ask the browser to resample:
+            objectFit: 'fill',
+            pointerEvents: 'none',
+            willChange: 'transform',
+            contain: 'paint',
+            transform: 'translateZ(0)',
+          }}
+          decoding="async"
+          draggable={false}
+        />
+      )
     }
-
-    /** Runtime guard for shapes that expose x/y (groups & normal shapes). */
-    const hasXY = (s: unknown): s is { x: number; y: number } => {
-      return !!s &&
-        typeof (s as { x?: unknown }).x === 'number' &&
-        typeof (s as { y?: unknown }).y === 'number'
-    }
-
-    const gutterDown = (e: React.PointerEvent<HTMLDivElement>): void => {
-      const selectedIds = editor.getSelectedShapeIds()
-      const isMultiSelect = selectedIds.length > 1
-      if (isMultiSelect) {
-        // Let tldraw handle multi-selection movement
-        return
-      }
-
-      // Prefer moving the topmost group if this shape lives in one
-      const selfId = shape.id as TLShapeId
-      const groupId = getTopGroupAncestorId(editor, selfId)
-      const targetId = groupId ?? selfId
-
-      const target = editor.getShape(targetId)
-      if (!hasXY(target)) return
-
-      // Select the movement target and bring it to front
-      editor.select(targetId)
-      editor.bringToFront([targetId])
-
-      const start = editor.screenToPage({ x: e.clientX, y: e.clientY })
-      dragRef.current = {
-        pointerId: e.pointerId,
-        startPage: start,
-        targetId,
-      }
-
-      e.currentTarget.setPointerCapture(e.pointerId)
-      e.preventDefault()
-      e.stopPropagation()
-    }
-
-    const gutterMove = (e: React.PointerEvent<HTMLDivElement>): void => {
-      const st = dragRef.current
-      if (!st) return
-
-      const now = editor.screenToPage({ x: e.clientX, y: e.clientY })
-      const dx = now.x - st.startPage.x
-      const dy = now.y - st.startPage.y
-      if (dx === 0 && dy === 0) return
-
-      const target = editor.getShape(st.targetId)
-      if (!target || !hasXY(target)) return
-
-      if (target.type === 'group') {
-        editor.updateShapes([
-          { id: st.targetId, type: 'group', x: target.x + dx, y: target.y + dy },
-        ])
-      } else {
-        editor.updateShapes([
-          {
-            id: st.targetId,
-            type: 'browser-shape',
-            x: target.x + dx,
-            y: target.y + dy,
-            props: { ...shape.props },
-          },
-        ])
-      }
-
-      // Advance baseline so we apply incremental deltas (smooth drag)
-      st.startPage = now
-
-      e.preventDefault()
-      e.stopPropagation()
-    }
-
-    const gutterEnd = (e: React.PointerEvent<HTMLDivElement>): void => {
-      const st = dragRef.current
-      if (st) {
-        try { e.currentTarget.releasePointerCapture(st.pointerId) } catch { }
-      }
-      dragRef.current = null
-    }
-
-type TabThumb = { dataUrlWebp?: string }
-
-function SnapshotImage(
-  { tabIdRef, liveActive }: {
-    tabIdRef: React.RefObject<string | null>
-    liveActive: boolean
-  }
-) {
-  if (liveActive) return null
-  const id = tabIdRef.current
-  if (!id) return null
-
-  const rec = window.__tabThumbs?.get(id) as TabThumb | undefined
-  const src = rec?.dataUrlWebp ?? null
-  if (!src) return null
-
-  return (
-    <img
-      src={src}
-      alt=""
-      style={{
-        position: 'absolute',
-        inset: 0,
-        width: '100%',
-        height: '100%',
-        // we capture at the display size; don't ask the browser to resample:
-        objectFit: 'fill',
-        pointerEvents: 'none',
-        willChange: 'transform',
-        contain: 'paint',
-        transform: 'translateZ(0)',
-      }}
-      decoding="async"
-      draggable={false}
-    />
-  )
-}
 
 
 
@@ -756,7 +656,7 @@ function SnapshotImage(
             }}
           >
 
-                         <SnapshotImage tabIdRef={tabIdRef} liveActive={liveActive}/>
+            <SnapshotImage tabIdRef={tabIdRef} liveActive={liveActive} />
 
             {/* Live web content: inset by BORDER so the blue outline is never covered */}
             <div
@@ -776,10 +676,6 @@ function SnapshotImage(
         {/* -------- Invisible OUTER drag gutters (effortless grabbing; no visuals) -------- */}
         {/* Place gutters under the navbar (zIndex: 1) so the nav always wins */}
         <div
-          onPointerDown={gutterDown}
-          onPointerMove={gutterMove}
-          onPointerUp={gutterEnd}
-          onPointerCancel={gutterEnd}
           style={{
             position: 'absolute',
             top: -DRAG_GUTTER,
@@ -795,10 +691,6 @@ function SnapshotImage(
 
         {/* Bottom gutter */}
         <div
-          onPointerDown={gutterDown}
-          onPointerMove={gutterMove}
-          onPointerUp={gutterEnd}
-          onPointerCancel={gutterEnd}
           style={{
             position: 'absolute',
             bottom: -DRAG_GUTTER,
@@ -814,10 +706,6 @@ function SnapshotImage(
 
         {/* Left gutter */}
         <div
-          onPointerDown={gutterDown}
-          onPointerMove={gutterMove}
-          onPointerUp={gutterEnd}
-          onPointerCancel={gutterEnd}
           style={{
             position: 'absolute',
             top: -DRAG_GUTTER,
@@ -833,10 +721,6 @@ function SnapshotImage(
 
         {/* Right gutter */}
         <div
-          onPointerDown={gutterDown}
-          onPointerMove={gutterMove}
-          onPointerUp={gutterEnd}
-          onPointerCancel={gutterEnd}
           style={{
             position: 'absolute',
             top: -DRAG_GUTTER,
