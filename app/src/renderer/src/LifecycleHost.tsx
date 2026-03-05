@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef } from 'react'
 import type { Editor, TLShapeId } from 'tldraw'
 import { useLifecycleManager } from './useLifecycleManager'
-import type { OverlayAPI, BoundsPayload } from '../../types/overlay'
+import type { OverlayAPI } from '../../types/overlay'
 import { NAV_BAR_HEIGHT } from './components/NavigationBar'
 import { browserTabSuspendRegistry } from './Utils/BrowserShapeUtil'
 
@@ -154,6 +154,8 @@ export default function LifecycleHost({ editorRef }: Props) {
         const vpB: Bounds = { x: vp.minX, y: vp.minY, w: vp.maxX - vp.minX, h: vp.maxY - vp.minY }
         const out: Array<{ id: TLShapeId; w: number; h: number; overlap: number }> = []
         for (const s of ed.getCurrentPageShapes()) {
+          if (s.type !== 'browser-shape') continue  // ← ADD THIS
+
           const id = s.id as TLShapeId
           const b = getBounds(ed, id)
           if (!b) continue
@@ -288,7 +290,7 @@ export default function LifecycleHost({ editorRef }: Props) {
   useEffect(() => {
     let raf = 0
     let previousActiveTabs = new Set<string>()
-    const lastSent = new Map<string, string>() // tabId -> json of last rect/size
+    const lastSent = new Map<string, { x: number; y: number; w: number; h: number }>() // tabId -> rect
     const lastZoomSent = new Map<string, number>()
     const ZOOM_EPS = 0.0125
 
@@ -309,7 +311,7 @@ export default function LifecycleHost({ editorRef }: Props) {
       }
       previousActiveTabs = new Set(activeTabs)
 
-      const batch: BoundsPayload[] = []
+      const batch: Array<{ tabId: string; rect: { x: number; y: number; width: number; height: number }; shapeSize: { w: number; h: number } }> = []
       const zoomBatch: { tabId: string; factor: number }[] = []
       const zoom = ed.getZoomLevel()
 
@@ -323,32 +325,46 @@ export default function LifecycleHost({ editorRef }: Props) {
         const shape = ed.getShape(shapeId)
         if (!shape || shape.type !== 'browser-shape') continue
 
-        const pb = ed.getShapePageBounds(shapeId)
-        if (!pb) continue
+        const shapeProps = (shape as any).props
+        const shapeSize = { w: shapeProps?.w ?? 800, h: shapeProps?.h ?? 600 }
 
-        const shapeSize = { w: (shape as any).props.w, h: (shape as any).props.h }
-        const dx = (pb.w - shapeSize.w) / 2
-        const dy = (pb.h - shapeSize.h) / 2
+        // Fast bounding box without tree traversal (absolute root relative)
+        const screenPos = ed.pageToScreen({ x: shape.x || 0, y: shape.y || 0 })
 
-        const screenPos = ed.pageToScreen({ x: pb.x + dx, y: pb.y + dy })
+        const x = Math.round(screenPos.x) || 0
+        const y = Math.round(screenPos.y + NAV_BAR_HEIGHT * zoom) || 0
+        let w = Math.round(shapeSize.w * zoom) || 1
+        let h = Math.round((shapeSize.h - NAV_BAR_HEIGHT) * zoom) || 1
 
-        const rect = {
-          x: Math.round(screenPos.x),
-          y: Math.round(screenPos.y + NAV_BAR_HEIGHT * zoom),
-          width: Math.round(shapeSize.w * zoom),
-          height: Math.round((shapeSize.h - NAV_BAR_HEIGHT) * zoom),
+        if (w <= 0) w = 1
+        if (h <= 0) h = 1
+
+        // Extreme safety guard explicitly filtering NaNs
+        if (Number.isNaN(x) || Number.isNaN(y) || Number.isNaN(w) || Number.isNaN(h)) {
+          console.warn('[LifecycleHost] Skipping NaN bounds for tab:', tabId)
+          continue
         }
+
+        const rect = { x, y, width: w, height: h }
 
         const force = newlyActive.has(tabId)
 
-        const key = JSON.stringify({ rect, shapeSize })
-        if (force || lastSent.get(tabId) !== key) {
-          lastSent.set(tabId, key)
+        const last = lastSent.get(tabId)
+        if (
+          force ||
+          !last ||
+          last.x !== rect.x ||
+          last.y !== rect.y ||
+          last.w !== rect.width ||
+          last.h !== rect.height
+        ) {
+          lastSent.set(tabId, { x: rect.x, y: rect.y, w: rect.width, h: rect.height })
           batch.push({ tabId, rect, shapeSize })
         }
 
         if (force || Math.abs(zoom - (lastZoomSent.get(tabId) ?? -1)) > ZOOM_EPS) {
           lastZoomSent.set(tabId, zoom)
+          // For active shapes, we actually tell the main process the exact zoom.
           zoomBatch.push({ tabId, factor: zoom })
         }
       }
