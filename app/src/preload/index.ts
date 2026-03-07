@@ -1,4 +1,5 @@
 import { contextBridge, ipcRenderer } from 'electron'
+ipcRenderer.setMaxListeners(0)
 import type { IpcRendererEvent } from 'electron' // ← add this
 import type {
   OverlayAPI,
@@ -90,7 +91,34 @@ const overlay: OverlayAPI = {
     ipcRenderer.on(ch, h)
     return () => ipcRenderer.removeListener(ch, h)
   },
+  onFrame: (callback) => {
+    const ch = 'overlay-video-frame'
+    const h = (_e: IpcRendererEvent, data: { tabId: string; handle: Uint8Array }) => callback(data)
+    ipcRenderer.on(ch, h)
+    return () => ipcRenderer.removeListener(ch, h)
+  },
 
+  // Takes the raw Windows GPU Handle and translates it into a web ImageBitmap
+  decodeGPUFrame: async (handle: Uint8Array): Promise<ImageBitmap | null> => {
+    try {
+      const pixelData = await ipcRenderer.invoke('overlay:decode-handle', handle);
+
+      // Guard against 0x0 frames
+      if (!pixelData || pixelData.width <= 0 || pixelData.height <= 0) return null;
+
+      // Use a zero-copy reference to the buffer memory
+      const imageData = new ImageData(
+        new Uint8ClampedArray(pixelData.buffer.buffer, pixelData.buffer.byteOffset, pixelData.buffer.byteLength),
+        pixelData.width,
+        pixelData.height
+      );
+
+      return await createImageBitmap(imageData);
+    } catch {
+      return null;
+    }
+  },
 } satisfies OverlayAPI
+
 
 contextBridge.exposeInMainWorld('overlay', overlay)

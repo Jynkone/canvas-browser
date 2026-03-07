@@ -170,7 +170,10 @@ export interface OverlayAPI {
   getPersistedState(): Promise<PersistedStateResult>
 
   saveThumb(payload: { tabId: string; url: string; dataUrlWebp: string }): Promise<{ ok: true; thumbPath: string } | { ok: false }>
+  onFrame(cb: (data: { tabId: string; handle: Uint8Array }) => void): () => void
+  decodeGPUFrame(handle: Uint8Array): Promise<ImageBitmap | null>
 }
+
 
 // electron augmentation stays the same …
 import 'electron'

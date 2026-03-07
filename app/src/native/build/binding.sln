@@ -1,0 +1,42 @@
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio 2015
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "(..)", "..\..", "{4D5635DD-F765-2416-1825-649C5AA6477E}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "(..)", "..\..\..", "{1ED8F92F-E1C2-801C-C030-847030F148AA}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "(node_modules)", "..\..\..\node_modules", "{FA7649AF-6EBF-A752-C27D-B0AB851E5B84}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "(node-addon-api)", "..\..\..\node_modules\node-addon-api", "{B4D7C1CC-1957-8C1A-820E-B6ABB2AC2AC9}"
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "nothing", "..\..\node_modules\node-addon-api\nothing.vcxproj", "{AC8EB692-7622-9786-5FA3-C304266AE309}"
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "texture_bridge", "texture_bridge.vcxproj", "{2A20D4CD-62D8-3731-AF42-92ABEDBCB458}"
+	ProjectSection(ProjectDependencies) = postProject
+		{AC8EB692-7622-9786-5FA3-C304266AE309} = {AC8EB692-7622-9786-5FA3-C304266AE309}
+	EndProjectSection
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Release|x64 = Release|x64
+		Debug|x64 = Debug|x64
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{2A20D4CD-62D8-3731-AF42-92ABEDBCB458}.Release|x64.ActiveCfg = Release|x64
+		{2A20D4CD-62D8-3731-AF42-92ABEDBCB458}.Release|x64.Build.0 = Release|x64
+		{2A20D4CD-62D8-3731-AF42-92ABEDBCB458}.Debug|x64.ActiveCfg = Debug|x64
+		{2A20D4CD-62D8-3731-AF42-92ABEDBCB458}.Debug|x64.Build.0 = Debug|x64
+		{AC8EB692-7622-9786-5FA3-C304266AE309}.Release|x64.ActiveCfg = Release|x64
+		{AC8EB692-7622-9786-5FA3-C304266AE309}.Release|x64.Build.0 = Release|x64
+		{AC8EB692-7622-9786-5FA3-C304266AE309}.Debug|x64.ActiveCfg = Debug|x64
+		{AC8EB692-7622-9786-5FA3-C304266AE309}.Debug|x64.Build.0 = Debug|x64
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(NestedProjects) = preSolution
+		{1ED8F92F-E1C2-801C-C030-847030F148AA} = {4D5635DD-F765-2416-1825-649C5AA6477E}
+		{FA7649AF-6EBF-A752-C27D-B0AB851E5B84} = {1ED8F92F-E1C2-801C-C030-847030F148AA}
+		{B4D7C1CC-1957-8C1A-820E-B6ABB2AC2AC9} = {FA7649AF-6EBF-A752-C27D-B0AB851E5B84}
+		{AC8EB692-7622-9786-5FA3-C304266AE309} = {B4D7C1CC-1957-8C1A-820E-B6ABB2AC2AC9}
+	EndGlobalSection
+EndGlobal

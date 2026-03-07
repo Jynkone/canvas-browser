@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef } from 'react'
+/*import { useEffect, useMemo, useRef } from 'react'
 import type { Editor, TLShapeId } from 'tldraw'
 import { useLifecycleManager } from './useLifecycleManager'
 import type { OverlayAPI } from '../../types/overlay'
@@ -71,6 +71,7 @@ if (!window.__activeTabs) window.__activeTabs = new Set()
 export default function LifecycleHost({ editorRef }: Props) {
   const lastInteraction = useRef<Map<TLShapeId, number>>(new Map())
   const tabToShape = useRef(new Map<string, TLShapeId>())
+
   useEffect(() => {
     const off = window.overlay.onNotice((n) => {
       if ((n as { kind?: unknown }).kind === 'flags') {
@@ -113,9 +114,11 @@ export default function LifecycleHost({ editorRef }: Props) {
       offNav()
     }
   }, [])
+
   const flagsByTab = useRef(
     new Map<string, { audible: boolean; capturing: boolean; devtools: boolean; downloads: boolean; pinned: boolean }>()
   )
+
   const bumpInteractionByShapeId = (shapeId: TLShapeId): void => {
     lastInteraction.current.set(shapeId, performance.now())
   }
@@ -132,7 +135,10 @@ export default function LifecycleHost({ editorRef }: Props) {
     const { tabId } = info
     const tag = window.__tabState?.get(tabId)
     if (tag === 'live') return
-    if (tag === 'frozen') {
+
+    if (tag === 'discarded') {
+      await window.overlay.createTab({ shapeId: tabId, restore: true })
+    } else if (tag === 'frozen') {
       await window.overlay.thaw({ tabId })
     }
     await window.overlay.show({ tabId })
@@ -154,7 +160,7 @@ export default function LifecycleHost({ editorRef }: Props) {
         const vpB: Bounds = { x: vp.minX, y: vp.minY, w: vp.maxX - vp.minX, h: vp.maxY - vp.minY }
         const out: Array<{ id: TLShapeId; w: number; h: number; overlap: number }> = []
         for (const s of ed.getCurrentPageShapes()) {
-          if (s.type !== 'browser-shape') continue  // ← ADD THIS
+          if (s.type !== 'browser-shape') continue
 
           const id = s.id as TLShapeId
           const b = getBounds(ed, id)
@@ -192,24 +198,9 @@ export default function LifecycleHost({ editorRef }: Props) {
     }
   }, [editorRef])
 
-  const snapshot = useMemo(() => {
-    return async (tabId: string, maxWidth = 896): Promise<void> => {
-      try {
-        const nav = await window.overlay.getNavigationState({ tabId })
-        if (!('ok' in nav) || !nav.ok || nav.isLoading) return
-        const currentUrl = nav.currentUrl ?? 'about:blank'
-        const res = await window.overlay.snapshot({ tabId, maxWidth })
-        if (!('ok' in res) || !res.ok || typeof res.dataUrl !== 'string' || res.dataUrl.length === 0) return
-        const webp = res.dataUrl
-        window.__tabThumbs?.set(tabId, { url: currentUrl, dataUrlWebp: webp })
-        void window.overlay.saveThumb({ tabId, url: currentUrl, dataUrlWebp: webp }).catch(() => { })
-      } catch {
-        /* ignore */
-      }
-    }
-  }, [])
 
-  const outputs = useMemo(() => {
+
+  /*const outputs = useMemo(() => {
     return {
       setLifecycle: (shapeId, state): void => {
         const ed = editorRef.current
@@ -264,7 +255,7 @@ export default function LifecycleHost({ editorRef }: Props) {
               const shapeType = ed.getShape(shapeId)
               const shapeW = (shapeType as any)?.props?.w ?? bounds.w
               const widthPx = Math.round(shapeW * zoom * dpr)
-              await snapshot(tabId, widthPx)             // forwards to payload.maxWidth
+              await snapshot(tabId, widthPx)
             }
           }
           await window.overlay.hide({ tabId })
@@ -287,10 +278,11 @@ export default function LifecycleHost({ editorRef }: Props) {
   )
   useLifecycleManager(inputs, outputs, limits)
 
+  // BATCH LAYOUT SYNC ENGINE
   useEffect(() => {
     let raf = 0
     let previousActiveTabs = new Set<string>()
-    const lastSent = new Map<string, { x: number; y: number; w: number; h: number }>() // tabId -> rect
+    const lastSent = new Map<string, { x: number; y: number; w: number; h: number }>()
     const lastZoomSent = new Map<string, number>()
     const ZOOM_EPS = 0.0125
 
@@ -311,14 +303,17 @@ export default function LifecycleHost({ editorRef }: Props) {
       }
       previousActiveTabs = new Set(activeTabs)
 
-      const batch: Array<{ tabId: string; rect: { x: number; y: number; width: number; height: number }; shapeSize: { w: number; h: number } }> = []
+      const batch: Array<{ tabId: string; rect: { x: number; y: number; width: number; height: number }; shapeSize: { w: number; h: number }; zIndex: string }> = []
       const zoomBatch: { tabId: string; factor: number }[] = []
-      const zoom = ed.getZoomLevel()
+
+      // Fixed: safely grab correct camera zoom
+      const zoom = ed.getCamera().z
 
       for (const tabId of activeTabs) {
         const shapeId = tabToShape.current.get(tabId)
         if (!shapeId) continue
 
+        // Abort layout calculations if the shape is currently in "Fit" mode or suspended
         if (browserTabSuspendRegistry.get(shapeId)?.current) continue
         if (window.__tabState?.get(tabId) !== 'live') continue
 
@@ -328,7 +323,6 @@ export default function LifecycleHost({ editorRef }: Props) {
         const shapeProps = (shape as any).props
         const shapeSize = { w: shapeProps?.w ?? 800, h: shapeProps?.h ?? 600 }
 
-        // Fast bounding box without tree traversal (absolute root relative)
         const screenPos = ed.pageToScreen({ x: shape.x || 0, y: shape.y || 0 })
 
         const x = Math.round(screenPos.x) || 0
@@ -339,32 +333,41 @@ export default function LifecycleHost({ editorRef }: Props) {
         if (w <= 0) w = 1
         if (h <= 0) h = 1
 
-        // Extreme safety guard explicitly filtering NaNs
         if (Number.isNaN(x) || Number.isNaN(y) || Number.isNaN(w) || Number.isNaN(h)) {
           console.warn('[LifecycleHost] Skipping NaN bounds for tab:', tabId)
           continue
         }
 
         const rect = { x, y, width: w, height: h }
-
         const force = newlyActive.has(tabId)
-
         const last = lastSent.get(tabId)
-        if (
-          force ||
-          !last ||
-          last.x !== rect.x ||
-          last.y !== rect.y ||
-          last.w !== rect.width ||
-          last.h !== rect.height
-        ) {
+
+        // Calculate absolute deltas
+        const deltaX = last ? rect.x - last.x : rect.x;
+        const deltaY = last ? rect.y - last.y : rect.y;
+        const deltaW = last ? rect.width - last.w : rect.width;
+        const deltaH = last ? rect.height - last.h : rect.height;
+
+        const isMoved = !last || deltaX !== 0 || deltaY !== 0 || deltaW !== 0 || deltaH !== 0;
+
+        if (force || isMoved) {
           lastSent.set(tabId, { x: rect.x, y: rect.y, w: rect.width, h: rect.height })
-          batch.push({ tabId, rect, shapeSize })
+
+          // Inject Tldraw's native z-index string into the batch so the main process knows stacking order
+          batch.push({ tabId, rect, shapeSize, zIndex: shape.index })
+
+          // Layout monitoring output
+          console.log(`[IPC Layout Sync] Tab: ${tabId}`, {
+            trigger: force ? 'NEW_ACTIVE' : (Math.abs(zoom - (lastZoomSent.get(tabId) ?? -1)) > ZOOM_EPS ? 'CAMERA_ZOOM' : 'SHAPE_MOVE_OR_PAN'),
+            delta: last ? { x: deltaX, y: deltaY, w: deltaW, h: deltaH } : 'INITIAL',
+            zIndex: shape.index,
+            zoom: zoom,
+            bounds: rect
+          });
         }
 
         if (force || Math.abs(zoom - (lastZoomSent.get(tabId) ?? -1)) > ZOOM_EPS) {
           lastZoomSent.set(tabId, zoom)
-          // For active shapes, we actually tell the main process the exact zoom.
           zoomBatch.push({ tabId, factor: zoom })
         }
       }
@@ -383,3 +386,4 @@ export default function LifecycleHost({ editorRef }: Props) {
 
   return null
 }
+*/

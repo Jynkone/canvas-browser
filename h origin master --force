@@ -1,0 +1,456 @@
+[33mcommit 658f967ebf7aaa371f38533df3e65e4d616d3de6[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mmaster[m[33m, [m[1;31morigin/master[m[33m)[m
+Author: Jynkone <ajeenkya29@gmail.com>
+Date:   Fri Mar 6 14:20:06 2026 +0530
+
+    more fixes to remvoe bounds calcualtion out of polaces not need specifically in thaw
+
+[33mcommit ef165bc9763c0aacdfb29bf12e3c3d149554ccc4[m
+Author: Jynkone <ajeenkya29@gmail.com>
+Date:   Fri Mar 6 12:46:07 2026 +0530
+
+    maybe fixess for pan I do not know
+
+[33mcommit 4070cd980fff2af20bb9e8b39cfd9f52b727d8ee[m
+Author: Jynkone <ajeenkya29@gmail.com>
+Date:   Thu Mar 5 22:29:17 2026 +0530
+
+    efficenecy fixes for bounds
+
+[33mcommit e7c94bf46dbe4097777efa2fe60f40f0ec81a9d2[m
+Author: Jynkone <ajeenkya29@gmail.com>
+Date:   Thu Mar 5 01:28:37 2026 +0530
+
+    Draghandlers added, made changes to various files, moved to electron 40.7
+
+[33mcommit ff6746354054608ace31c408b727965611140a33[m
+Author: Jynkone <ajeenkya29@gmail.com>
+Date:   Wed Mar 4 22:20:36 2026 +0530
+
+    Bug fixes and batched updates
+
+[33mcommit bd913da3e843ff829dd1fdb2835643f1d8720005[m
+Author: Jynkone <ajeenkya29@gmail.com>
+Date:   Wed Mar 4 16:34:03 2026 +0530
+
+    stuttering fix while moving windows around caused by custom calculations on tldraw windows
+
+[33mcommit 67aefc98443d9ae7480986849aacbdf6659237b5[m
+Author: Jynkone <ajeenkya29@gmail.com>
+Date:   Wed Nov 5 14:54:52 2025 +0530
+
+    screenshot issues
+
+[33mcommit aa09ff8f19d24065a8ba2a6c8968869195cc06b9[m
+Author: Jynkone <ajeenkya29@gmail.com>
+Date:   Wed Nov 5 14:54:16 2025 +0530
+
+    Screenshots issues and other shit
+
+[33mcommit 3b5cd50871356d9a7501096aea473eedb66de077[m
+Author: Jynkone <ajeenkya29@gmail.com>
+Date:   Mon Nov 3 21:53:47 2025 +0530
+
+    More fucking changes
+
+[33mcommit af1b74b60a4ccd162be758f57c4c6a8a9d75e877[m
+Author: Jynkone <ajeenkya29@gmail.com>
+Date:   Sun Nov 2 11:29:54 2025 +0530
+
+    Fuckign faliure on the most basic level
+
+[33mcommit 2494a210c90c467c015ccf9cbbdf8a910390e525[m
+Author: Jynkone <ajeenkya29@gmail.com>
+Date:   Fri Oct 31 22:44:30 2025 +0530
+
+    the hell
+
+[33mcommit 0f47cdfa75e47adc9a4f283e56a90dfe6121d485[m
+Author: Jynkone <ajeenkya29@gmail.com>
+Date:   Fri Oct 31 22:41:32 2025 +0530
+
+    More edits
+
+[33mcommit 6a0477d8153142eaa6272a36d667b27b8bcbdab6[m
+Author: Jynkone <ajeenkya29@gmail.com>
+Date:   Fri Oct 31 13:02:31 2025 +0530
+
+    updates to snapshot
+
+[33mcommit 364c027334e0f20ad2af6b98ad05049b425b7df7[m
+Author: Jynkone <ajeenkya29@gmail.com>
+Date:   Fri Oct 31 12:30:37 2025 +0530
+
+    updated lifecycle manager
+
+[33mcommit 855702c3437836007fb0e7c2b5b2d1a5bd1c6cc8[m
+Author: Jynkone <ajeenkya29@gmail.com>
+Date:   Fri Oct 31 12:15:26 2025 +0530
+
+    Lifecycle management
+
+[33mcommit 6f95f4bde6e61a280f503aea960f9a95314deb96[m
+Author: Jynkone <ajeenkya29@gmail.com>
+Date:   Thu Oct 30 10:22:40 2025 +0530
+
+    more tweaks to screenshot mech
+
+[33mcommit bbbcfbda88be3123c6df0b67f76e5cf85f0f0730[m
+Author: Jynkone <ajeenkya29@gmail.com>
+Date:   Thu Oct 30 10:01:18 2025 +0530
+
+    Updates for screenshot
+
+[33mcommit 5407357a0325861044ebabd5c3adaeb0420eb99f[m
+Author: Jynkone <ajeenkya29@gmail.com>
+Date:   Wed Oct 29 10:55:01 2025 +0530
+
+    Fucked up
+
+[33mcommit 9e87076b191b0e9bbcd11da51aebb42b10ca02e9[m
+Author: Jynkone <ajeenkya29@gmail.com>
+Date:   Wed Oct 1 11:09:23 2025 +0530
+
+    Effiencey updates
+
+[33mcommit b83cf9b310bcd44207cd04e7f38b8febdcd5c8e4[m
+Author: Jynkone <ajeenkya29@gmail.com>
+Date:   Fri Aug 29 19:31:41 2025 +0530
+
+    make grouped things wor k properly
+
+[33mcommit 7b98ee4dc4a428b34cdf2bcfe3eccf8c7e376159[m
+Author: Jynkone <ajeenkya29@gmail.com>
+Date:   Thu Aug 28 16:04:19 2025 +0530
+
+    some qualtiy of life improvoeemnts
+
+[33mcommit 3e1bf9b72f5169c624264b9ccf1ee6e68a649652[m
+Author: Jynkone <ajeenkya29@gmail.com>
+Date:   Tue Aug 26 17:22:22 2025 +0530
+
+    commit other things
+
+[33mcommit f6e536a4bf1f344b8ad06d0982443fe82e7a03ef[m
+Author: Jynkone <ajeenkya29@gmail.com>
+Date:   Tue Aug 26 16:51:56 2025 +0530
+
+    Type contract changes
+
+[33mcommit c10695598123e979964b2e77ae531c86da102f30[m
+Author: Jynkone <ajeenkya29@gmail.com>
+Date:   Tue Aug 26 16:49:07 2025 +0530
+
+    more updates types
+
+[33mcommit 5f71d240af070f3787671bdaa88a58aa67f389b2[m
+Merge: 8253611 d0841af
+Author: Jynkone <ajeenkya29@gmail.com>
+Date:   Tue Aug 26 14:40:55 2025 +0530
+
+    Merge branch 'master' of https://github.com/Jynkone/canvas-browser
+
+[33mcommit 825361111510a99e5c56456fc1de9b6171607766[m
+Author: Jynkone <ajeenkya29@gmail.com>
+Date:   Tue Aug 26 14:40:48 2025 +0530
+
+    A lot of updates made for quality of life imporovemnts
+
+[33mcommit d0841afcc8bca6682222c7659fc41ded1ae603b8[m
+Author: Jynkone <ajeenkya29@gmail.com>
+Date:   Sun Aug 24 20:02:41 2025 +0530
+
+    Create main.yml
+
+[33mcommit 73b351abacff9acf9c7abec6a66abfb8ed7b522d[m
+Author: Jynkone <ajeenkya29@gmail.com>
+Date:   Sun Aug 24 19:57:33 2025 +0530
+
+    Delete .github/workflows directory
+
+[33mcommit 27d64ee88c78aecfb26c0c9c057f85741cac2e14[m
+Author: Jynkone <ajeenkya29@gmail.com>
+Date:   Sun Aug 24 19:46:50 2025 +0530
+
+    Create main.yml
+
+[33mcommit 5fe5afe9aee4a0c23a46560d3f3993c612d0632b[m
+Author: Jynkone <ajeenkya29@gmail.com>
+Date:   Sun Aug 24 19:43:42 2025 +0530
+
+    Make screen record working. and other things
+
+[33mcommit e5dbe0b9de321b0794baab2b1c0350ea2cf3ffa1[m
+Author: Jynkone <ajeenkya29@gmail.com>
+Date:   Sat Aug 23 22:14:44 2025 +0530
+
+    Final commit everything smooth
+
+[33mcommit d582843bb9dd11f083b21c648279efa687db5c07[m
+Author: Jynkone <ajeenkya29@gmail.com>
+Date:   Sat Aug 23 10:17:42 2025 +0530
+
+    Final version for now if changes do not work out
+
+[33mcommit 807dea17bfe17e6dd9ff4d16a3af5203190ac5a0[m
+Author: Jynkone <ajeenkya29@gmail.com>
+Date:   Fri Aug 22 09:38:03 2025 +0530
+
+    okay final Browserhsape in
+
+[33mcommit 5c722e3b8e1903a1a3a0f625d65f51b493e84c6f[m
+Author: Jynkone <ajeenkya29@gmail.com>
+Date:   Fri Aug 22 01:00:14 2025 +0530
+
+    okay 2nd last
+
+[33mcommit cd7fc12e74790b453731857d04ee575de237ac9c[m
+Author: Jynkone <ajeenkya29@gmail.com>
+Date:   Thu Aug 21 17:32:24 2025 +0530
+
+    some final polish
+
+[33mcommit 328b5aeb6287494b985b1943c59725ab0c53b817[m
+Author: Jynkone <ajeenkya29@gmail.com>
+Date:   Thu Aug 21 15:45:08 2025 +0530
+
+    finally a working version
+
+[33mcommit 130be49c0146c146ee6f928a64c838c75ad24770[m
+Author: Jynkone <ajeenkya29@gmail.com>
+Date:   Thu Aug 21 12:42:38 2025 +0530
+
+    making this work
+
+[33mcommit ec0ce2d0b72bd03806a6823694549d137d2dc073[m
+Author: Jynkone <ajeenkya29@gmail.com>
+Date:   Thu Aug 21 12:17:48 2025 +0530
+
+    okay some thing is happening here
+
+[33mcommit fb921fe8bb86c3f80f7d95a45a90da9bf1a90c96[m
+Author: Jynkone <ajeenkya29@gmail.com>
+Date:   Thu Aug 21 11:15:28 2025 +0530
+
+    log function
+
+[33mcommit 820e644bb99a455ab9331266c1c68dd4d17c09bd[m
+Author: Jynkone <ajeenkya29@gmail.com>
+Date:   Thu Aug 21 09:43:28 2025 +0530
+
+    most recent working condition
+
+[33mcommit b7adf8a7345ca4d846fee51e7153699534ff379a[m
+Author: Jynkone <ajeenkya29@gmail.com>
+Date:   Thu Aug 21 02:24:26 2025 +0530
+
+    fitone working
+
+[33mcommit a032aef4c9ba6a54595f46e0e50eb37044ec1dcf[m
+Author: Jynkone <ajeenkya29@gmail.com>
+Date:   Thu Aug 21 01:38:44 2025 +0530
+
+    New URL tracking
+
+[33mcommit 680f4791221a432cebca32e11b7d57fb4fbd72f0[m
+Author: Jynkone <ajeenkya29@gmail.com>
+Date:   Thu Aug 21 00:20:57 2025 +0530
+
+    Some sort of sync working
+
+[33mcommit aefeb18f5bbdc45a2239c8fdea2a4c9b7f95c3ad[m
+Author: Jynkone <ajeenkya29@gmail.com>
+Date:   Wed Aug 20 23:38:56 2025 +0530
+
+    session management
+
+[33mcommit e647bb8b7e020b1e3d152a511a3bbc9bfa693c31[m
+Author: Jynkone <ajeenkya29@gmail.com>
+Date:   Wed Aug 20 23:19:23 2025 +0530
+
+    screenshot based image swapping
+
+[33mcommit 59eccc7bbfb68d1f7457f9efe81cec6913120b25[m
+Author: Jynkone <ajeenkya29@gmail.com>
+Date:   Wed Aug 20 22:49:42 2025 +0530
+
+    Screenshot swapping mech
+
+[33mcommit b39243bc8fb588b2125d9775f4c143b4712813ec[m
+Author: Jynkone <ajeenkya29@gmail.com>
+Date:   Wed Aug 20 20:21:27 2025 +0530
+
+    okay baseline
+
+[33mcommit 612381ef0730932a20249f881c7b3268f9a799e5[m
+Author: Jynkone <ajeenkya29@gmail.com>
+Date:   Wed Aug 20 19:38:57 2025 +0530
+
+    Things are very much broken
+
+[33mcommit 979abbec4d3276590364617f5cfa091fce04299f[m
+Author: Jynkone <ajeenkya29@gmail.com>
+Date:   Wed Aug 20 09:27:03 2025 +0530
+
+    Okay got it to a level that it works
+
+[33mcommit fcaac22e2be6d91b311121cbaa59452e7de9a9d9[m
+Author: Jynkone <ajeenkya29@gmail.com>
+Date:   Wed Aug 20 08:33:02 2025 +0530
+
+    No drag gutter
+
+[33mcommit 8cac155716ba49ac0bbed1fbb7126315bf15e530[m
+Author: Jynkone <ajeenkya29@gmail.com>
+Date:   Tue Aug 19 22:43:38 2025 +0530
+
+    okay things are finally settling down
+
+[33mcommit 0667ae1a4bd8099be9facddd43194ff0c4775187[m
+Author: Jynkone <ajeenkya29@gmail.com>
+Date:   Tue Aug 19 16:38:08 2025 +0530
+
+    some updates
+
+[33mcommit 665735315d09a1e7782a0c82e60d6d6d2f8eef11[m
+Author: Jynkone <ajeenkya29@gmail.com>
+Date:   Tue Aug 19 15:38:00 2025 +0530
+
+    Okay a lot of changes
+
+[33mcommit 7d3c6faaf82dc4df39f631ea65412631fe1c284e[m
+Author: Jynkone <ajeenkya29@gmail.com>
+Date:   Tue Aug 19 03:04:28 2025 +0530
+
+    this nav is better
+
+[33mcommit bb40937527a77c38cc5778ffb0691bcc9eb571cf[m
+Author: Jynkone <ajeenkya29@gmail.com>
+Date:   Tue Aug 19 03:03:35 2025 +0530
+
+    type safe things
+
+[33mcommit 325a017a5f52f97696dc8db695a426510a00efe9[m
+Author: Jynkone <ajeenkya29@gmail.com>
+Date:   Tue Aug 19 02:32:15 2025 +0530
+
+    okat things work as intended now.
+
+[33mcommit 31e3c2531f0870c680b0f8710eb531102e947b7e[m
+Author: Jynkone <ajeenkya29@gmail.com>
+Date:   Tue Aug 19 00:34:25 2025 +0530
+
+    reverted back
+
+[33mcommit b31ceff75264bbdbe4c1a358ac5cfb653ae149cb[m
+Author: Jynkone <ajeenkya29@gmail.com>
+Date:   Tue Aug 19 00:26:40 2025 +0530
+
+    at center browser window of cursor
+
+[33mcommit eef3b261eb918fe43daa355bbb771d6bf49e63c0[m
+Author: Jynkone <ajeenkya29@gmail.com>
+Date:   Tue Aug 19 00:23:14 2025 +0530
+
+    refactored browsershape
+
+[33mcommit 701a22836900fdb3c0ee4fc76057bb199e60906e[m
+Author: Jynkone <ajeenkya29@gmail.com>
+Date:   Tue Aug 19 00:01:52 2025 +0530
+
+    deleted file
+
+[33mcommit b6a61e3253a00933d08ad56cc0c405c644368035[m
+Author: Jynkone <ajeenkya29@gmail.com>
+Date:   Mon Aug 18 23:45:07 2025 +0530
+
+    Finally things are working
+
+[33mcommit e1895bfab71aa536e878b8979f6604227fb317f9[m
+Author: Jynkone <ajeenkya29@gmail.com>
+Date:   Mon Aug 18 19:10:52 2025 +0530
+
+    new errors
+
+[33mcommit e8fce0f07ea8c23c99565e27d680dd8ecf241666[m
+Author: Jynkone <ajeenkya29@gmail.com>
+Date:   Mon Aug 18 16:34:14 2025 +0530
+
+    more changes
+
+[33mcommit 3f4bacf6f012d667f9befb846305c7735328dc47[m
+Author: Jynkone <ajeenkya29@gmail.com>
+Date:   Mon Aug 18 15:42:55 2025 +0530
+
+    type issues done
+
+[33mcommit 045609e898ee98a1a211762485f6db30786dcae7[m
+Author: Jynkone <ajeenkya29@gmail.com>
+Date:   Mon Aug 18 15:39:57 2025 +0530
+
+    Type safety
+
+[33mcommit cf860474097a8d1b3ac7bf5c0ea0f835569bc306[m
+Author: Jynkone <ajeenkya29@gmail.com>
+Date:   Mon Aug 18 15:27:01 2025 +0530
+
+    more changes
+
+[33mcommit bafb2ba587cff7d6f16b33481862c3a58d758c8b[m
+Author: Jynkone <ajeenkya29@gmail.com>
+Date:   Mon Aug 18 12:15:13 2025 +0530
+
+    shit
+
+[33mcommit 237742294b084adb38857cdc348589d199881244[m
+Author: Jynkone <ajeenkya29@gmail.com>
+Date:   Sun Aug 17 23:17:13 2025 +0530
+
+    okay it is cool now
+
+[33mcommit e290e92304787e7d29d5a3456105e8e2d8cfd6ba[m
+Author: Jynkone <ajeenkya29@gmail.com>
+Date:   Sun Aug 17 17:41:16 2025 +0530
+
+    fuck yeah it lives!
+
+[33mcommit 3c1551ef42a212bdb8ce3853f3eebfa72ba06d89[m
+Author: Jynkone <ajeenkya29@gmail.com>
+Date:   Sat Aug 16 17:10:13 2025 +0530
+
+    Okay lets see how this goes
+
+[33mcommit 8a219777774cc5e4dad12d2fb53a1876746ab432[m
+Author: Jynkone <ajeenkya29@gmail.com>
+Date:   Fri Aug 15 16:51:24 2025 +0530
+
+    Okay icons load now.
+
+[33mcommit eeb0c4b312ed283394892ea8da93ca01c14c41ad[m
+Author: Jynkone <ajeenkya29@gmail.com>
+Date:   Fri Aug 15 15:04:47 2025 +0530
+
+    More changes not working yet
+
+[33mcommit ca417fb466511db66c53273b6f20b20dabe907a1[m
+Author: Jynkone <ajeenkya29@gmail.com>
+Date:   Fri Aug 15 11:49:21 2025 +0530
+
+    Okay first commit with the full structure in place
+
+[33mcommit c62a7e033aa3254d4aef1f6af2308b0d90aba679[m
+Author: Jynkone <ajeenkya29@gmail.com>
+Date:   Fri Aug 15 11:28:32 2025 +0530
+
+    feat(main): OSR tab manager + wire main window
+
+[33mcommit 5a2511d2654930633c5a073d356ab9f48d54db6a[m
+Author: Jynkone <ajeenkya29@gmail.com>
+Date:   Fri Aug 15 10:40:38 2025 +0530
+
+    feat: scaffold electron-vite react-ts
+
+[33mcommit 16ab356958309e6d3044ebb126021b6c62ee9f65[m
+Author: Jynkone <ajeenkya29@gmail.com>
+Date:   Fri Aug 15 10:32:26 2025 +0530
+
+    chore: init repo

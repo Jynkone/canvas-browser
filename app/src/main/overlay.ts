@@ -6,12 +6,25 @@ import type { OverlayNotice, Flags, BoundsPayload, ZoomPayload } from '../../src
 import sharp from 'sharp';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { createRequire } from 'module';
+
+const require = createRequire(import.meta.url);
+let textureBridge: any;
+
+try {
+  // Point directly to the file you just built
+  const bridgePath = path.join(app.getAppPath(), 'src/native/build/Release/texture_bridge.node');
+  textureBridge = require(bridgePath);
+  console.log('[Native] Successfully loaded texture bridge!');
+} catch (err) {
+  console.error('[Native] Failed to load texture bridge:', err);
+}
 
 
 type Rect = { x: number; y: number; width: number; height: number }
 
 type ViewState = {
-  view: WebContentsView
+  view: BrowserWindow
   attached: boolean
   lastBounds: { x: number; y: number; w: number; h: number }
   lastAppliedZoom?: number
@@ -26,6 +39,7 @@ type ViewState = {
     title: string
   }
   lastCaptureAt?: number
+  currentTexture?: any // Store the GPU handle here
 }
 
 const THUMBS_DIR: string = path.join(app.getPath('userData'), 'thumbs');
@@ -280,20 +294,20 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null): void {
         const s = views.get(id)!
         return { view: s.view, state: s }
       }
-      return { view: null as WebContentsView | null, state: null as ViewState | null }
+      return { view: null as BrowserWindow | null, state: null as ViewState | null }
     },
-    attach(win: BrowserWindow, s: ViewState) {
+    attach(_win: BrowserWindow, s: ViewState) {
       if (s.attached) return
-      try { win.contentView.addChildView(s.view); s.attached = true } catch { }
+      s.attached = true
     },
-    detach(win: BrowserWindow, s: ViewState) {
+    detach(_win: BrowserWindow, s: ViewState) {
       if (!s.attached) return
-      try { win.contentView.removeChildView(s.view); s.attached = false } catch { }
+      s.attached = false
     },
     currentEff() { return clamp((canvasZoom || 1) * ZOOM_RATIO, 0.05, CHROME_MAX) },
     hasRealBounds(b?: { width: number; height: number } | null) { return !!b && b.width >= 2 && b.height >= 2 },
 
-    async clearEmuIfAny(view: WebContentsView) {
+    async clearEmuIfAny(view: BrowserWindow) { // FIXED: Use BrowserWindow
       try {
         const dbg: ElectronDebugger = view.webContents.debugger
         if (dbg.isAttached()) {
@@ -310,15 +324,12 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null): void {
         const bucket = state.pendingBucket
         if (bucket == null) return
         state.pendingBucket = null
-        // One single apply for this step, using the latest bounds
         S.setEff(state.view, bucket / 100, state)
         state.lastAppliedZoom = bucket / 100
       }, 0)
     },
 
-
-    // add force?: boolean
-    setEff(view: WebContentsView, eff: number, state?: ViewState) {
+    setEff(view: BrowserWindow, eff: number, state?: ViewState) { // FIXED: Use BrowserWindow
       if (eff >= CHROME_MIN) {
         if (state?.lastAppliedZoomKey !== undefined) {
           try { S.clearEmuIfAny(view) } catch { }
@@ -331,17 +342,14 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null): void {
       }
 
       const bucket = effToBucketKey(eff)
-
       const b = state?.lastBounds
       if (!b || b.w <= 0 || b.h <= 0) return
 
       const bucketEff = bucket / 100
       const currentEff = Math.max(0.001, Math.min(eff, CHROME_MIN))
       const shrinkToBottom = Math.min(1, bucketEff / currentEff)
-
       const targetW = Math.max(1, Math.round(b.w * shrinkToBottom))
       const targetH = Math.max(1, Math.round(b.h * shrinkToBottom))
-
       const scale = bucketEff / CHROME_MIN
       const emuW = Math.max(1, Math.floor(targetW / scale))
       const emuH = Math.max(1, Math.floor(targetH / scale))
@@ -354,21 +362,11 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null): void {
 
       try {
         const dbg: ElectronDebugger = view.webContents.debugger
-        if (!dbg.isAttached()) {
-          try { dbg.attach('1.3') } catch { }
-        }
+        if (!dbg.isAttached()) { try { dbg.attach('1.3') } catch { } }
 
         void dbg.sendCommand('Emulation.setDeviceMetricsOverride', {
-          width: emuW,
-          height: emuH,
-          deviceScaleFactor: 1,
-          scale,
-          mobile: false,
-          screenWidth: emuW,
-          screenHeight: emuH,
-          positionX: 0,
-          positionY: 0,
-          dontSetVisibleSize: false,
+          width: emuW, height: emuH, deviceScaleFactor: 1, scale, mobile: false,
+          screenWidth: emuW, screenHeight: emuH, positionX: 0, positionY: 0, dontSetVisibleSize: false,
         })
 
         if (state) {
@@ -381,11 +379,10 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null): void {
     reapply(state: ViewState) {
       try {
         const eff = S.currentEff()
-        void S.setEff(state.view, eff, state)
+        void S.setEff(state.view, eff, state) // This will now work without errors
         state.lastAppliedZoom = eff
       } catch { }
     },
-
 
     updateNav(state: ViewState) {
       try {
@@ -399,9 +396,7 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null): void {
       } catch { }
     },
 
-
     roundRect(rect: Rect) {
-      // rect is always a real Rect after Fix 1, but keep clamps & ints here
       const x = Math.floor(rect.x), y = Math.floor(rect.y)
       const w = Math.max(1, Math.ceil(rect.width)), h = Math.max(1, Math.ceil(rect.height))
       return { x, y, w, h }
@@ -717,18 +712,60 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null): void {
 
       let state: ViewState | undefined
       try {
-        const view = new WebContentsView({
+        const view = new BrowserWindow({
+          show: false, // Keep it hidden from the taskbar
+          width: 1000,
+          height: 600,
+          frame: false,
           webPreferences: {
-            devTools: true,
-            spellcheck: true,
+            offscreen: {
+              useSharedTexture: true // Your high-speed bridge depends on this
+            },
+            backgroundThrottling: false,
+            //paintWhenInitiallyHidden: true, // 🟢 FORCE CHROMIUM TO PAINT WHILE HIDDEN
             contextIsolation: true,
-            nodeIntegration: false,
             sandbox: true,
-            webSecurity: true,
-            allowRunningInsecureContent: false,
-            backgroundThrottling: true,
+            devTools: true,
+
           },
         })
+
+        // Force the compositor to wake up
+        try {
+          view.webContents.setFrameRate(60);
+          console.log(`[Native] Set 60fps for ${tabId}`);
+        } catch (e) { }
+
+        wireFlagsFor(tabId, view.webContents)
+        view.webContents.openDevTools({ mode: "detach" });
+
+        // 🔥 THE LOGGING ENGINE 🔥
+        view.webContents.on('paint', (event, dirty, _image) => {
+          // 1. Log that the event even exists
+          if (Math.random() < 0.01) { // Log every ~100th frame to avoid flooding
+            console.log(`[Native] Paint event firing for ${tabId}. Dirty: ${dirty.width}x${dirty.height}`);
+          }
+
+          const tex = (event as any).texture;
+          if (tex) {
+            const handle = tex.textureInfo.sharedTextureHandle;
+
+            const win = getWindow();
+            if (win && !win.isDestroyed() && handle) {
+              win.webContents.send('overlay-video-frame', { tabId, handle });
+            } else if (!win) {
+              console.error('[Native] Main Window is NULL. Cannot send frames to React!');
+            }
+            tex.release();
+          } else {
+            // If you see this log, your Electron version/Hardware doesn't support shared textures
+            console.error('[Native] Paint event fired but NO GPU TEXTURE found.');
+          }
+        });
+        try {
+          view.webContents.setFrameRate(60);
+        } catch (e) { }
+
         wireFlagsFor(tabId, view.webContents)
         view.webContents.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
 
@@ -773,6 +810,25 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null): void {
             }
           }
         )
+
+        view.webContents.on('paint', (event, _dirty, _image) => {
+          const tex = (event as any).texture;
+          if (tex) {
+            const handle = tex.textureInfo.sharedTextureHandle;
+
+            // 1. Send the handle to the frontend canvas!
+            const win = getWindow();
+            if (win && !win.isDestroyed() && handle) {
+              win.webContents.send('overlay-video-frame', {
+                tabId,
+                handle
+              });
+            }
+
+            // 2. MUST release it so Chromium can keep rendering
+            tex.release();
+          }
+        });
 
         // Chromium's pre-check: say "yes" for clipboard AND fullscreen
         view.webContents.session.setPermissionCheckHandler((_wc, permission) => {
@@ -1320,44 +1376,44 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null): void {
       const { state } = S.resolve(tabId)
       if (!state) continue
 
-      const { x, y, w, h } = S.roundRect(rect)
-
-      const screenX = x + BORDER
-      const screenY = y + BORDER
-      const screenW = Math.max(1, w - 2 * BORDER)
-      const screenH = Math.max(1, h - 2 * BORDER)
+      // 1. We only care about the literal width and height of the shape
+      const screenW = Math.max(1, Math.ceil(rect.width))
+      const screenH = Math.max(1, Math.ceil(rect.height))
 
       const b = state.lastBounds
 
-      if (
-        !b ||
-        screenX !== b.x ||
-        screenY !== b.y ||
-        screenW !== b.w ||
-        screenH !== b.h
-      ) {
-        state.lastBounds = {
-          x: screenX,
-          y: screenY,
-          w: screenW,
-          h: screenH
-        }
+      // 2. Only tell the GPU to resize if the dimensions ACTUALLY changed
+      if (!b || screenW !== b.w || screenH !== b.h) {
+        // We set x and y to 0 because the GPU texture has no physical screen position
+        state.lastBounds = { x: 0, y: 0, w: screenW, h: screenH }
 
         try {
-          state.view.setBounds({
-            x: screenX,
-            y: screenY,
-            width: screenW,
-            height: screenH
-          })
+          try {
+            state.view.setContentSize(screenW, screenH)
+          } catch (err) {
+            console.error('[Native] Resize failed:', err)
+          }
         } catch { }
-      }
-
-      if (S.currentEff() < CHROME_MIN && state.pendingBucket != null) {
-        S.scheduleEmu(state)
       }
     }
   })
+  // THE FINAL BOSS HANDLER: Connects React to the C++ Bridge
+  ipcMain.handle('overlay:decode-handle', async (_e, handleArray: Uint8Array) => {
+    if (!textureBridge) return null;
+    try {
+      // The Preload script sends a Uint8Array, but C++ wants a standard Node Buffer
+      const handleBuffer = Buffer.from(handleArray);
+
+      // Call our C++ Door to extract the pixels from the Graphics Card!
+      const pixelData = textureBridge.decodeHandle(handleBuffer);
+      return pixelData;
+    } catch (err) {
+      console.error('[Native] Failed to decode GPU handle:', err);
+      return null;
+    }
+  });
+
+
   ipcMain.handle('overlay:set-lifecycle', (_event, payload: { tabId: string; lifecycle: LifecycleKind; hasScreenshot: boolean; }) => {
     const { tabId, lifecycle, hasScreenshot } = payload;
     const prev: PersistedTabState | undefined = browserState[tabId];
@@ -1511,7 +1567,7 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null): void {
     const resolved = S.resolve(tabId);
     const state = resolved?.state;
     if (!state) return;
-    const view: WebContentsView = state.view;
+    const view: BrowserWindow = state.view;
     const wc: WebContents = view.webContents;
     await setLifecycle(wc, 'frozen');
     const win = getWindow();
@@ -1561,7 +1617,7 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null): void {
     const state = resolved?.state;
     if (!state) return;
 
-    const view: WebContentsView = state.view;
+    const view: BrowserWindow = state.view;
     const wc: WebContents = view.webContents;
 
     // (a) Unfreeze lifecycle first
