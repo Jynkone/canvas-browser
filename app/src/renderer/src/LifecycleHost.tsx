@@ -1,9 +1,7 @@
-/*import { useEffect, useMemo, useRef } from 'react'
+import { useEffect, useMemo, useRef } from 'react'
 import type { Editor, TLShapeId } from 'tldraw'
 import { useLifecycleManager } from './useLifecycleManager'
 import type { OverlayAPI } from '../../types/overlay'
-import { NAV_BAR_HEIGHT } from './components/NavigationBar'
-import { browserTabSuspendRegistry } from './Utils/BrowserShapeUtil'
 
 declare global {
   interface Window {
@@ -11,31 +9,31 @@ declare global {
     __tabState?: Map<string, 'live' | 'frozen' | 'discarded'>
     __tabThumbs?: Map<string, { url: string; dataUrlWebp: string }>
     __activeTabs?: Set<string>
+    __tabRestoreInfo?: Map<string, { currentUrl: string; lifecycle: 'live' | 'frozen' | 'discarded'; thumbPath: string | null }>
+    __overlayRestoreReady?: boolean
   }
 }
 
 const TAB_ACTIVITY_EVENT = 'paper:tab-activity' as const
+const TAB_INTERACT_EVENT = 'paper:tab-interact' as const
 const NEW_TAB_EVENT = 'paper:new-tab' as const
-const PLACEMENT_EVENT = 'paper:placement-changed' as const
-
-type TabActivityDetail = Readonly<{ tabId: string }>
-type NewTabDetail = Readonly<{ tabId: string; shapeId: TLShapeId }>
+const TAB_STATE_EVENT = 'paper:tab-state-changed' as const
+const RESTORE_READY_EVENT = 'paper:restore-ready' as const
 
 type Props = { editorRef: React.RefObject<Editor | null> }
-
 type Bounds = { x: number; y: number; w: number; h: number }
 
 function isObj(x: unknown): x is Record<string, unknown> {
   return typeof x === 'object' && x !== null
 }
 
-const getBounds = (ed: Editor, id: TLShapeId): Bounds | null => {
-  const b = ed.getShapePageBounds(id)
+function getBounds(editor: Editor, id: TLShapeId): Bounds | null {
+  const b = editor.getShapePageBounds(id)
   if (!b) return null
   return { x: b.x, y: b.y, w: b.w, h: b.h }
 }
 
-const intersect = (a: Bounds, b: Bounds): Bounds | null => {
+function intersect(a: Bounds, b: Bounds): Bounds | null {
   const x1 = Math.max(a.x, b.x)
   const y1 = Math.max(a.y, b.y)
   const x2 = Math.min(a.x + a.w, b.x + b.w)
@@ -46,344 +44,310 @@ const intersect = (a: Bounds, b: Bounds): Bounds | null => {
   return { x: x1, y: y1, w, h }
 }
 
-function getZoom(ed: Editor | null): number {
-  const z = ed?.getCamera().z
-  return typeof z === 'number' ? z : 1
-}
-
-const readTabInfoFromShape = (
-  ed: Editor,
-  shapeId: TLShapeId
-): { tabId: string; url: string } | null => {
-  const raw = ed.getShape(shapeId)
+function readTabInfoFromShape(editor: Editor, shapeId: TLShapeId): { tabId: string; url: string } | null {
+  const raw = editor.getShape(shapeId)
   if (!isObj(raw)) return null
   if ((raw as { type?: unknown }).type !== 'browser-shape') return null
-  const p = (raw as { props?: unknown }).props
-  if (!isObj(p)) return null
-  const url = (p as { url?: unknown }).url
-  return { tabId: String(shapeId), url: typeof url === 'string' ? url : '' }
+  const props = (raw as { props?: unknown }).props
+  if (!isObj(props)) return null
+  const url = (props as { url?: unknown }).url
+  return { tabId: String(shapeId), url: typeof url === 'string' ? url : 'about:blank' }
+}
+
+function emitTabState(tabId: string, state: 'live' | 'frozen' | 'discarded'): void {
+  window.dispatchEvent(new CustomEvent(TAB_STATE_EVENT, { detail: { tabId, state } }))
 }
 
 if (!window.__tabState) window.__tabState = new Map()
 if (!window.__tabThumbs) window.__tabThumbs = new Map()
 if (!window.__activeTabs) window.__activeTabs = new Set()
+if (!window.__tabRestoreInfo) window.__tabRestoreInfo = new Map()
+if (typeof window.__overlayRestoreReady !== 'boolean') window.__overlayRestoreReady = false
 
 export default function LifecycleHost({ editorRef }: Props) {
   const lastInteraction = useRef<Map<TLShapeId, number>>(new Map())
   const tabToShape = useRef(new Map<string, TLShapeId>())
-
-  useEffect(() => {
-    const off = window.overlay.onNotice((n) => {
-      if ((n as { kind?: unknown }).kind === 'flags') {
-        const rec = n as {
-          kind: 'flags'
-          tabId: string
-          flags: { audible: boolean; capturing: boolean; devtools: boolean; downloads: boolean; pinned: boolean }
-        }
-        flagsByTab.current.set(rec.tabId, rec.flags)
-      }
-    })
-    return () => off()
-  }, [])
-
-  useEffect(() => {
-    const api = window.overlay
-    const onActivity = (e: Event): void => {
-      const detail = (e as CustomEvent<TabActivityDetail>).detail
-      const tabId = detail?.tabId
-      if (!tabId) return
-      bumpInteractionByTabId(tabId)
-      const shapeId = tabToShape.current.get(tabId)
-      if (shapeId) { void revive(shapeId) }
-    }
-    const onNewTab = (e: Event): void => {
-      const detail = (e as CustomEvent<NewTabDetail>).detail
-      if (detail?.tabId && detail?.shapeId) {
-        tabToShape.current.set(detail.tabId, detail.shapeId)
-        bumpInteractionByShapeId(detail.shapeId)
-      }
-    }
-    window.addEventListener(TAB_ACTIVITY_EVENT, onActivity as EventListener, { capture: true })
-    window.addEventListener(NEW_TAB_EVENT, onNewTab as EventListener, { capture: true })
-    const offUrl = api.onUrlUpdate(({ tabId }) => bumpInteractionByTabId(tabId))
-    const offNav = api.onNavFinished(({ tabId }) => bumpInteractionByTabId(tabId))
-    return () => {
-      window.removeEventListener(TAB_ACTIVITY_EVENT, onActivity as EventListener, { capture: true } as AddEventListenerOptions)
-      window.removeEventListener(NEW_TAB_EVENT, onNewTab as EventListener, { capture: true } as AddEventListenerOptions)
-      offUrl()
-      offNav()
-    }
-  }, [])
-
-  const flagsByTab = useRef(
-    new Map<string, { audible: boolean; capturing: boolean; devtools: boolean; downloads: boolean; pinned: boolean }>()
-  )
+  const reviveInFlight = useRef(new Map<TLShapeId, Promise<void>>())
 
   const bumpInteractionByShapeId = (shapeId: TLShapeId): void => {
     lastInteraction.current.set(shapeId, performance.now())
   }
+
   const bumpInteractionByTabId = (tabId: string): void => {
     const shapeId = tabToShape.current.get(tabId)
     if (shapeId) bumpInteractionByShapeId(shapeId)
   }
 
-  const revive = async (shapeId: TLShapeId): Promise<void> => {
-    const ed = editorRef.current
-    if (!ed) return
-    const info = readTabInfoFromShape(ed, shapeId)
-    if (!info) return
-    const { tabId } = info
-    const tag = window.__tabState?.get(tabId)
-    if (tag === 'live') return
-
-    if (tag === 'discarded') {
-      await window.overlay.createTab({ shapeId: tabId, restore: true })
-    } else if (tag === 'frozen') {
-      await window.overlay.thaw({ tabId })
-    }
-    await window.overlay.show({ tabId })
-    window.__activeTabs!.add(tabId)
-    window.__tabState!.set(tabId, 'live')
-    lastInteraction.current.set(shapeId, performance.now())
-    tabToShape.current.set(tabId, shapeId)
-    window.dispatchEvent(
-      new CustomEvent('paper:tab-activity', { detail: { tabId } })
-    )
+  const capturePoster = async (tabId: string, url: string): Promise<void> => {
+    try {
+      const res = await window.overlay.snapshot({ tabId })
+      if (!res.ok) return
+      window.__tabThumbs?.set(tabId, { url, dataUrlWebp: res.dataUrl })
+      const prev = window.__tabRestoreInfo?.get(tabId)
+      window.__tabRestoreInfo?.set(tabId, {
+        currentUrl: url,
+        lifecycle: prev?.lifecycle ?? 'frozen',
+        thumbPath: prev?.thumbPath ?? null,
+      })
+      await window.overlay.saveThumb({ tabId, url, dataUrlWebp: res.dataUrl })
+    } catch { }
   }
+
+  const revive = async (shapeId: TLShapeId): Promise<void> => {
+    const pending = reviveInFlight.current.get(shapeId)
+    if (pending) {
+      await pending
+      return
+    }
+
+    const run = (async () => {
+    const editor = editorRef.current
+    if (!editor) return
+    const info = readTabInfoFromShape(editor, shapeId)
+    if (!info) return
+
+    const { tabId } = info
+    const currentState = window.__tabState?.get(tabId)
+
+    if (currentState === 'frozen') {
+      await window.overlay.thaw({ tabId })
+    } else {
+      await window.overlay.createTab({ shapeId: tabId, restore: true })
+    }
+
+    await window.overlay.show({ tabId })
+    window.__activeTabs?.add(tabId)
+    window.__tabState?.set(tabId, 'live')
+    const prev = window.__tabRestoreInfo?.get(tabId)
+    window.__tabRestoreInfo?.set(tabId, {
+      currentUrl: prev?.currentUrl ?? info.url,
+      lifecycle: 'live',
+      thumbPath: prev?.thumbPath ?? null,
+    })
+    tabToShape.current.set(tabId, shapeId)
+    bumpInteractionByShapeId(shapeId)
+    emitTabState(tabId, 'live')
+    })()
+
+    reviveInFlight.current.set(shapeId, run)
+    try {
+      await run
+    } finally {
+      if (reviveInFlight.current.get(shapeId) === run) {
+        reviveInFlight.current.delete(shapeId)
+      }
+    }
+  }
+
+  useEffect(() => {
+    let cancelled = false
+
+    ; (async () => {
+      window.__overlayRestoreReady = false
+      window.__tabState?.clear()
+      window.__tabThumbs?.clear()
+      window.__activeTabs?.clear()
+      window.__tabRestoreInfo?.clear()
+
+      try {
+        const res = await window.overlay.getPersistedState()
+        if (!res.ok || cancelled) return
+
+        const fs = require('node:fs') as typeof import('node:fs')
+        for (const tab of res.tabs) {
+          window.__tabState?.set(tab.tabId, tab.lifecycle)
+          window.__tabRestoreInfo?.set(tab.tabId, {
+            currentUrl: tab.currentUrl,
+            lifecycle: tab.lifecycle,
+            thumbPath: tab.thumbPath,
+          })
+          if (!tab.thumbPath || !fs.existsSync(tab.thumbPath)) continue
+          const dataUrlWebp = `data:image/webp;base64,${fs.readFileSync(tab.thumbPath).toString('base64')}`
+          window.__tabThumbs?.set(tab.tabId, {
+            url: tab.currentUrl,
+            dataUrlWebp,
+          })
+        }
+      } catch { }
+      finally {
+        if (cancelled) return
+        window.__overlayRestoreReady = true
+        window.dispatchEvent(new Event(RESTORE_READY_EVENT))
+      }
+    })()
+
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  useEffect(() => {
+    const onActivity = (event: Event): void => {
+      const detail = (event as CustomEvent<{ tabId: string }>).detail
+      const tabId = detail?.tabId
+      if (!tabId) return
+      bumpInteractionByTabId(tabId)
+    }
+
+    const onNewTab = (event: Event): void => {
+      const detail = (event as CustomEvent<{ tabId: string; shapeId: TLShapeId }>).detail
+      if (!detail?.tabId || !detail?.shapeId) return
+      tabToShape.current.set(detail.tabId, detail.shapeId)
+      window.__tabState?.set(detail.tabId, 'live')
+      const prev = window.__tabRestoreInfo?.get(detail.tabId)
+      window.__tabRestoreInfo?.set(detail.tabId, {
+        currentUrl: prev?.currentUrl ?? readTabInfoFromShape(editorRef.current!, detail.shapeId)?.url ?? 'about:blank',
+        lifecycle: 'live',
+        thumbPath: prev?.thumbPath ?? null,
+      })
+      window.__activeTabs?.add(detail.tabId)
+      bumpInteractionByShapeId(detail.shapeId)
+      emitTabState(detail.tabId, 'live')
+    }
+
+    const onInteract = (event: Event): void => {
+      const detail = (event as CustomEvent<{ shapeId: TLShapeId }>).detail
+      const shapeId = detail?.shapeId
+      if (!shapeId) return
+      bumpInteractionByShapeId(shapeId)
+      void revive(shapeId)
+    }
+
+    window.addEventListener(TAB_ACTIVITY_EVENT, onActivity as EventListener, { capture: true })
+    window.addEventListener(TAB_INTERACT_EVENT, onInteract as EventListener, { capture: true })
+    window.addEventListener(NEW_TAB_EVENT, onNewTab as EventListener, { capture: true })
+
+    return () => {
+      window.removeEventListener(TAB_ACTIVITY_EVENT, onActivity as EventListener, { capture: true } as AddEventListenerOptions)
+      window.removeEventListener(TAB_INTERACT_EVENT, onInteract as EventListener, { capture: true } as AddEventListenerOptions)
+      window.removeEventListener(NEW_TAB_EVENT, onNewTab as EventListener, { capture: true } as AddEventListenerOptions)
+    }
+  }, [])
 
   const inputs = useMemo(() => {
     return {
-      getVisibleShapes: (): ReadonlyArray<{ id: TLShapeId; w: number; h: number; overlap: number }> => {
-        const ed = editorRef.current
-        if (!ed) return []
-        const vp = ed.getViewportPageBounds()
-        const vpB: Bounds = { x: vp.minX, y: vp.minY, w: vp.maxX - vp.minX, h: vp.maxY - vp.minY }
-        const out: Array<{ id: TLShapeId; w: number; h: number; overlap: number }> = []
-        for (const s of ed.getCurrentPageShapes()) {
-          if (s.type !== 'browser-shape') continue
+      getVisibleShapes: () => {
+        const editor = editorRef.current
+        if (!editor) return []
+        const viewport = editor.getViewportPageBounds()
+        const viewportBounds: Bounds = {
+          x: viewport.minX,
+          y: viewport.minY,
+          w: viewport.maxX - viewport.minX,
+          h: viewport.maxY - viewport.minY,
+        }
 
-          const id = s.id as TLShapeId
-          const b = getBounds(ed, id)
-          if (!b) continue
-          const ov = intersect(b, vpB)
-          const frac = ov ? (ov.w * ov.h) / (b.w * b.h) : 0
-          out.push({ id, w: b.w, h: b.h, overlap: Math.max(0, Math.min(1, frac)) })
+        const out: Array<{ id: TLShapeId; w: number; h: number; overlap: number }> = []
+        for (const shape of editor.getCurrentPageShapes()) {
+          if (shape.type !== 'browser-shape') continue
+          const id = shape.id as TLShapeId
+          const bounds = getBounds(editor, id)
+          if (!bounds) continue
+          const overlap = intersect(bounds, viewportBounds)
+          const frac = overlap ? (overlap.w * overlap.h) / Math.max(1, bounds.w * bounds.h) : 0
+          out.push({ id, w: bounds.w, h: bounds.h, overlap: Math.max(0, Math.min(1, frac)) })
         }
         return out
       },
       getCamera: () => {
-        const ed = editorRef.current
-        const cam = ed?.getCamera()
-        return {
-          x: cam?.x ?? 0,
-          y: cam?.y ?? 0,
-          zoom: getZoom(ed)
-        }
+        const camera = editorRef.current?.getCamera()
+        return { x: camera?.x ?? 0, y: camera?.y ?? 0, zoom: camera?.z ?? 1 }
       },
       getTabInfo: (shapeId: TLShapeId) => {
-        const ed = editorRef.current
-        if (!ed) return null
-        return readTabInfoFromShape(ed, shapeId)
+        const editor = editorRef.current
+        if (!editor) return null
+        return readTabInfoFromShape(editor, shapeId)
       },
+      getLifecycleState: (tabId: string) => window.__tabState?.get(tabId),
       now: () => performance.now(),
       getLastInteractionMs: (shapeId: TLShapeId) => lastInteraction.current.get(shapeId),
-      hasThumb: (shapeId: TLShapeId): boolean => {
-        const ed = editorRef.current
-        if (!ed) return false
-        const info = readTabInfoFromShape(ed, shapeId)
+      hasThumb: (shapeId: TLShapeId) => {
+        const editor = editorRef.current
+        if (!editor) return false
+        const info = readTabInfoFromShape(editor, shapeId)
         if (!info) return false
-        const t = window.__tabThumbs?.get(info.tabId)
-        return !!t && typeof t.dataUrlWebp === 'string' && t.dataUrlWebp.length > 0
+        return !!window.__tabThumbs?.get(info.tabId)
       },
     }
   }, [editorRef])
 
-
-
-  /*const outputs = useMemo(() => {
+  const outputs = useMemo(() => {
     return {
-      setLifecycle: (shapeId, state): void => {
-        const ed = editorRef.current
-        if (!ed) return
-        const info = readTabInfoFromShape(ed, shapeId)
+      setLifecycle: (shapeId: TLShapeId, state: 'live' | 'frozen' | 'discarded'): void => {
+        const editor = editorRef.current
+        if (!editor) return
+        const info = readTabInfoFromShape(editor, shapeId)
         if (!info) return
+
         const { tabId } = info
+
         if (state === 'live') {
+          void revive(shapeId)
           return
         }
+
         if (state === 'frozen') {
-          ; (async () => {
+          void (async () => {
+            await capturePoster(tabId, info.url)
             await window.overlay.hide({ tabId })
             await window.overlay.freeze({ tabId })
-            window.__activeTabs!.delete(tabId)
-            window.__tabState!.set(tabId, 'frozen')
+            window.__activeTabs?.delete(tabId)
+            window.__tabState?.set(tabId, 'frozen')
+            const prev = window.__tabRestoreInfo?.get(tabId)
+            window.__tabRestoreInfo?.set(tabId, {
+              currentUrl: info.url,
+              lifecycle: 'frozen',
+              thumbPath: prev?.thumbPath ?? null,
+            })
+            emitTabState(tabId, 'frozen')
           })()
           return
         }
-        ; (async () => {
+
+        void (async () => {
+          await capturePoster(tabId, info.url)
           await window.overlay.destroy({ tabId, discard: true })
-          window.__activeTabs!.delete(tabId)
-          window.__tabState!.set(tabId, 'discarded')
+          window.__activeTabs?.delete(tabId)
+          window.__tabState?.set(tabId, 'discarded')
+          const prev = window.__tabRestoreInfo?.get(tabId)
+          window.__tabRestoreInfo?.set(tabId, {
+            currentUrl: info.url,
+            lifecycle: 'discarded',
+            thumbPath: prev?.thumbPath ?? null,
+          })
+          emitTabState(tabId, 'discarded')
         })()
       },
 
-      setPlacement: (
-        shapeId: TLShapeId,
-        placement: 'active' | 'background',
-        needThumb: boolean
-      ): void => {
-        const ed = editorRef.current
-        if (!ed) return
-        const info = readTabInfoFromShape(ed, shapeId)
+      setPlacement: (shapeId: TLShapeId, placement: 'active' | 'background', _needThumb: boolean): void => {
+        const editor = editorRef.current
+        if (!editor) return
+        const info = readTabInfoFromShape(editor, shapeId)
         if (!info) return
+
         const { tabId } = info
-        if (placement === 'active') {
-          (async () => {
-            await window.overlay.show({ tabId })
-            window.__activeTabs!.add(tabId)
-            window.dispatchEvent(new CustomEvent(PLACEMENT_EVENT, { detail: { tabId, placement: 'active' } }))
-          })()
+        const state = window.__tabState?.get(tabId) ?? 'live'
+
+        if (placement === 'active' && state === 'live') {
+          void window.overlay.show({ tabId })
+          window.__activeTabs?.add(tabId)
           return
         }
-        const wasActive = window.__activeTabs!.has(tabId);
-        (async () => {
-          if (needThumb && wasActive) {
-            const bounds = ed.getShapePageBounds(shapeId)
-            if (bounds) {
-              const zoom = ed.getCamera().z || 1
-              const dpr = window.devicePixelRatio || 1
-              const shapeType = ed.getShape(shapeId)
-              const shapeW = (shapeType as any)?.props?.w ?? bounds.w
-              const widthPx = Math.round(shapeW * zoom * dpr)
-              await snapshot(tabId, widthPx)
-            }
-          }
-          await window.overlay.hide({ tabId })
-          window.__activeTabs!.delete(tabId)
-          window.dispatchEvent(new CustomEvent(PLACEMENT_EVENT, { detail: { tabId, placement: 'background' } }))
-        })()
+
+        void window.overlay.hide({ tabId })
+        window.__activeTabs?.delete(tabId)
       },
     }
-  }, [editorRef, snapshot])
-
-  const MIN = 60_000
-  const limits = useMemo(
-    () => ({
-      hotCapOverview: 8,
-      tinyPxFloor: 48_000,
-      freezeHiddenMs: 3 * MIN,
-      discardFrozenMs: 9 * MIN,
-    }),
-    []
-  )
-  useLifecycleManager(inputs, outputs, limits)
-
-  // BATCH LAYOUT SYNC ENGINE
-  useEffect(() => {
-    let raf = 0
-    let previousActiveTabs = new Set<string>()
-    const lastSent = new Map<string, { x: number; y: number; w: number; h: number }>()
-    const lastZoomSent = new Map<string, number>()
-    const ZOOM_EPS = 0.0125
-
-    const loop = () => {
-      raf = requestAnimationFrame(loop)
-      const ed = editorRef.current
-      if (!ed) return
-
-      const activeTabs = window.__activeTabs
-      if (!activeTabs || activeTabs.size === 0) {
-        previousActiveTabs.clear()
-        return
-      }
-
-      const newlyActive = new Set<string>()
-      for (const tabId of activeTabs) {
-        if (!previousActiveTabs.has(tabId)) newlyActive.add(tabId)
-      }
-      previousActiveTabs = new Set(activeTabs)
-
-      const batch: Array<{ tabId: string; rect: { x: number; y: number; width: number; height: number }; shapeSize: { w: number; h: number }; zIndex: string }> = []
-      const zoomBatch: { tabId: string; factor: number }[] = []
-
-      // Fixed: safely grab correct camera zoom
-      const zoom = ed.getCamera().z
-
-      for (const tabId of activeTabs) {
-        const shapeId = tabToShape.current.get(tabId)
-        if (!shapeId) continue
-
-        // Abort layout calculations if the shape is currently in "Fit" mode or suspended
-        if (browserTabSuspendRegistry.get(shapeId)?.current) continue
-        if (window.__tabState?.get(tabId) !== 'live') continue
-
-        const shape = ed.getShape(shapeId)
-        if (!shape || shape.type !== 'browser-shape') continue
-
-        const shapeProps = (shape as any).props
-        const shapeSize = { w: shapeProps?.w ?? 800, h: shapeProps?.h ?? 600 }
-
-        const screenPos = ed.pageToScreen({ x: shape.x || 0, y: shape.y || 0 })
-
-        const x = Math.round(screenPos.x) || 0
-        const y = Math.round(screenPos.y + NAV_BAR_HEIGHT * zoom) || 0
-        let w = Math.round(shapeSize.w * zoom) || 1
-        let h = Math.round((shapeSize.h - NAV_BAR_HEIGHT) * zoom) || 1
-
-        if (w <= 0) w = 1
-        if (h <= 0) h = 1
-
-        if (Number.isNaN(x) || Number.isNaN(y) || Number.isNaN(w) || Number.isNaN(h)) {
-          console.warn('[LifecycleHost] Skipping NaN bounds for tab:', tabId)
-          continue
-        }
-
-        const rect = { x, y, width: w, height: h }
-        const force = newlyActive.has(tabId)
-        const last = lastSent.get(tabId)
-
-        // Calculate absolute deltas
-        const deltaX = last ? rect.x - last.x : rect.x;
-        const deltaY = last ? rect.y - last.y : rect.y;
-        const deltaW = last ? rect.width - last.w : rect.width;
-        const deltaH = last ? rect.height - last.h : rect.height;
-
-        const isMoved = !last || deltaX !== 0 || deltaY !== 0 || deltaW !== 0 || deltaH !== 0;
-
-        if (force || isMoved) {
-          lastSent.set(tabId, { x: rect.x, y: rect.y, w: rect.width, h: rect.height })
-
-          // Inject Tldraw's native z-index string into the batch so the main process knows stacking order
-          batch.push({ tabId, rect, shapeSize, zIndex: shape.index })
-
-          // Layout monitoring output
-          console.log(`[IPC Layout Sync] Tab: ${tabId}`, {
-            trigger: force ? 'NEW_ACTIVE' : (Math.abs(zoom - (lastZoomSent.get(tabId) ?? -1)) > ZOOM_EPS ? 'CAMERA_ZOOM' : 'SHAPE_MOVE_OR_PAN'),
-            delta: last ? { x: deltaX, y: deltaY, w: deltaW, h: deltaH } : 'INITIAL',
-            zIndex: shape.index,
-            zoom: zoom,
-            bounds: rect
-          });
-        }
-
-        if (force || Math.abs(zoom - (lastZoomSent.get(tabId) ?? -1)) > ZOOM_EPS) {
-          lastZoomSent.set(tabId, zoom)
-          zoomBatch.push({ tabId, factor: zoom })
-        }
-      }
-
-      if (batch.length > 0) {
-        void window.overlay.setBounds(batch)
-      }
-      if (zoomBatch.length > 0) {
-        void window.overlay.setZoom(zoomBatch)
-      }
-    }
-
-    raf = requestAnimationFrame(loop)
-    return () => cancelAnimationFrame(raf)
   }, [editorRef])
+
+  const limits = useMemo(() => ({
+    hotCapOverview: 8,
+    tinyPxFloor: 48_000,
+    freezeHiddenMs: 0.1 * 60_000,
+    discardFrozenMs: 0.3 * 60_000,
+  }), [])
+
+  useLifecycleManager(inputs, outputs, limits)
 
   return null
 }
-*/

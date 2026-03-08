@@ -12,6 +12,7 @@ interface NavigationBarProps {
   onBack: () => void
   onForward: () => void
   onReload: () => void
+  onInteract?: () => void
 
   // NEW: fit-screen toggle
   fitMode: boolean
@@ -65,6 +66,7 @@ export const NavigationBar: React.FC<NavigationBarProps> = ({
   onBack,
   onForward,
   onReload,
+  onInteract,
   fitMode,
   onToggleFit,
 }) => {
@@ -82,6 +84,7 @@ export const NavigationBar: React.FC<NavigationBarProps> = ({
   const handleSubmit = useCallback(
     (e: React.FormEvent) => {
       e.preventDefault()
+      onInteract?.()
       const trimmed = urlInput.trim()
       if (!trimmed) return
 
@@ -96,7 +99,7 @@ export const NavigationBar: React.FC<NavigationBarProps> = ({
         onUrlChange(`https://www.google.com/search?q=${encodeURIComponent(trimmed)}`)
       }
     },
-    [urlInput, onUrlChange]
+    [onInteract, onUrlChange, urlInput]
   )
 
   interface ButtonConfig {
@@ -229,6 +232,7 @@ export const NavigationBar: React.FC<NavigationBarProps> = ({
 
   const handleButtonPress = (config: ButtonConfig) => {
     if (config.disabled) return
+    onInteract?.()
     setActiveButton(config.key)
     config.handler()
     setTimeout(() => setActiveButton(null), 250)
@@ -261,7 +265,7 @@ export const NavigationBar: React.FC<NavigationBarProps> = ({
         <button
           key={config.key}
           type="button"
-          onPointerDown={(e) => { e.stopPropagation(); handleButtonPress(config); }}
+          onPointerDown={(e) => { e.stopPropagation(); onInteract?.(); handleButtonPress(config); }}
           disabled={config.disabled}
           style={getButtonStyle(config)}
           title={config.title}
@@ -270,21 +274,36 @@ export const NavigationBar: React.FC<NavigationBarProps> = ({
         </button>
       ))}
 
-      <form onSubmit={handleSubmit} style={{ flex: 1, display: 'flex' }} onPointerDown={(e) => e.stopPropagation()}>
+      <form
+        onSubmit={handleSubmit}
+        style={{ flex: 1, display: 'flex' }}
+        onPointerDown={(e) => {
+          e.stopPropagation()
+          onInteract?.()
+        }}
+      >
         <input
           type="text"
           value={urlInput}
-          onChange={(e) => setUrlInput(e.target.value)}
+          onChange={(e) => {
+            onInteract?.()
+            setUrlInput(e.target.value)
+          }}
           placeholder="Search or enter address"
           style={getInputStyle()}
           onFocus={(e) => {
+            onInteract?.()
             e.currentTarget.select()
             setInputState((prev) => ({ ...prev, isFocused: true }))
           }}
           onBlur={() => {
             setInputState((prev) => ({ ...prev, isFocused: false }))
           }}
-          onMouseDown={(e) => e.stopPropagation()}
+          onKeyDown={() => onInteract?.()}
+          onMouseDown={(e) => {
+            e.stopPropagation()
+            onInteract?.()
+          }}
           onMouseUp={(e) => {
             e.preventDefault()
             e.currentTarget.select()
@@ -310,7 +329,7 @@ export const NavigationBar: React.FC<NavigationBarProps> = ({
         type="button"
         aria-label={fitMode ? 'Exit fit' : 'Fit screen'}
         title={fitMode ? 'Exit fit' : 'Fit screen'}
-        onPointerDown={(e) => { e.stopPropagation(); onToggleFit(); }}
+        onPointerDown={(e) => { e.stopPropagation(); onInteract?.(); onToggleFit(); }}
         style={getFitButtonStyle()}
       >
         {fitMode ? '⤡' : '⤢'}

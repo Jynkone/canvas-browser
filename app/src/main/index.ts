@@ -4,19 +4,16 @@ import { fileURLToPath } from "url";
 import os from "os";
 import { setupOverlayIPC } from "./overlay";
 
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
-// Force discrete GPU if available
 app.commandLine.appendSwitch("force_high_performance_gpu");
 app.commandLine.appendSwitch("disable-renderer-backgrounding");
-// Optional: also disable pinch zoom at Chromium level (belt + suspenders)
-//app.commandLine.appendSwitch("disable-pinch");
 app.commandLine.appendSwitch("disable-site-isolation-trials");
 app.commandLine.appendSwitch("process-per-site");
+app.commandLine.appendSwitch('force-device-scale-factor', '1.5')
 
-
-// Single instance lock
 if (!app.requestSingleInstanceLock()) {
   app.quit();
 }
@@ -56,9 +53,7 @@ function setHighPerformanceMode(enable: boolean): void {
     }
     try {
       os.setPriority(process.pid, os.constants.priority.PRIORITY_HIGH);
-    } catch {
-      /* ignore */
-    }
+    } catch { /* ignore */ }
   } else {
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.setBackgroundThrottling(true);
@@ -69,9 +64,7 @@ function setHighPerformanceMode(enable: boolean): void {
     }
     try {
       os.setPriority(process.pid, os.constants.priority.PRIORITY_NORMAL);
-    } catch {
-      /* ignore */
-    }
+    } catch { /* ignore */ }
   }
 }
 
@@ -90,23 +83,20 @@ function createWindow(): void {
     webPreferences: {
       preload: join(__dirname, "../preload/index.js"),
       devTools: true,
-      nodeIntegration: false,
-      contextIsolation: true,
-      zoomFactor: 1.0, // start at 100%
+      nodeIntegration: true,       // required for electronSharedTexture
+      contextIsolation: false,     // required for nodeIntegration + no contextBridge
+      zoomFactor: 1.0,
     },
-
   });
 
   mainWindow.webContents.openDevTools({ mode: "detach" });
 
-  // ——— Hard-lock window zoom at 100% ———
   const wc = mainWindow.webContents;
   const reassertZoom = (): void => wc.setZoomFactor(1);
 
   reassertZoom();
-  wc.setVisualZoomLevelLimits(1, 1); // blocks pinch/gesture zoom
+  wc.setVisualZoomLevelLimits(1, 1);
 
-  // Block Ctrl/Cmd +, -, =, 0 (layout zoom shortcuts)
   wc.on("before-input-event", (event, input) => {
     const isMetaOrCtrl = input.control || input.meta;
     const key = (input.key ?? "").toLowerCase();
@@ -115,18 +105,15 @@ function createWindow(): void {
     }
   });
 
-  // Re-assert around navigations / HMR reloads
   wc.on("did-finish-load", reassertZoom);
   wc.on("did-navigate", reassertZoom);
   wc.on("did-navigate-in-page", reassertZoom);
 
-  // Overlay & performance IPC
   setupOverlayIPC(() => mainWindow);
   ipcMain.on("request-high-performance", (_evt, enable: boolean) => {
     setHighPerformanceMode(enable);
   });
 
-  // Dev / Prod loader
   const rendererUrl = getValidUrl(process.env.ELECTRON_RENDERER_URL);
   const viteUrl = getValidUrl(process.env.VITE_DEV_SERVER_URL);
   const devUrl = rendererUrl || viteUrl || "http://localhost:5173/";
@@ -136,6 +123,12 @@ function createWindow(): void {
   } else {
     void mainWindow.loadFile(join(__dirname, "../renderer/index.html"));
   }
+
+  mainWindow.on("close", () => {
+    if (process.platform !== "darwin") {
+      app.quit();
+    }
+  });
 
   mainWindow.on("closed", () => {
     mainWindow = null;

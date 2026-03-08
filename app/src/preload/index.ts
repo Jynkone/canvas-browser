@@ -1,4 +1,6 @@
-import { contextBridge, ipcRenderer } from 'electron'
+// nodeIntegration: true, contextIsolation: false
+// No contextBridge — assign directly to window.
+import { ipcRenderer } from 'electron'
 ipcRenderer.setMaxListeners(0)
 import type { IpcRendererEvent } from 'electron'
 import type {
@@ -10,38 +12,65 @@ import type {
   ThawPayload,
   SnapshotRequest,
   SnapshotResult,
+  CreateTabPayload,
+  CreateTabResponse,
+  DestroyTabPayload,
+  SendInputPayload,
+  BoundsPayload,
+  NavigatePayload,
+  SimpleResult,
+  TabIdPayload,
+  NavigationStateResult,
+  SetLifecyclePayload,
+  PersistedStateResult,
+  SharedTextureFrame,
 } from '../types/overlay'
 
-// 1) Versions bridge
-contextBridge.exposeInMainWorld('electron', {
-  process: { versions: process.versions },
-})
+declare global {
+  interface Window {
+    electron: { process: { versions: NodeJS.ProcessVersions } }
+    overlay: OverlayAPI
+  }
+}
 
-// 2) Overlay bridge (typed via OverlayAPI)
+const frameCallbacks = new Map<string, (frame: SharedTextureFrame, tabId: string) => void>()
+
+const st = (require('electron') as any).sharedTexture
+if (st) {
+  st.setSharedTextureReceiver((frame: any, tabId: string) => {
+    const cb = frameCallbacks.get(tabId)
+    if (!cb) {
+      try { frame?.importedSharedTexture?.release?.() } catch { }
+      return
+    }
+    cb(frame, tabId)
+  })
+} else {
+  console.warn('[preload] sharedTexture not available')
+}
+
+// ---- Overlay API -----------------------------------------------------------
 const overlay: OverlayAPI = {
-  createTab: (payload) => ipcRenderer.invoke('overlay:create-tab', payload),
-  show: (payload) => ipcRenderer.invoke('overlay:show', payload),
-  hide: (payload) => ipcRenderer.invoke('overlay:hide', payload),
-  destroy: (payload) => ipcRenderer.invoke('overlay:destroy', payload),
-  setBounds: (payload) => ipcRenderer.invoke('overlay:set-bounds', payload),
-  setZoom: (payload) => ipcRenderer.invoke('overlay:set-zoom', payload),
+  createTab: (payload: CreateTabPayload): Promise<CreateTabResponse> => ipcRenderer.invoke('overlay:create-tab', payload),
+  show: (payload: TabIdPayload): Promise<void> => ipcRenderer.invoke('overlay:show', payload),
+  hide: (payload: TabIdPayload): Promise<void> => ipcRenderer.invoke('overlay:hide', payload),
+  destroy: (payload: DestroyTabPayload): Promise<void> => ipcRenderer.invoke('overlay:destroy', payload),
 
-  focus: (payload) => ipcRenderer.invoke('overlay:focus', payload),
-  blur: () => ipcRenderer.invoke('overlay:blur'),
+  sendInput: (payload: SendInputPayload): Promise<void> => ipcRenderer.invoke('overlay:send-input', payload),
+  setBounds: (payload: BoundsPayload | BoundsPayload[]): Promise<void> => ipcRenderer.invoke('overlay:set-bounds', payload),
 
-  navigate: (payload) => ipcRenderer.invoke('overlay:navigate', payload),
-  goBack: (payload) => ipcRenderer.invoke('overlay:go-back', payload),
-  goForward: (payload) => ipcRenderer.invoke('overlay:go-forward', payload),
-  reload: (payload) => ipcRenderer.invoke('overlay:reload', payload),
-  getNavigationState: (payload) => ipcRenderer.invoke('overlay:get-navigation-state', payload),
+  navigate: (payload: NavigatePayload): Promise<SimpleResult> => ipcRenderer.invoke('overlay:navigate', payload),
+  goBack: (payload: TabIdPayload): Promise<SimpleResult> => ipcRenderer.invoke('overlay:go-back', payload),
+  goForward: (payload: TabIdPayload): Promise<SimpleResult> => ipcRenderer.invoke('overlay:go-forward', payload),
+  reload: (payload: TabIdPayload): Promise<SimpleResult> => ipcRenderer.invoke('overlay:reload', payload),
+  getNavigationState: (payload: TabIdPayload): Promise<NavigationStateResult> => ipcRenderer.invoke('overlay:get-navigation-state', payload),
 
-  freeze: (payload: FreezePayload) => ipcRenderer.invoke('overlay:freeze', payload),
-  thaw: (payload: ThawPayload) => ipcRenderer.invoke('overlay:thaw', payload),
-  snapshot: (request: SnapshotRequest): Promise<SnapshotResult> =>
-    ipcRenderer.invoke('overlay:snapshot', request),
+  freeze: (payload: FreezePayload): Promise<void> => ipcRenderer.invoke('overlay:freeze', payload),
+  thaw: (payload: ThawPayload): Promise<void> => ipcRenderer.invoke('overlay:thaw', payload),
+  snapshot: (request: SnapshotRequest): Promise<SnapshotResult> => ipcRenderer.invoke('overlay:snapshot', request),
 
-  setLifecycle: (payload) => ipcRenderer.invoke('overlay:set-lifecycle', payload),
-  getPersistedState: () => ipcRenderer.invoke('overlay:get-persisted-state'),
+  setLifecycle: (payload: SetLifecyclePayload): Promise<SimpleResult> => ipcRenderer.invoke('overlay:set-lifecycle', payload),
+  getPersistedState: (): Promise<PersistedStateResult> => ipcRenderer.invoke('overlay:get-persisted-state'),
 
   saveThumb: (payload: { tabId: string; url: string; dataUrlWebp: string }) =>
     ipcRenderer.invoke('overlay:save-thumb', payload),
@@ -83,23 +112,20 @@ const overlay: OverlayAPI = {
     return () => ipcRenderer.removeListener(ch, h)
   },
 
-  // ✅ CHANGED: now receives decoded pixels, not a GPU handle
-  onFrame: (callback) => {
-    const ch = 'overlay-video-frame'
-    const h = (
-      _e: IpcRendererEvent,
-      data: { tabId: string; pixels: Buffer; width: number; height: number }
-    ) => callback(data)
-    ipcRenderer.on(ch, h)
-    return () => ipcRenderer.removeListener(ch, h)
+  onFrame: (tabId, callback) => {
+    frameCallbacks.set(tabId, callback)
+    return () => {
+      if (frameCallbacks.get(tabId) === callback) {
+        frameCallbacks.delete(tabId)
+      }
+    }
   },
 
-  // ✅ CHANGED: no longer needed — pixels arrive pre-decoded.
-  // Kept as a no-op so existing type references don't break.
   decodeGPUFrame: async (_handle: Uint8Array): Promise<ImageBitmap | null> => {
-    console.warn('[preload] decodeGPUFrame called but is now a no-op — frames arrive pre-decoded via onFrame')
+    console.warn('[preload] decodeGPUFrame is a no-op')
     return null
   },
 } satisfies OverlayAPI
 
-contextBridge.exposeInMainWorld('overlay', overlay)
+window.electron = { process: { versions: process.versions } }
+window.overlay = overlay

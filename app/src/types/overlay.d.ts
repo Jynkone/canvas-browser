@@ -2,7 +2,7 @@
 
 export type Rect = { x: number; y: number; width: number; height: number }
 
-export type TabResult =
+export type CreateTabResponse =
   | { ok: true; tabId: string }
   | { ok: false; error: string }
 
@@ -34,6 +34,7 @@ export type CaptureResult =
   | { ok: false; error: string }
 
 export type LifecycleState = 'live' | 'frozen' | 'discarded'
+export type LifecycleKind = 'hot' | 'warm' | 'frozen'
 
 export type CreateTabPayload =
   | { shapeId: string; url: string }
@@ -53,9 +54,9 @@ export interface BoundsPayload {
   shapeSize?: { w: number; h: number }
 }
 
-export interface ZoomPayload {
-  tabId?: string
-  factor: number
+export interface SendInputPayload {
+  tabId: string
+  event: object
 }
 
 export interface NavigatePayload {
@@ -104,12 +105,14 @@ export type SnapshotResult =
 export type OverlayNotice =
   | { kind: 'tab-limit'; max: number }
   | { kind: 'popup-suppressed'; url: string }
+  | { kind: 'external-auth'; provider: 'google'; url: string }
   | { kind: 'tab-crashed'; tabId: string }
   | { kind: 'nav-error'; tabId: string; code: number; description: string; url?: string }
   | { kind: 'screen-share-error'; message: string }
   | { kind: 'media-denied'; which: string }
   | { kind: 'pressure'; level: 'normal' | 'elevated' | 'critical'; availableMB: number }
   | { kind: 'flags'; tabId: string; flags: Flags }
+  | { kind: 'cursor'; tabId: string; cursor: string }
 
 export interface PopupAckPayload {
   openerTabId: string
@@ -117,29 +120,23 @@ export interface PopupAckPayload {
   childTabId?: string
 }
 
-// ── Frame data: pixels are already decoded RGBA by the main process ──────────
-// The old approach sent a raw GPU handle and round-tripped it back to main for
-// decoding, but the texture was released before the second IPC arrived.
-// Now the main process decodes in the paint handler (before tex.release()) and
-// sends the resulting pixel buffer directly to the renderer.
-export interface FrameData {
-  tabId: string
-  pixels: Buffer      // RGBA bytes, width*height*4 length
-  width: number
-  height: number
+export interface SharedTextureFrame {
+  importedSharedTexture: {
+    getVideoFrame(): VideoFrame
+    release(): void
+  }
 }
 
 export interface OverlayAPI {
-  createTab(payload: CreateTabPayload): Promise<TabResult>
-  show(payload: BoundsPayload | TabIdPayload): Promise<void>
+  createTab(payload: CreateTabPayload): Promise<CreateTabResponse>
+  show(payload: TabIdPayload): Promise<void>
   hide(payload: TabIdPayload): Promise<void>
   destroy(payload: DestroyTabPayload): Promise<void>
+
+  sendInput(payload: SendInputPayload): Promise<void>
   setBounds(payload: BoundsPayload | BoundsPayload[]): Promise<void>
-  setZoom(payload: ZoomPayload | ZoomPayload[]): Promise<void>
 
-  focus(payload?: Partial<TabIdPayload>): Promise<void>
-  blur(): Promise<void>
-
+  onFrame(tabId: string, callback: (frame: SharedTextureFrame, tabId: string) => void): () => void
   onUrlUpdate(callback: (data: { tabId: string; url?: string }) => void): () => void
   onPressure(cb: (p: { level: 'normal' | 'elevated' | 'critical'; freeMB: number; totalMB: number }) => void): () => void
 
@@ -162,10 +159,7 @@ export interface OverlayAPI {
   getPersistedState(): Promise<PersistedStateResult>
   saveThumb(payload: { tabId: string; url: string; dataUrlWebp: string }): Promise<{ ok: true; thumbPath: string } | { ok: false }>
 
-  // ✅ Receives pre-decoded RGBA pixels — no GPU handle round-trip
-  onFrame(cb: (data: FrameData) => void): () => void
-
-  // Kept for API compat but is now a no-op (decoding happens in main process)
+  // Kept for API compat but is now a no-op
   decodeGPUFrame(handle: Uint8Array): Promise<ImageBitmap | null>
 }
 

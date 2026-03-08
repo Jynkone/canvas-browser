@@ -376,8 +376,6 @@ function createOSR(id, url) {
         width: 1920, height: 1080,
         webPreferences: {
             offscreen: { useSharedTexture: true },
-            backgroundThrottling: false,
-            sandbox: false,
             deviceScaleFactor: 1,
         }
     })
