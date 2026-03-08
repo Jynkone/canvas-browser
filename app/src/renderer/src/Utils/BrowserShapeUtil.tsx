@@ -23,6 +23,8 @@ export type BrowserShape = TLBaseShape<
   { w: number; h: number; url: string }
 >
 
+export const browserTabSuspendRegistry = new Map<string, { current: boolean }>()
+
 export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
   static override type = 'browser-shape' as const
   override isAspectRatioLocked = () => false
@@ -38,131 +40,207 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
 
   override onResize(shape: BrowserShape, info: TLResizeInfo<BrowserShape>) {
     const r = resizeBox(shape, info)
-    return { ...r, props: { ...r.props, w: Math.max(MIN_W, r.props.w), h: Math.max(MIN_H, r.props.h) } }
+    return {
+      ...r,
+      props: {
+        ...r.props,
+        w: Math.max(MIN_W, r.props.w),
+        h: Math.max(MIN_H, r.props.h),
+      },
+    }
   }
 
   override getGeometry(shape: BrowserShape) {
-    return new BrowserGrabGeometry({ x: 0, y: 0, width: shape.props.w, height: shape.props.h, isFilled: true })
+    return new BrowserGrabGeometry({
+      x: 0,
+      y: 0,
+      width: shape.props.w,
+      height: shape.props.h,
+      isFilled: true,
+    })
   }
 
   override component(shape: BrowserShape) {
     const api = window.overlay
     const canvasRef = useRef<HTMLCanvasElement | null>(null)
     const tabIdRef = useRef<string | null>(null)
+    const creatingRef = useRef(false)
 
-    const navState = { currentUrl: shape.props.url, canGoBack: false, canGoForward: false, title: '' }
+    const contentH = shape.props.h - NAV_BAR_HEIGHT
 
-    // 1. CREATE THE OFFSCREEN TAB
+    // ── 1. CREATE TAB ──────────────────────────────────────────────────────
     useEffect(() => {
-      if (!api || tabIdRef.current) return
-      let cancelled = false;
+      if (!api || tabIdRef.current || creatingRef.current) return
+      creatingRef.current = true
+      let alive = true
 
-      (async () => {
-        try {
-          console.log('[DEBUG] Requesting OSR tab creation for:', shape.props.url);
-          // Your Main Process MUST be creating this with webPreferences: { offscreen: true }
-          const res = await api.createTab({ url: shape.props.url, shapeId: shape.id })
-          if (!res.ok || cancelled) return
+        ; (async () => {
+          try {
+            console.log('[BrowserShape] Creating tab:', shape.id)
+            const res = await api.createTab({ url: shape.props.url, shapeId: shape.id })
 
-          tabIdRef.current = res.tabId
-          console.log('[DEBUG] OSR Tab created. ID:', res.tabId);
-        } catch (err) {
-          console.error('[DEBUG] Failed to create tab:', err)
-        }
-      })()
-
-      return () => { cancelled = true }
-    }, [api, shape.props.url, shape.id])
-
-    // Add this ref at the top of your component function with the other refs
-    // 1. Add this ref at the top of your component with your other refs
-    const frameCountRef = useRef(0);
-
-    // 2. Replace your "CATCH AND PAINT" effect with this:
-    useEffect(() => {
-      if (!api) return;
-
-      const canvas = canvasRef.current;
-      if (!canvas) {
-        console.error('[React] Canvas ref is missing');
-        return;
-      }
-
-      const ctx = canvas.getContext('bitmaprenderer');
-      if (!ctx) {
-        console.error('[React] bitmaprenderer context not supported!');
-        return;
-      }
-
-      const offFrame = api.onFrame(async ({ tabId, handle }) => {
-        // Only process frames for THIS specific tab instance
-        if (tabId !== tabIdRef.current) return;
-
-        frameCountRef.current++;
-
-        // Log the first frame, and then every 100th frame to prove it's alive
-        if (frameCountRef.current === 1) {
-          console.log('[React] 🟢 FIRST frame arrived for tab:', tabId);
-        } else if (frameCountRef.current % 100 === 0) {
-          console.log(`[React] Frame #${frameCountRef.current} received for ${tabId}`);
-        }
-
-        try {
-          // Attempt to turn the GPU handle into a usable bitmap
-          const bitmap = await api.decodeGPUFrame(handle);
-
-          if (bitmap) {
-            // Blast the bitmap onto the canvas
-            ctx.transferFromImageBitmap(bitmap);
-          } else {
-            // If this fires, your C++ bridge (texture_bridge.node) is returning null
-            if (frameCountRef.current % 60 === 0) {
-              console.warn('[React] decodeGPUFrame returned NULL at frame:', frameCountRef.current);
+            if (!alive) {
+              if (res.ok) void api.destroy({ tabId: res.tabId })
+              return
             }
+            if (!res.ok) {
+              console.error('[BrowserShape] createTab failed:', res.error)
+              creatingRef.current = false
+              return
+            }
+
+            tabIdRef.current = res.tabId
+            console.log('[BrowserShape] Tab created:', res.tabId)
+
+            // Tell the OSR window its real pixel dimensions immediately
+            await api.setBounds({
+              tabId: res.tabId,
+              rect: {
+                x: 0,
+                y: 0,
+                width: Math.max(1, Math.round(shape.props.w)),
+                height: Math.max(1, Math.round(contentH)),
+              },
+            })
+          } catch (err) {
+            console.error('[BrowserShape] create error:', err)
+            creatingRef.current = false
+          }
+        })()
+
+      return () => {
+        alive = false
+        creatingRef.current = false
+      }
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [api, shape.id])
+
+    // ── 2. SYNC BOUNDS on resize ───────────────────────────────────────────
+    useEffect(() => {
+      const tabId = tabIdRef.current
+      if (!api || !tabId) return
+      void api.setBounds({
+        tabId,
+        rect: {
+          x: 0,
+          y: 0,
+          width: Math.max(1, Math.round(shape.props.w)),
+          height: Math.max(1, Math.round(contentH)),
+        },
+      })
+    }, [api, shape.props.w, contentH])
+
+    // ── 3. PAINT FRAMES ────────────────────────────────────────────────────
+    const frameCountRef = useRef(0)
+
+    useEffect(() => {
+      if (!api) return
+      const canvas = canvasRef.current
+      if (!canvas) return
+
+      // Prefer bitmaprenderer; fall back to 2d
+      const bitmapCtx = canvas.getContext('bitmaprenderer') as ImageBitmapRenderingContext | null
+      const ctx2d = bitmapCtx ? null : (canvas.getContext('2d') as CanvasRenderingContext2D | null)
+
+      if (!bitmapCtx && !ctx2d) {
+        console.error('[BrowserShape] No canvas context available')
+        return
+      }
+
+      const offFrame = api.onFrame(async (data: {
+        tabId: string
+        pixels: Buffer
+        width: number
+        height: number
+      }) => {
+        if (data.tabId !== tabIdRef.current) return
+
+        frameCountRef.current++
+        if (frameCountRef.current === 1) {
+          console.log('[BrowserShape] 🟢 First frame! tab:', data.tabId, data.width, 'x', data.height)
+        }
+
+        try {
+          // pixels is a Node Buffer of RGBA bytes decoded by the C++ bridge
+          // We need a plain ArrayBuffer for ImageData
+          let rawBuffer: ArrayBuffer
+          if ((data.pixels as unknown as { buffer: ArrayBuffer }).buffer instanceof ArrayBuffer) {
+            rawBuffer = (data.pixels as unknown as { buffer: ArrayBuffer; byteOffset: number; byteLength: number }).buffer
+          } else {
+            // Fallback: copy into a new ArrayBuffer
+            const arr = new Uint8Array(data.width * data.height * 4)
+            arr.set(data.pixels as unknown as Uint8Array)
+            rawBuffer = arr.buffer
+          }
+
+          const rgba = new Uint8ClampedArray(rawBuffer)
+          const imageData = new ImageData(rgba, data.width, data.height)
+
+          if (bitmapCtx) {
+            const bitmap = await createImageBitmap(imageData)
+            bitmapCtx.transferFromImageBitmap(bitmap)
+          } else if (ctx2d) {
+            ctx2d.putImageData(imageData, 0, 0)
           }
         } catch (err) {
-          console.error('[React] Frame processing error:', err);
+          console.error('[BrowserShape] Frame paint error:', err)
         }
-      });
+      })
 
       return () => {
-        offFrame();
-        frameCountRef.current = 0;
-      };
-    }, [api]);    // 3. CLEANUP
+        offFrame()
+        frameCountRef.current = 0
+      }
+    }, [api])
+
+    // ── 4. DESTROY on unmount ──────────────────────────────────────────────
     useEffect(() => {
       return () => {
-        if (api && tabIdRef.current) void api.destroy({ tabId: tabIdRef.current });
-      };
-    }, [api]);
+        const tabId = tabIdRef.current
+        if (api && tabId) {
+          console.log('[BrowserShape] Destroying tab:', tabId)
+          void api.destroy({ tabId })
+          tabIdRef.current = null
+        }
+      }
+    }, [api])
 
+    // ── RENDER ────────────────────────────────────────────────────────────
     return (
       <HTMLContainer style={{ width: shape.props.w, height: shape.props.h, pointerEvents: 'auto' }}>
-        <div style={{ width: '100%', height: '100%', display: 'flex', flexDirection: 'column', background: '#fff' }}>
-
-          <div style={{ position: 'relative', zIndex: 2, background: '#f1f1f1' }}>
+        <div
+          style={{
+            width: '100%',
+            height: '100%',
+            display: 'flex',
+            flexDirection: 'column',
+            background: '#fff',
+          }}
+        >
+          <div style={{ flexShrink: 0, zIndex: 2 }}>
             <NavigationBar
-              navState={navState}
+              navState={{ currentUrl: shape.props.url, canGoBack: false, canGoForward: false, title: '' }}
               isLoading={false}
-              onUrlChange={(url) => api?.navigate({ tabId: tabIdRef.current!, url })}
-              onBack={() => api?.goBack({ tabId: tabIdRef.current! })}
-              onForward={() => api?.goForward({ tabId: tabIdRef.current! })}
-              onReload={() => api?.reload({ tabId: tabIdRef.current! })}
+              onUrlChange={(url) => {
+                const tabId = tabIdRef.current
+                if (tabId) api?.navigate({ tabId, url })
+              }}
+              onBack={() => { const t = tabIdRef.current; if (t) api?.goBack({ tabId: t }) }}
+              onForward={() => { const t = tabIdRef.current; if (t) api?.goForward({ tabId: t }) }}
+              onReload={() => { const t = tabIdRef.current; if (t) api?.reload({ tabId: t }) }}
               fitMode={false}
               onToggleFit={() => { }}
             />
           </div>
 
-          {/* THE CANVAS: This is where the image stream paints */}
-          <div style={{ flex: 1, position: 'relative', overflow: 'hidden' }}>
+          <div style={{ flex: 1, overflow: 'hidden', position: 'relative' }}>
             <canvas
               ref={canvasRef}
-              width={shape.props.w}
-              height={shape.props.h - NAV_BAR_HEIGHT}
-              style={{ display: 'block', width: '100%', height: '100%', objectFit: 'fill' }}
+              width={Math.max(1, Math.round(shape.props.w))}
+              height={Math.max(1, Math.round(contentH))}
+              style={{ display: 'block', width: '100%', height: '100%' }}
             />
           </div>
-
         </div>
       </HTMLContainer>
     )

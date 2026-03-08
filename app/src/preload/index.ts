@@ -1,6 +1,6 @@
 import { contextBridge, ipcRenderer } from 'electron'
 ipcRenderer.setMaxListeners(0)
-import type { IpcRendererEvent } from 'electron' // ← add this
+import type { IpcRendererEvent } from 'electron'
 import type {
   OverlayAPI,
   PopupAckPayload,
@@ -26,11 +26,9 @@ const overlay: OverlayAPI = {
   setBounds: (payload) => ipcRenderer.invoke('overlay:set-bounds', payload),
   setZoom: (payload) => ipcRenderer.invoke('overlay:set-zoom', payload),
 
-  // focus / capture (optional)
   focus: (payload) => ipcRenderer.invoke('overlay:focus', payload),
   blur: () => ipcRenderer.invoke('overlay:blur'),
 
-  // navigation
   navigate: (payload) => ipcRenderer.invoke('overlay:navigate', payload),
   goBack: (payload) => ipcRenderer.invoke('overlay:go-back', payload),
   goForward: (payload) => ipcRenderer.invoke('overlay:go-forward', payload),
@@ -42,18 +40,11 @@ const overlay: OverlayAPI = {
   snapshot: (request: SnapshotRequest): Promise<SnapshotResult> =>
     ipcRenderer.invoke('overlay:snapshot', request),
 
-  setLifecycle: (payload) =>
-    ipcRenderer.invoke('overlay:set-lifecycle', payload),
+  setLifecycle: (payload) => ipcRenderer.invoke('overlay:set-lifecycle', payload),
+  getPersistedState: () => ipcRenderer.invoke('overlay:get-persisted-state'),
 
-  getPersistedState: () =>
-    ipcRenderer.invoke('overlay:get-persisted-state'),
-
-  saveThumb: (payload: {
-    tabId: string;
-    url: string;
-    dataUrlWebp: string;
-  }) => ipcRenderer.invoke('overlay:save-thumb', payload),
-
+  saveThumb: (payload: { tabId: string; url: string; dataUrlWebp: string }) =>
+    ipcRenderer.invoke('overlay:save-thumb', payload),
 
   onUrlUpdate: (callback) => {
     const ch = 'overlay-url-updated'
@@ -91,34 +82,24 @@ const overlay: OverlayAPI = {
     ipcRenderer.on(ch, h)
     return () => ipcRenderer.removeListener(ch, h)
   },
+
+  // ✅ CHANGED: now receives decoded pixels, not a GPU handle
   onFrame: (callback) => {
     const ch = 'overlay-video-frame'
-    const h = (_e: IpcRendererEvent, data: { tabId: string; handle: Uint8Array }) => callback(data)
+    const h = (
+      _e: IpcRendererEvent,
+      data: { tabId: string; pixels: Buffer; width: number; height: number }
+    ) => callback(data)
     ipcRenderer.on(ch, h)
     return () => ipcRenderer.removeListener(ch, h)
   },
 
-  // Takes the raw Windows GPU Handle and translates it into a web ImageBitmap
-  decodeGPUFrame: async (handle: Uint8Array): Promise<ImageBitmap | null> => {
-    try {
-      const pixelData = await ipcRenderer.invoke('overlay:decode-handle', handle);
-
-      // Guard against 0x0 frames
-      if (!pixelData || pixelData.width <= 0 || pixelData.height <= 0) return null;
-
-      // Use a zero-copy reference to the buffer memory
-      const imageData = new ImageData(
-        new Uint8ClampedArray(pixelData.buffer.buffer, pixelData.buffer.byteOffset, pixelData.buffer.byteLength),
-        pixelData.width,
-        pixelData.height
-      );
-
-      return await createImageBitmap(imageData);
-    } catch {
-      return null;
-    }
+  // ✅ CHANGED: no longer needed — pixels arrive pre-decoded.
+  // Kept as a no-op so existing type references don't break.
+  decodeGPUFrame: async (_handle: Uint8Array): Promise<ImageBitmap | null> => {
+    console.warn('[preload] decodeGPUFrame called but is now a no-op — frames arrive pre-decoded via onFrame')
+    return null
   },
 } satisfies OverlayAPI
-
 
 contextBridge.exposeInMainWorld('overlay', overlay)

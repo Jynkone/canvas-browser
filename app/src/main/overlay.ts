@@ -1,4 +1,4 @@
-import { app, BrowserWindow, WebContentsView, ipcMain, Menu, desktopCapturer, dialog, WebContents } from 'electron'
+import { app, BrowserWindow, ipcMain, Menu, desktopCapturer, dialog, WebContents } from 'electron'
 import type { Debugger as ElectronDebugger, Input, SystemMemoryInfo } from 'electron'
 import { writeFileSync, readFileSync, existsSync } from 'fs'
 import { join } from 'path'
@@ -722,7 +722,6 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null): void {
               useSharedTexture: true // Your high-speed bridge depends on this
             },
             backgroundThrottling: false,
-            //paintWhenInitiallyHidden: true, // 🟢 FORCE CHROMIUM TO PAINT WHILE HIDDEN
             contextIsolation: true,
             sandbox: true,
             devTools: true,
@@ -730,41 +729,13 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null): void {
           },
         })
 
-        // Force the compositor to wake up
-        try {
-          view.webContents.setFrameRate(60);
-          console.log(`[Native] Set 60fps for ${tabId}`);
-        } catch (e) { }
-
+        try { view.webContents.startPainting() } catch (e) { console.error('[OSR] startPainting failed:', e) }
+        console.log('[OSR] isPainting:', view.webContents.isPainting())
+        view.webContents.setFrameRate(60)
         wireFlagsFor(tabId, view.webContents)
         view.webContents.openDevTools({ mode: "detach" });
 
         // 🔥 THE LOGGING ENGINE 🔥
-        view.webContents.on('paint', (event, dirty, _image) => {
-          // 1. Log that the event even exists
-          if (Math.random() < 0.01) { // Log every ~100th frame to avoid flooding
-            console.log(`[Native] Paint event firing for ${tabId}. Dirty: ${dirty.width}x${dirty.height}`);
-          }
-
-          const tex = (event as any).texture;
-          if (tex) {
-            const handle = tex.textureInfo.sharedTextureHandle;
-
-            const win = getWindow();
-            if (win && !win.isDestroyed() && handle) {
-              win.webContents.send('overlay-video-frame', { tabId, handle });
-            } else if (!win) {
-              console.error('[Native] Main Window is NULL. Cannot send frames to React!');
-            }
-            tex.release();
-          } else {
-            // If you see this log, your Electron version/Hardware doesn't support shared textures
-            console.error('[Native] Paint event fired but NO GPU TEXTURE found.');
-          }
-        });
-        try {
-          view.webContents.setFrameRate(60);
-        } catch (e) { }
 
         wireFlagsFor(tabId, view.webContents)
         view.webContents.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
@@ -811,24 +782,47 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null): void {
           }
         )
 
+
         view.webContents.on('paint', (event, _dirty, _image) => {
           const tex = (event as any).texture;
-          if (tex) {
-            const handle = tex.textureInfo.sharedTextureHandle;
+          if (!tex) return;
 
-            // 1. Send the handle to the frontend canvas!
+          try {
+            const handle = tex.textureInfo?.sharedTextureHandle;
             const win = getWindow();
-            if (win && !win.isDestroyed() && handle) {
-              win.webContents.send('overlay-video-frame', {
-                tabId,
-                handle
-              });
-            }
+            if (!win || win.isDestroyed() || !handle) return;
 
-            // 2. MUST release it so Chromium can keep rendering
+            if (textureBridge) {
+              // ✅ DECODE HERE — while we still hold the texture reference
+              // After tex.release() the handle is invalid, so this MUST happen first
+              const handleBuf: Buffer = Buffer.isBuffer(handle)
+                ? handle
+                : Buffer.from(handle as Uint8Array);
+
+              const pixelData = textureBridge.decodeHandle(handleBuf) as
+                | { buffer: Buffer; width: number; height: number }
+                | null;
+
+              if (pixelData && pixelData.width > 0 && pixelData.height > 0) {
+                // Send already-decoded RGBA pixels — no second IPC roundtrip needed
+                win.webContents.send('overlay-video-frame', {
+                  tabId,
+                  pixels: pixelData.buffer,
+                  width: pixelData.width,
+                  height: pixelData.height,
+                });
+              }
+            }
+          } catch (err) {
+            // Don't let a bridge error crash the paint loop
+            console.error('[paint] decode error:', err);
+          } finally {
+            // ✅ Release AFTER decoding
             tex.release();
           }
         });
+
+
 
         // Chromium's pre-check: say "yes" for clipboard AND fullscreen
         view.webContents.session.setPermissionCheckHandler((_wc, permission) => {
@@ -954,13 +948,6 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null): void {
               { tabId, at: Date.now() } satisfies { tabId: string; at: number }
             )
           } catch { }
-        }
-
-        try {
-          await S.reapply(state);
-          await view.webContents.loadURL(savedUrl);
-        } catch (err) {
-          console.error('[overlay] loadURL failed:', err);
         }
 
         view.webContents.on('dom-ready', safeReapply)
@@ -1315,8 +1302,6 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null): void {
         })
 
 
-        await S.reapply(state)
-        try { await view.webContents.loadURL(savedUrl) } catch { }
 
         return { ok: true as const, tabId }
       } catch (err) {

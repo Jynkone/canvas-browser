@@ -2,7 +2,6 @@
 
 export type Rect = { x: number; y: number; width: number; height: number }
 
-// --- Results (discriminated unions)
 export type TabResult =
   | { ok: true; tabId: string }
   | { ok: false; error: string }
@@ -26,8 +25,6 @@ export type Flags = {
   pinned: boolean
 }
 
-
-
 export type NavigationStateResult =
   | ({ ok: true } & NavigationState & { isLoading: boolean })
   | { ok: false; error: string }
@@ -36,22 +33,16 @@ export type CaptureResult =
   | { ok: true; dataUrl: string }
   | { ok: false; error: string }
 
-// 👇👇 THIS is the lifecycle we’re using everywhere now
 export type LifecycleState = 'live' | 'frozen' | 'discarded'
 
-// --- payloads
-
-// create has two shapes now: normal + restore
 export type CreateTabPayload =
   | { shapeId: string; url: string }
   | { shapeId: string; restore: true }
 
-// for most calls (show/hide/goBack/...) this stays simple
 export interface TabIdPayload {
   tabId: string
 }
 
-// destroy is the only one that can carry discard: true
 export type DestroyTabPayload =
   | { tabId: string }
   | { tabId: string; discard: true }
@@ -62,7 +53,6 @@ export interface BoundsPayload {
   shapeSize?: { w: number; h: number }
 }
 
-/** TLDraw zoom (1 = 100%). If omitted, applies globally (supported by main). */
 export interface ZoomPayload {
   tabId?: string
   factor: number
@@ -73,7 +63,6 @@ export interface NavigatePayload {
   url: string
 }
 
-// --- Popup contracts
 export interface PopupRequestPayload {
   eventId: string
   url: string
@@ -81,12 +70,8 @@ export interface PopupRequestPayload {
   parentTabId?: string
 }
 
-export interface FreezePayload {
-  tabId: string
-}
-export interface ThawPayload {
-  tabId: string
-}
+export interface FreezePayload { tabId: string }
+export interface ThawPayload { tabId: string }
 
 export interface SnapshotRequest {
   tabId: string
@@ -132,22 +117,29 @@ export interface PopupAckPayload {
   childTabId?: string
 }
 
-// --- API surface
+// ── Frame data: pixels are already decoded RGBA by the main process ──────────
+// The old approach sent a raw GPU handle and round-tripped it back to main for
+// decoding, but the texture was released before the second IPC arrived.
+// Now the main process decodes in the paint handler (before tex.release()) and
+// sends the resulting pixel buffer directly to the renderer.
+export interface FrameData {
+  tabId: string
+  pixels: Buffer      // RGBA bytes, width*height*4 length
+  width: number
+  height: number
+}
+
 export interface OverlayAPI {
-  // lifecycle / placement
   createTab(payload: CreateTabPayload): Promise<TabResult>
   show(payload: BoundsPayload | TabIdPayload): Promise<void>
   hide(payload: TabIdPayload): Promise<void>
-  // 👇 this is the important change
   destroy(payload: DestroyTabPayload): Promise<void>
   setBounds(payload: BoundsPayload | BoundsPayload[]): Promise<void>
   setZoom(payload: ZoomPayload | ZoomPayload[]): Promise<void>
 
-  // focus / capture (optional)
   focus(payload?: Partial<TabIdPayload>): Promise<void>
   blur(): Promise<void>
 
-  // events
   onUrlUpdate(callback: (data: { tabId: string; url?: string }) => void): () => void
   onPressure(cb: (p: { level: 'normal' | 'elevated' | 'critical'; freeMB: number; totalMB: number }) => void): () => void
 
@@ -168,14 +160,15 @@ export interface OverlayAPI {
 
   setLifecycle(payload: SetLifecyclePayload): Promise<SimpleResult>
   getPersistedState(): Promise<PersistedStateResult>
-
   saveThumb(payload: { tabId: string; url: string; dataUrlWebp: string }): Promise<{ ok: true; thumbPath: string } | { ok: false }>
-  onFrame(cb: (data: { tabId: string; handle: Uint8Array }) => void): () => void
+
+  // ✅ Receives pre-decoded RGBA pixels — no GPU handle round-trip
+  onFrame(cb: (data: FrameData) => void): () => void
+
+  // Kept for API compat but is now a no-op (decoding happens in main process)
   decodeGPUFrame(handle: Uint8Array): Promise<ImageBitmap | null>
 }
 
-
-// electron augmentation stays the same …
 import 'electron'
 declare module 'electron' {
   interface WebContents {
