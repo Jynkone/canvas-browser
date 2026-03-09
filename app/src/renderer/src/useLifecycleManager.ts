@@ -23,7 +23,6 @@ export interface Inputs {
   readonly getLifecycleState: (tabId: string) => LifecycleState | undefined
   readonly now: () => number
   readonly getLastInteractionMs: (shapeId: TLShapeId) => number | undefined
-  readonly hasThumb: (shapeId: TLShapeId) => boolean
 }
 
 export interface Outputs {
@@ -32,11 +31,15 @@ export interface Outputs {
 }
 
 export interface Limits {
-  readonly hotCapOverview: number
+  readonly hotCapOverview: number   // max painting tabs when zoom < ZOOM_CAP_THRESHOLD
   readonly tinyPxFloor: number
   readonly freezeHiddenMs: number
   readonly discardFrozenMs: number
 }
+
+// Below this zoom level the paint cap kicks in — you're in "overview" mode.
+// At or above it, all live viewport-visible tabs paint normally.
+const ZOOM_CAP_THRESHOLD = 0.5
 
 type Tracked = {
   readonly tabId: string
@@ -47,42 +50,30 @@ type Tracked = {
   lastPlacementSent: PlacementState | null
 }
 
-export function useLifecycleManager(
-  inputs: Inputs,
-  outputs: Outputs,
-  limits: Limits,
-): void {
+export function useLifecycleManager(inputs: Inputs, outputs: Outputs, limits: Limits): void {
   const st = useRef<{
     byTab: Map<string, Tracked>
     byShape: Map<TLShapeId, string>
-    tickingLifecycle: boolean
+    ticking: boolean
   }>({
-    byTab: new Map<string, Tracked>(),
-    byShape: new Map<TLShapeId, string>(),
-    tickingLifecycle: false,
+    byTab: new Map(),
+    byShape: new Map(),
+    ticking: false,
   })
+
+  // ---- Activity event: bump interaction time and ensure tab is live --------
 
   useEffect(() => {
     const onActivity = (event: Event): void => {
-      const { tabId } = (event as CustomEvent<{ tabId: string }>).detail
+      const { tabId } = (event as CustomEvent<{ tabId: string }>).detail ?? {}
       if (!tabId) return
 
-      const visibleShapes = inputs.getVisibleShapes()
-      const actualLife = inputs.getLifecycleState(tabId) ?? 'live'
       let tracked = st.current.byTab.get(tabId)
       if (!tracked) {
-        const now = inputs.now()
-        for (const geom of visibleShapes) {
+        for (const geom of inputs.getVisibleShapes()) {
           const info = inputs.getTabInfo(geom.id)
           if (!info || info.tabId !== tabId) continue
-          tracked = {
-            tabId,
-            shapeId: geom.id,
-            life: actualLife,
-            lastInteractionAt: now,
-            lastLifecycleSent: null,
-            lastPlacementSent: null,
-          }
+          tracked = { tabId, shapeId: geom.id, life: 'live', lastInteractionAt: inputs.now(), lastLifecycleSent: null, lastPlacementSent: null }
           st.current.byTab.set(tabId, tracked)
           st.current.byShape.set(geom.id, tabId)
           break
@@ -90,21 +81,12 @@ export function useLifecycleManager(
         if (!tracked) return
       }
 
-      tracked.life = actualLife
       tracked.life = 'live'
       tracked.lastInteractionAt = inputs.now()
-      if (actualLife !== 'live' || tracked.lastLifecycleSent !== 'live') {
+
+      if (tracked.lastLifecycleSent !== 'live') {
         outputs.setLifecycle(tracked.shapeId, 'live')
         tracked.lastLifecycleSent = 'live'
-      }
-
-      const isVisible = visibleShapes.some((geom) => {
-        if (geom.id !== tracked.shapeId) return false
-        return geom.overlap > 0
-      })
-      if (isVisible && tracked.lastPlacementSent !== 'active') {
-        outputs.setPlacement(tracked.shapeId, 'active', false)
-        tracked.lastPlacementSent = 'active'
       }
     }
 
@@ -112,14 +94,34 @@ export function useLifecycleManager(
     return () => window.removeEventListener('paper:tab-activity', onActivity as EventListener)
   }, [inputs, outputs])
 
+  // ---- Host confirmation: sync Manager state when Host confirms a change ---
+
+  useEffect(() => {
+    const onStateChange = (event: Event): void => {
+      const { tabId, state } = (event as CustomEvent<{ tabId: string; state: LifecycleState }>).detail ?? {}
+      if (!tabId || !state) return
+      const tracked = st.current.byTab.get(tabId)
+      if (!tracked) return
+      tracked.life = state
+      tracked.lastLifecycleSent = state
+    }
+    window.addEventListener('paper:tab-state-changed', onStateChange as EventListener)
+    return () => window.removeEventListener('paper:tab-state-changed', onStateChange as EventListener)
+  }, [])
+
+  // ---- Single tick: sync state, age tabs, update placement -----------------
+
   useEffect(() => {
     const interval = window.setInterval(() => {
-      if (st.current.tickingLifecycle) return
-      st.current.tickingLifecycle = true
+      if (st.current.ticking) return
+      st.current.ticking = true
 
       try {
         const now = inputs.now()
+        const { zoom } = inputs.getCamera()
+        const visibleTabs = new Set<string>()
 
+        // Upsert all currently visible shapes into tracking
         for (const geom of inputs.getVisibleShapes()) {
           const info = inputs.getTabInfo(geom.id)
           if (!info) continue
@@ -128,20 +130,22 @@ export function useLifecycleManager(
           const tracked = st.current.byTab.get(info.tabId)
           if (tracked) {
             tracked.shapeId = geom.id
-            tracked.life = inputs.getLifecycleState(info.tabId) ?? tracked.life
-            continue
+            // do NOT overwrite tracked.life — Manager owns it after first insert
+          } else {
+            st.current.byTab.set(info.tabId, {
+              tabId: info.tabId,
+              shapeId: geom.id,
+              life: inputs.getLifecycleState(info.tabId) ?? 'live',
+              lastInteractionAt: now,
+              lastLifecycleSent: null,
+              lastPlacementSent: null,
+            })
           }
 
-          st.current.byTab.set(info.tabId, {
-            tabId: info.tabId,
-            shapeId: geom.id,
-            life: inputs.getLifecycleState(info.tabId) ?? 'live',
-            lastInteractionAt: now,
-            lastLifecycleSent: null,
-            lastPlacementSent: null,
-          })
+          if (geom.overlap > 0) visibleTabs.add(info.tabId)
         }
 
+        // Pull in any interaction bumps from Host
         for (const [shapeId, tabId] of st.current.byShape) {
           const tracked = st.current.byTab.get(tabId)
           if (!tracked) continue
@@ -152,8 +156,8 @@ export function useLifecycleManager(
           }
         }
 
+        // Age tabs — lifecycle is zoom-independent, always runs
         for (const tracked of st.current.byTab.values()) {
-          tracked.life = inputs.getLifecycleState(tracked.tabId) ?? tracked.life
           const idle = now - tracked.lastInteractionAt
 
           if (tracked.life === 'live' && idle >= limits.freezeHiddenMs) {
@@ -167,54 +171,52 @@ export function useLifecycleManager(
             tracked.lastLifecycleSent = tracked.life
           }
         }
-      } finally {
-        st.current.tickingLifecycle = false
-      }
-    }, 1000)
 
-    return () => window.clearInterval(interval)
-  }, [inputs, outputs, limits])
+        // ---- Paint cap: decide which live+visible tabs actually get to paint --
+        //
+        // Above ZOOM_FULL_THRESHOLD: normal — only viewport-visible tabs paint.
+        // Below ZOOM_CAP_THRESHOLD:  overview mode — cap painting to the
+        //   `hotCapOverview` most recently interacted live tabs. Everything else
+        //   gets background (stopPainting) and just shows its last frame.
+        //
+        // The two thresholds are the same value (0.5) giving a clean cut.
+        // If you want a gradual transition zone, set ZOOM_CAP_THRESHOLD < ZOOM_FULL_THRESHOLD.
 
-  useEffect(() => {
-    const interval = window.setInterval(() => {
-      const visibleTabs = new Set<string>()
-      for (const geom of inputs.getVisibleShapes()) {
-        const info = inputs.getTabInfo(geom.id)
-        if (!info) continue
+        let allowedToPaint: Set<string>
 
-        st.current.byShape.set(geom.id, info.tabId)
-        const tracked = st.current.byTab.get(info.tabId)
-        if (tracked) {
-          tracked.shapeId = geom.id
-          tracked.life = inputs.getLifecycleState(info.tabId) ?? tracked.life
+        if (zoom < ZOOM_CAP_THRESHOLD) {
+          // Overview mode: collect all live visible tabs, sort by recency, take top N
+          const liveCandidates = Array.from(visibleTabs)
+            .map((tabId) => st.current.byTab.get(tabId))
+            .filter((t): t is Tracked => !!t && t.life === 'live')
+            .sort((a, b) => b.lastInteractionAt - a.lastInteractionAt)
+            .slice(0, limits.hotCapOverview)
+
+          allowedToPaint = new Set(liveCandidates.map((t) => t.tabId))
         } else {
-          st.current.byTab.set(info.tabId, {
-            tabId: info.tabId,
-            shapeId: geom.id,
-            life: inputs.getLifecycleState(info.tabId) ?? 'live',
-            lastInteractionAt: inputs.now(),
-            lastLifecycleSent: null,
-            lastPlacementSent: null,
-          })
+          // Normal mode: all live visible tabs paint
+          allowedToPaint = new Set(
+            Array.from(visibleTabs).filter((tabId) => {
+              const t = st.current.byTab.get(tabId)
+              return t && t.life === 'live'
+            })
+          )
         }
 
-        if (geom.overlap > 0) {
-          visibleTabs.add(info.tabId)
+        // Emit placement changes
+        for (const tracked of st.current.byTab.values()) {
+          const nextPlacement: PlacementState = allowedToPaint.has(tracked.tabId) ? 'active' : 'background'
+          if (tracked.lastPlacementSent !== nextPlacement) {
+            outputs.setPlacement(tracked.shapeId, nextPlacement, false)
+            tracked.lastPlacementSent = nextPlacement
+          }
         }
-      }
 
-      for (const tracked of st.current.byTab.values()) {
-        const nextPlacement: PlacementState =
-          tracked.life === 'live' && visibleTabs.has(tracked.tabId)
-            ? 'active'
-            : 'background'
-
-        if (tracked.lastPlacementSent === nextPlacement) continue
-        outputs.setPlacement(tracked.shapeId, nextPlacement, false)
-        tracked.lastPlacementSent = nextPlacement
+      } finally {
+        st.current.ticking = false
       }
     }, 500)
 
     return () => window.clearInterval(interval)
-  }, [inputs, outputs])
+  }, [inputs, outputs, limits])
 }

@@ -3,12 +3,13 @@ import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 import os from "os";
 import { setupOverlayIPC } from "./overlay";
+import { startCookieServer, stopCookieServer } from './canvas-cookie-server'
+
 
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
-app.commandLine.appendSwitch("force_high_performance_gpu");
 app.commandLine.appendSwitch("disable-renderer-backgrounding");
 app.commandLine.appendSwitch("disable-site-isolation-trials");
 app.commandLine.appendSwitch("process-per-site");
@@ -136,6 +137,7 @@ function createWindow(): void {
 }
 
 app.whenReady().then(() => {
+  startCookieServer()  
   createWindow();
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
@@ -154,5 +156,6 @@ app.on("second-instance", () => {
 });
 
 app.on("before-quit", () => {
+  stopCookieServer()
   setHighPerformanceMode(false);
 });

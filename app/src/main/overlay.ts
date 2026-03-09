@@ -91,6 +91,7 @@ function buildBrowserUserAgent(): string {
 }
 
 const BROWSER_USER_AGENT = buildBrowserUserAgent()
+const OVERLAY_PARTITION = 'persist:overlay'
 app.userAgentFallback = BROWSER_USER_AGENT
 
 const browserState: Record<string, PersistedTabState> = {};
@@ -516,12 +517,7 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null): void {
     childWc.on('did-navigate-in-page', (_e, url) => { try { finalize(url) } catch { } })
   }
 
-  function openGoogleAuthExternally(url: string): void {
-    void shell.openExternal(url).catch((error) => {
-      console.error('[auth] Failed to open Google auth externally:', error)
-    })
-    sendNotice({ kind: 'external-auth', provider: 'google', url })
-  }
+
 
   // -------------------- IPC handlers ---------------------------------------
 
@@ -552,6 +548,7 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null): void {
         width: 1280,
         height: 720,
         webPreferences: {
+          partition: OVERLAY_PARTITION,
           offscreen: { useSharedTexture: true },
           backgroundThrottling: false,
           contextIsolation: true,
@@ -562,7 +559,7 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null): void {
 
    
       view.webContents.startPainting()
-      view.webContents.setFrameRate(60)
+      view.webContents.setFrameRate(30)
       const reassertZoom = (): void => {
         try { view.webContents.setZoomFactor(1) } catch { }
       }
@@ -730,13 +727,12 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null): void {
         emitNavHint(tabId, url)
       })
 
-      view.webContents.on('will-navigate', (event, url) => {
-        if (!state || view.webContents.isDestroyed()) return
-        if (!isGoogleAuthUrl(url)) return
-        event.preventDefault()
-        openGoogleAuthExternally(url)
-      })
-
+view.webContents.on('will-navigate', (event, url) => {
+  if (!state || view.webContents.isDestroyed()) return
+  if (!isGoogleAuthUrl(url)) return
+  event.preventDefault()
+  shell.openExternal(url).catch(console.error)
+})
       view.webContents.on('page-title-updated', () => {
         if (state) S.updateNav(state)
         emitNavHint(tabId)
@@ -789,10 +785,16 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null): void {
           if (isNewWindow || hasFeatures) {
             const shouldStay = shouldStayAsPopup(url, features)
             if (shouldStay) {
-              if (isGoogleAuthUrl(url)) {
-                openGoogleAuthExternally(url)
+             /* if (isGoogleAuthUrl(url)) {
+                openAuthWindow(url,  view.webContents, () => {
+                  try {
+                    if (!view.webContents.isDestroyed()) {
+                      view.webContents.reload()
+                    }
+                  } catch { }
+                })
                 return { action: 'deny' }
-              }
+              }*/
               const { width, height } = getPopupWindowBounds(features)
               return {
                 action: 'allow',
@@ -1033,10 +1035,10 @@ export function setupOverlayIPC(getWindow: () => BrowserWindow | null): void {
     if (!state) return { ok: false, error: 'No view' }
     const raw = url.trim()
     const target = raw.startsWith('http://') || raw.startsWith('https://') ? raw : `https://${raw}`
-    if (isGoogleAuthUrl(target)) {
-      openGoogleAuthExternally(target)
-      return { ok: true }
-    }
+if (isGoogleAuthUrl(target)) {
+  shell.openExternal(target).catch(console.error)
+  return { ok: true }
+}
     try {
       await state.view.webContents.loadURL(target)
       S.updateNav(state)
