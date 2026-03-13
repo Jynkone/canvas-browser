@@ -137,9 +137,12 @@ function toCssCursor(cursor: string | undefined): string {
   return map[lower] ?? lower
 }
 
+// Always reads fresh from the DOM — never stale due to closure capture.
+// surfaceW/H must match exactly what was last sent to overlay:set-bounds.
 function toSurfacePoint(
   el: HTMLDivElement,
-  surfaceSize: { width: number; height: number },
+  surfaceW: number,
+  surfaceH: number,
   clientX: number,
   clientY: number,
   fitMode: boolean
@@ -147,8 +150,8 @@ function toSurfacePoint(
   const rect = el.getBoundingClientRect()
   if (rect.width <= 0 || rect.height <= 0) return null
 
-  const surfaceW = Math.max(1, surfaceSize.width)
-  const surfaceH = Math.max(1, surfaceSize.height)
+  const sw = Math.max(1, surfaceW)
+  const sh = Math.max(1, surfaceH)
 
   let left = rect.left
   let top = rect.top
@@ -156,12 +159,11 @@ function toSurfacePoint(
   let height = rect.height
 
   if (fitMode) {
-    const scale = Math.min(rect.width / surfaceW, rect.height / surfaceH)
-    width = surfaceW * scale
-    height = surfaceH * scale
+    const scale = Math.min(rect.width / sw, rect.height / sh)
+    width = sw * scale
+    height = sh * scale
     left = rect.left + (rect.width - width) / 2
     top = rect.top + (rect.height - height) / 2
-
     if (clientX < left || clientX > left + width || clientY < top || clientY > top + height) {
       return null
     }
@@ -171,8 +173,8 @@ function toSurfacePoint(
   const relY = clamp((clientY - top) / Math.max(1, height), 0, 1)
 
   return {
-    x: clamp(Math.round(relX * surfaceW), 0, surfaceW - 1),
-    y: clamp(Math.round(relY * surfaceH), 0, surfaceH - 1),
+    x: clamp(Math.round(relX * sw), 0, sw - 1),
+    y: clamp(Math.round(relY * sh), 0, sh - 1),
   }
 }
 
@@ -293,9 +295,16 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
     const preFitCamRef = useRef<SavedCamera | null>(null)
     const fitStopRef = useRef<(() => void) | null>(null)
 
+    // Keep surface size in a ref so input handlers always read the latest value
+    // without needing to re-register listeners on every resize.
+    const surfaceSizeRef = useRef({ width: 0, height: 0 })
+
     const { width: contentW, height: contentH } = getContentSize(shape)
     const liveTabId = tabSnapshot.lifecycle === 'live' ? tabId : null
     const browserCursor = toCssCursor(tabSnapshot.cursor)
+
+    // Always keep surfaceSizeRef current — runs every render so it's never stale.
+    surfaceSizeRef.current = { width: contentW, height: contentH }
 
     useEffect(() => {
       const onSync = (event: Event): void => {
@@ -346,67 +355,88 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
       setTabSnapshot((prev) => ({ ...prev, isLoading }))
     }
 
+    // ── Input forwarding ──────────────────────────────────────────────────────
+    // Registered once on mount (no liveTabId dep) — handlers read liveTabIdRef
+    // so they always use the current tab ID without re-registering.
+    // surfaceSizeRef is read at call time so coords are always accurate.
+    const liveTabIdRef = useRef<string | null>(null)
+    liveTabIdRef.current = liveTabId
+
+    const fitModeRef = useRef(false)
+    fitModeRef.current = fitMode
+
     useEffect(() => {
       const el = contentRef.current
-      if (!el || !api || !liveTabId) return
+      if (!el || !api) return
+
       let pointerIsDown = false
-      const surfaceSize = { width: contentW, height: contentH }
 
-      const getPoint = (e: MouseEvent | WheelEvent) =>
-        toSurfacePoint(el, surfaceSize, e.clientX, e.clientY, fitMode)
-
-      const sendMouseMove = (e: MouseEvent): void => {
-        const point = getPoint(e)
-        if (!point) return
-        void api.sendInput?.({ tabId: liveTabId, event: { type: 'mouseMove', x: point.x, y: point.y } })
+      const getPoint = (e: MouseEvent | WheelEvent) => {
+        const { width, height } = surfaceSizeRef.current
+        return toSurfacePoint(el, width, height, e.clientX, e.clientY, fitModeRef.current)
       }
 
-      const onMouseDown = (e: MouseEvent) => {
+      const sendMouseMove = (e: MouseEvent): void => {
+        const tid = liveTabIdRef.current
+        if (!tid) return
+        const point = getPoint(e)
+        if (!point) return
+        void api.sendInput?.({ tabId: tid, event: { type: 'mouseMove', x: point.x, y: point.y } })
+      }
+
+      const onMouseDown = (e: MouseEvent): void => {
         if (e.button > 2) return
         e.stopPropagation()
         e.preventDefault()
-        markActivity()
+        // Focus so keydown events reach el
         el.focus({ preventScroll: true })
+        const tid = liveTabIdRef.current
+        if (!tid) return
+        markActivity()
         const point = getPoint(e)
         if (!point) return
         pointerIsDown = true
         sendMouseMove(e)
         void api.sendInput?.({
-          tabId: liveTabId,
+          tabId: tid,
           event: { type: 'mouseDown', x: point.x, y: point.y, button: getMouseButton(e.button), clickCount: e.detail || 1 },
         })
       }
 
-      const onMouseUp = (e: MouseEvent) => {
+      const onMouseUp = (e: MouseEvent): void => {
         if (!pointerIsDown) return
         pointerIsDown = false
         e.stopPropagation()
         e.preventDefault()
+        const tid = liveTabIdRef.current
+        if (!tid) return
         const point = getPoint(e)
         if (!point) return
         void api.sendInput?.({
-          tabId: liveTabId,
+          tabId: tid,
           event: { type: 'mouseUp', x: point.x, y: point.y, button: getMouseButton(e.button), clickCount: e.detail || 1 },
         })
       }
 
-      const onElementMouseMove = (e: MouseEvent) => {
+      const onElementMouseMove = (e: MouseEvent): void => {
         markActivity()
         sendMouseMove(e)
       }
 
-      const onWindowMouseMove = (e: MouseEvent) => {
+      const onWindowMouseMove = (e: MouseEvent): void => {
         if (pointerIsDown) sendMouseMove(e)
       }
 
-      const onWheel = (e: WheelEvent) => {
+      const onWheel = (e: WheelEvent): void => {
         e.stopPropagation()
         e.preventDefault()
         markActivity()
+        const tid = liveTabIdRef.current
+        if (!tid) return
         const point = getPoint(e)
         if (!point) return
         void api.sendInput?.({
-          tabId: liveTabId,
+          tabId: tid,
           event: {
             type: 'mouseWheel',
             x: point.x,
@@ -419,44 +449,79 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
         })
       }
 
-      const onMouseLeave = () => {
+      const onMouseLeave = (): void => {
         if (pointerIsDown) return
-        void api.sendInput?.({ tabId: liveTabId, event: { type: 'mouseLeave' } })
+        const tid = liveTabIdRef.current
+        if (!tid) return
+        void api.sendInput?.({ tabId: tid, event: { type: 'mouseLeave' } })
       }
 
-      const onMouseEnter = (e: MouseEvent) => {
+      const onMouseEnter = (e: MouseEvent): void => {
+        const tid = liveTabIdRef.current
+        if (!tid) return
         const point = getPoint(e)
         if (!point) return
-        void api.sendInput?.({ tabId: liveTabId, event: { type: 'mouseEnter', x: point.x, y: point.y } })
+        void api.sendInput?.({ tabId: tid, event: { type: 'mouseEnter', x: point.x, y: point.y } })
       }
 
-      const onKeyDown = (e: KeyboardEvent) => {
+      const onKeyDown = (e: KeyboardEvent): void => {
+        const tid = liveTabIdRef.current
+        if (!tid) return
         markActivity()
         const keyCode = toElectronKeyCode(e)
         if (!keyCode) return
         e.stopPropagation()
         if (e.key !== 'Tab') e.preventDefault()
-        void api.sendInput?.({ tabId: liveTabId, event: { type: 'keyDown', keyCode, modifiers: getKeyModifiers(e) } })
+        void api.sendInput?.({ tabId: tid, event: { type: 'keyDown', keyCode, modifiers: getKeyModifiers(e) } })
         const charKeyCode = getCharKeyCode(e)
         if (!charKeyCode) return
-        void api.sendInput?.({ tabId: liveTabId, event: { type: 'char', keyCode: charKeyCode, modifiers: getKeyModifiers(e) } })
+        void api.sendInput?.({ tabId: tid, event: { type: 'char', keyCode: charKeyCode, modifiers: getKeyModifiers(e) } })
       }
 
-      const onKeyUp = (e: KeyboardEvent) => {
+      const onKeyUp = (e: KeyboardEvent): void => {
+        const tid = liveTabIdRef.current
+        if (!tid) return
         markActivity()
         const keyCode = toElectronKeyCode(e)
         if (!keyCode) return
         e.stopPropagation()
-        void api.sendInput?.({ tabId: liveTabId, event: { type: 'keyUp', keyCode, modifiers: getKeyModifiers(e) } })
+        void api.sendInput?.({ tabId: tid, event: { type: 'keyUp', keyCode, modifiers: getKeyModifiers(e) } })
       }
+
+      // Suppress browser context menu — let overlay handle right-click
+      const onContextMenu = (e: MouseEvent): void => {
+        e.stopPropagation()
+        e.preventDefault()
+      }
+
+      // Forward paste events so Ctrl+V works inside the overlay tab
+      const onPaste = (e: ClipboardEvent): void => {
+        const tid = liveTabIdRef.current
+        if (!tid) return
+        e.preventDefault()
+        e.stopPropagation()
+        const text = e.clipboardData?.getData('text/plain') ?? ''
+        if (!text) return
+        for (const char of text) {
+          void api.sendInput?.({ tabId: tid, event: { type: 'char', keyCode: char, modifiers: [] } })
+        }
+      }
+
+      // Drag events — tell the overlay so it can suppress its own drag handling
+      const onDragOver = (e: DragEvent): void => { e.preventDefault(); e.stopPropagation() }
+      const onDrop = (e: DragEvent): void => { e.preventDefault(); e.stopPropagation() }
 
       el.addEventListener('mouseenter', onMouseEnter)
       el.addEventListener('mouseleave', onMouseLeave)
       el.addEventListener('mousedown', onMouseDown)
+      el.addEventListener('contextmenu', onContextMenu)
       el.addEventListener('wheel', onWheel, { passive: false })
       el.addEventListener('mousemove', onElementMouseMove)
       el.addEventListener('keydown', onKeyDown)
       el.addEventListener('keyup', onKeyUp)
+      el.addEventListener('paste', onPaste as EventListener)
+      el.addEventListener('dragover', onDragOver)
+      el.addEventListener('drop', onDrop)
       window.addEventListener('mouseup', onMouseUp, true)
       window.addEventListener('mousemove', onWindowMouseMove, true)
 
@@ -464,14 +529,21 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
         el.removeEventListener('mouseenter', onMouseEnter)
         el.removeEventListener('mouseleave', onMouseLeave)
         el.removeEventListener('mousedown', onMouseDown)
+        el.removeEventListener('contextmenu', onContextMenu)
         el.removeEventListener('wheel', onWheel)
         el.removeEventListener('mousemove', onElementMouseMove)
         el.removeEventListener('keydown', onKeyDown)
         el.removeEventListener('keyup', onKeyUp)
+        el.removeEventListener('paste', onPaste as EventListener)
+        el.removeEventListener('dragover', onDragOver)
+        el.removeEventListener('drop', onDrop)
         window.removeEventListener('mouseup', onMouseUp, true)
         window.removeEventListener('mousemove', onWindowMouseMove, true)
       }
-    }, [api, contentH, contentW, fitMode, liveTabId, tabSnapshot.lifecycle])
+      // Intentionally omit liveTabId, fitMode, contentW/H from deps —
+      // all are accessed via refs so this effect runs only once per mount.
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [api])
 
     const getViewportPx = (): { vw: number; vh: number } => {
       const vb = (editor as EditorWithViewport).getViewportScreenBounds?.()
@@ -626,8 +698,13 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
           pointerEvents: 'auto',
           cursor: fitMode ? 'default' : isEditing ? 'default' : 'move',
         }}
-        onPointerDownCapture={() => {
-          void requestLive()
+        onPointerDownCapture={async (e) => {
+          // If the tab isn't live yet, revive it and then manually re-fire focus
+          // so the input handlers are ready before the user's click reaches the overlay.
+          if (!liveTabIdRef.current) {
+            await requestLive()
+            contentRef.current?.focus({ preventScroll: true })
+          }
           markActivity()
         }}
         onPointerDown={(e) => {
@@ -732,6 +809,8 @@ export class BrowserShapeUtil extends ShapeUtil<BrowserShape> {
               outline: 'none',
               cursor: browserCursor,
               pointerEvents: 'auto',
+              // Prevent the browser from stealing focus away from the content div
+              userSelect: 'none',
             }}
           >
             <canvas

@@ -191,14 +191,15 @@ export default function LifecycleHost({ editorRef }: Props) {
       const info = readTabInfoFromShape(editor, shapeId)
       if (!info) return
       const { tabId } = info
-      const currentState = window.__tabState?.get(tabId)
+const currentState = window.__tabState?.get(tabId)
 
-      if (currentState === 'frozen') {
-        await window.overlay.thaw({ tabId })
-      } else if (currentState !== 'live') {
-        await window.overlay.createTab({ shapeId: tabId, restore: true })
-      }
-
+if (currentState !== 'live') {
+  const hasRestoreInfo = !!window.__tabRestoreInfo?.get(tabId)
+  const res = hasRestoreInfo
+    ? await window.overlay.createTab({ shapeId: tabId, restore: true })
+    : await window.overlay.createTab({ url: info.url, shapeId: tabId })
+  if (!res.ok) return
+}
       await window.overlay.show({ tabId })
       window.__activeTabs?.add(tabId)
       window.__tabState?.set(tabId, 'live')
